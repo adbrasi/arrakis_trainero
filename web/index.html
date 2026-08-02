@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arrakis Trainero</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="container">
+
+  <header class="top-bar">
+    <div class="brand">
+      <span class="brand-mark">⚔</span>
+      <div>
+        <h1>ARRAKIS <em>TRAINERO</em></h1>
+        <span class="subtitle">o treinador que anda sozinho · 砂の調教師</span>
+      </div>
+    </div>
+    <div class="top-status">
+      <span id="gpu-chip" class="chip" hidden></span>
+      <span id="hf-chip" class="chip" hidden></span>
+      <span id="or-chip" class="chip" hidden></span>
+      <span class="status"><span id="status-dot" class="dot"></span><span id="status-text">carregando…</span></span>
+    </div>
+  </header>
+
+  <!-- 1 · Projeto -->
+  <section class="card" id="card-project">
+    <div class="card-head"><span class="step-n">1</span><h2>Projeto</h2></div>
+    <div class="row">
+      <input id="project-name" type="text" placeholder="nome do LoRA (ex.: makima_v1)" autocomplete="off">
+      <div class="mode-toggle" id="mode-toggle">
+        <button data-mode="lora" class="active">LoRA</button>
+        <button data-mode="slider">Concept Slider</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 2 · Dataset -->
+  <section class="card" id="card-dataset">
+    <div class="card-head"><span class="step-n">2</span><h2 id="dataset-title">Dataset</h2></div>
+
+    <div id="dataset-panels">
+      <div class="ds-panel" data-side="pos">
+        <div class="ds-label" hidden>CONCEITO ALTO (+)</div>
+        <div class="dropzone" tabindex="0">
+          <p><strong>Arraste imagens/vídeos + .txt</strong> (ou um .zip) aqui, ou clique</p>
+          <p class="hint">Qwen Edit: imagens de controle numa pasta <code>control/</code></p>
+          <input type="file" multiple hidden>
+        </div>
+        <div class="row link-row">
+          <input class="link-input" type="text"
+                 placeholder="…ou cole: link Mega · zip/pasta HuggingFace · URL · caminho local">
+          <button class="btn ghost import-btn">Importar</button>
+        </div>
+        <div class="ds-stats" hidden></div>
+      </div>
+
+      <div class="ds-panel" data-side="neg" hidden>
+        <div class="ds-label">CONCEITO BAIXO (−)</div>
+        <div class="dropzone" tabindex="0">
+          <p><strong>Dataset do conceito fraco/ausente</strong></p>
+          <input type="file" multiple hidden>
+        </div>
+        <div class="row link-row">
+          <input class="link-input" type="text" placeholder="link Mega · HF · URL · caminho">
+          <button class="btn ghost import-btn">Importar</button>
+        </div>
+        <div class="ds-stats" hidden></div>
+      </div>
+    </div>
+
+    <!-- LTX slider: pares de prompt, sem dataset -->
+    <div id="slider-prompts" hidden>
+      <p class="hint">LTX 2.3 treina o slider direto de pares de prompt — sem dataset.</p>
+      <div id="pair-list"></div>
+      <button class="btn ghost" id="add-pair">+ adicionar par</button>
+    </div>
+
+    <!-- Captions -->
+    <div id="caption-card" hidden>
+      <div class="caption-head">⚠ <span id="caption-msg"></span></div>
+      <div class="row">
+        <select id="caption-profile"></select>
+        <input id="caption-trigger" type="text" placeholder="trigger word (ex.: makima_chainsaw)">
+        <button class="btn amber" id="btn-captions">Gerar captions</button>
+      </div>
+      <p class="hint">gera caption para TODOS os itens (.txt existentes viram contexto do LLM e são reescritos)</p>
+      <p class="hint" id="caption-key-hint" hidden>defina OPENROUTER_API_KEY no ambiente do pod para usar isso</p>
+    </div>
+  </section>
+
+  <!-- 3 · Modelo -->
+  <section class="card" id="card-model">
+    <div class="card-head"><span class="step-n">3</span><h2>Modelo</h2></div>
+    <div class="model-group"><span class="group-label">IMAGEM</span><div class="model-grid" id="models-imagem"></div></div>
+    <div class="model-group"><span class="group-label">VÍDEO</span><div class="model-grid" id="models-video"></div></div>
+    <p class="preset-line" id="preset-line" hidden></p>
+  </section>
+
+  <!-- TREINAR -->
+  <section class="train-row">
+    <button class="btn-train" id="btn-train" disabled>TREINAR</button>
+    <button class="btn ghost" id="btn-cancel" hidden>Cancelar</button>
+  </section>
+
+  <!-- Config avançada -->
+  <details class="card advanced" id="advanced">
+    <summary>⚙ configurações do treino (preset atual)</summary>
+    <div class="adv-grid">
+      <label>Rede
+        <select id="adv-net"></select>
+      </label>
+      <label class="check"><input type="checkbox" id="adv-loraplus"> LoRA+ <span class="hint">(ratio 16)</span></label>
+      <label>Rank <input type="number" id="adv-dim" min="1"></label>
+      <label>Alpha <input type="number" id="adv-alpha" min="1"></label>
+      <label>Learning rate <input type="text" id="adv-lr"></label>
+      <label>Epochs <input type="number" id="adv-epochs" min="1"></label>
+      <label>Repeats <input type="number" id="adv-repeats" min="1"></label>
+      <label>Salvar a cada N epochs <input type="number" id="adv-save" min="1"></label>
+      <label id="adv-ltx-res-wrap" hidden>Resolução LTX (LxAxF) <input type="text" id="adv-ltx-res" placeholder="768x512x81"></label>
+      <label class="check"><input type="checkbox" id="adv-hf" checked> Criar repo no HuggingFace</label>
+      <label class="check"><input type="checkbox" id="adv-hf-private" checked> Repo privado</label>
+    </div>
+    <p class="hint">Tudo acima já vem do preset padrão do modelo + tamanho do dataset. Só mexa se souber por quê.
+       DoRA não existe nos backends usados (musubi/sd-scripts) — LoKr/LoHa cobrem o caso.</p>
+  </details>
+
+  <!-- Progresso -->
+  <section class="card" id="card-progress" hidden>
+    <div class="card-head"><h2 id="progress-title">Progresso</h2></div>
+    <div class="phase-chips" id="phase-chips"></div>
+    <div class="bar-wrap" id="bar-wrap" hidden>
+      <div class="bar"><div class="bar-fill" id="bar-fill"></div></div>
+      <span class="bar-label" id="bar-label"></span>
+    </div>
+    <div class="metrics" id="metrics"></div>
+    <div id="hf-link-row" hidden></div>
+    <pre class="console" id="console"></pre>
+  </section>
+
+</div>
+<div id="toasts"></div>
+<script src="app.js"></script>
+</body>
+</html>
