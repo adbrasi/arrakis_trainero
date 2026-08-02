@@ -168,7 +168,12 @@ def build_train_config(model_key: str, overrides: dict, schedule: dict, stats: d
 
     for key in ("network_dim", "network_alpha", "learning_rate"):
         if key in overrides and overrides[key] not in (None, ""):
-            cfg[key] = overrides[key]
+            # learning_rate chega como texto do painel; se ficar str, o TOML sai
+            # com aspas e o argparse do trainer nunca converte (crash no optimizer)
+            try:
+                cfg[key] = float(overrides[key]) if key == "learning_rate" else int(overrides[key])
+            except (TypeError, ValueError):
+                raise JobFailed(f"valor inválido para {key}: {overrides[key]!r}")
 
     network_args = []
     if overrides.get("loraplus") and net_type == "lora":
@@ -359,12 +364,22 @@ def anima_comfy_converter(job: Job):
         return None
 
     def convert(ckpt: Path) -> Path | None:
+        # Runs inside the upload-watcher thread WHILE training runs in the main
+        # job thread — must not touch job._proc (job.run would race the train
+        # subprocess handle), so this uses subprocess directly.
+        import subprocess
+
         if ckpt.name.endswith("_comfy.safetensors"):
             return None
         dest = ckpt.with_name(ckpt.stem + "_comfy.safetensors")
         if dest.exists():
             return None
-        job.run([py, str(script), str(ckpt), str(dest)], cwd=edir)
+        res = subprocess.run([py, str(script), str(ckpt), str(dest)], cwd=str(edir),
+                             capture_output=True, text=True, timeout=600)
+        if res.returncode != 0:
+            job.log(f"⚠ conversão Comfy falhou: {res.stderr[-400:]}")
+            return None
+        job.log(f"✔ convertido p/ ComfyUI: {dest.name}")
         return dest
 
     return convert
@@ -430,10 +445,16 @@ def run_training(job: Job, params: dict) -> None:
             schedule[key] = int(overrides[key])
     tier = vram_tier(model_key, vram_gb)
     batch_size = tier.get("batch_size", 1)
-    resolution = overrides.get("resolution") or model.get("resolution", [1024, 1024])
     ltx_cfg = dict(model.get("ltx") or {})
     if overrides.get("ltx_resolution"):
         ltx_cfg["resolution"] = overrides["ltx_resolution"]
+    resolution = overrides.get("resolution") or model.get("resolution", [1024, 1024])
+    if engine == "musubi-ltx":
+        try:
+            w, h, _f = (int(x) for x in ltx_cfg["resolution"].lower().split("x"))
+            resolution = [w, h]
+        except (ValueError, KeyError):
+            raise JobFailed(f"resolução LTX inválida: {ltx_cfg.get('resolution')!r} (use LxAxF, ex. 768x512x81)")
     dataset_toml = write_dataset_toml(model_key, pdir, dataset_dir, pdir / "cache",
                                       schedule, resolution, batch_size, stats, ltx_cfg)
     cfg = build_train_config(model_key, overrides, schedule, stats, vram_gb,

@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from trainero import dataset as ds
 from trainero import jobs
+from trainero.jobs import JobFailed
 from trainero.captioner import generate_captions
 from trainero.config import (IMAGE_EXTS, VIDEO_EXTS, WEB_PORT, ensure_dirs,
                              gpu_info, hf_token, load_state, update_state)
@@ -187,19 +188,23 @@ class Handler(SimpleHTTPRequestHandler):
                 remaining -= len(chunk)
         ext = ds.archive_ext(name)
         if ext:
+            import subprocess
+            import uuid
+
             class _SyncJob:  # tiny shim: extraction logging goes nowhere useful here
                 def log(self, *_): pass
 
                 def run(self, cmd, **kw):
-                    import subprocess
-
                     subprocess.run([str(c) for c in cmd], check=True,
                                    cwd=kw.get("cwd"), capture_output=True)
-            staging = target_root.parent / "_upload_staging"
-            shutil.rmtree(staging, ignore_errors=True)
+
+            # unique per request: parallel uploads of two zips must not share staging
+            staging = target_root.parent / f"_upload_staging_{uuid.uuid4().hex}"
             try:
                 ds.extract_archive(dest, staging / "src", _SyncJob())
                 ds.normalize_into(staging, target_root, _SyncJob())
+            except (JobFailed, subprocess.CalledProcessError, OSError) as exc:
+                return self._error(f"extração de {name} falhou: {exc}")
             finally:
                 dest.unlink(missing_ok=True)
                 shutil.rmtree(staging, ignore_errors=True)

@@ -197,8 +197,17 @@ def extract_archive(archive: Path, dest: Path, job: Job) -> None:
             raise JobFailed("p7zip indisponível")
         job.run(["7z", "x", f"-o{dest}", "-y", str(archive)])
     else:
+        # archives also come from URLs/Mega/HF — never trust member paths
         with tarfile.open(archive, "r:*") as tf:
-            tf.extractall(dest)  # noqa: S202 — datasets are the user's own files
+            try:
+                tf.extractall(dest, filter="data")
+            except TypeError:  # Python < 3.12: validate members manually
+                base = dest.resolve()
+                for member in tf.getmembers():
+                    target = (dest / member.name).resolve()
+                    if base not in target.parents and target != base:
+                        raise JobFailed(f"caminho suspeito no tar: {member.name}")
+                tf.extractall(dest)
 
 
 def _resolve_archives(root: Path, job: Job) -> None:

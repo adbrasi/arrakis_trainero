@@ -90,7 +90,7 @@ def _ltx_native_slider(job: Job, params: dict) -> None:
         "network_module": "networks.lora_ltx2",
         "network_dim": int(overrides.get("network_dim") or 16),
         "network_alpha": int(overrides.get("network_alpha") or 16),
-        "learning_rate": overrides.get("learning_rate") or 2e-4,
+        "learning_rate": float(overrides.get("learning_rate") or 2e-4),
         "optimizer_type": "adamw8bit", "lr_scheduler": "constant",
         "max_train_steps": steps, "save_every_n_steps": max(100, steps // 4),
         "latent_width": 768, "latent_height": 512, "latent_frames": 1,

@@ -286,7 +286,7 @@ function collectOverrides() {
   const touched = state.advTouched;
   if (touched.has("adv-dim")) o.network_dim = parseInt($("#adv-dim").value, 10);
   if (touched.has("adv-alpha")) o.network_alpha = parseInt($("#adv-alpha").value, 10);
-  if (touched.has("adv-lr")) o.learning_rate = $("#adv-lr").value.trim();
+  if (touched.has("adv-lr")) o.learning_rate = parseFloat($("#adv-lr").value);
   if (touched.has("adv-epochs")) o.epochs = parseInt($("#adv-epochs").value, 10);
   if (touched.has("adv-repeats")) o.num_repeats = parseInt($("#adv-repeats").value, 10);
   if (touched.has("adv-save")) o.save_every_n_epochs = parseInt($("#adv-save").value, 10);

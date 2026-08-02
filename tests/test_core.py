@@ -88,9 +88,17 @@ class TestTrainConfig(unittest.TestCase):
             self._cfg("anima", {"net_type": "lokr"})
 
     def test_overrides_apply(self):
-        cfg = self._cfg("qwen-image", {"network_dim": 16, "learning_rate": "1e-4"})
+        cfg = self._cfg("qwen-image", {"network_dim": "16", "learning_rate": "1e-4"})
         self.assertEqual(cfg["network_dim"], 16)
-        self.assertEqual(cfg["learning_rate"], "1e-4")
+        # str viraria TOML com aspas e o trainer crasharia no optimizer
+        self.assertIsInstance(cfg["learning_rate"], float)
+        self.assertEqual(cfg["learning_rate"], 1e-4)
+
+    def test_bad_lr_rejected(self):
+        from trainero.jobs import JobFailed
+
+        with self.assertRaises(JobFailed):
+            self._cfg("qwen-image", {"learning_rate": "abc"})
 
     def test_cli_args(self):
         args = _cli_args({"a": 1, "flag": True, "off": False, "lst": ["x", "y"], "skip": None})
