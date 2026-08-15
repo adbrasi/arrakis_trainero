@@ -252,5 +252,33 @@ class TestBuildConvertDataset(unittest.TestCase):
                                       generate=lambda *a, **k: (_png_bytes(), 0.0))
 
 
+class TestStyleRushGuards(unittest.TestCase):
+    def _job(self):
+        job = _FakeJob()
+        job.set_phases = lambda names: None
+        job.start_phase = lambda name: None
+        job.end_phase = lambda name, ok=True: None
+        job.extra = {}
+        return job
+
+    def test_unsupported_model_is_rejected(self):
+        from trainero.jobs import JobFailed
+        from trainero.training import run_style_rush_training
+
+        with self.assertRaises(JobFailed) as ctx:
+            run_style_rush_training(self._job(), {"project": "p", "model": "wan-22",
+                                                  "trigger": "t", "overrides": {}})
+        self.assertIn("control", str(ctx.exception).lower())
+
+    def test_empty_trigger_is_rejected(self):
+        from trainero.jobs import JobFailed
+        from trainero.training import run_style_rush_training
+
+        with self.assertRaises(JobFailed) as ctx:
+            run_style_rush_training(self._job(), {"project": "p", "model": "flux-klein",
+                                                  "trigger": "  ", "overrides": {}})
+        self.assertIn("trigger", str(ctx.exception).lower())
+
+
 if __name__ == "__main__":
     unittest.main()

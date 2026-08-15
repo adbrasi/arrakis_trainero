@@ -19,6 +19,8 @@ import shutil
 from pathlib import Path
 
 from . import dataset as ds
+from . import style_rush as sr
+from .captioner import generate_captions
 from .config import PROJECTS_DIR, gpu_info
 from .engines import (engine_dir, ensure_engine, supports_sampling, venv_bin,
                       venv_python)
@@ -27,7 +29,8 @@ from .jobs import Job, JobFailed
 from .models_download import ensure_models, resolve
 from .presets import (CONTROL_RESOLUTION, LORAPLUS_RATIO, MODELS, NETWORK_MODULES,
                       SAMPLE_GUIDANCE, SAMPLE_PROMPT, SAMPLE_SEED, SAMPLE_STEPS,
-                      net_types_for, suggest_schedule, vram_tier)
+                      STYLE_RUSH_SCHEDULE, net_types_for, style_rush_models,
+                      suggest_schedule, vram_tier)
 
 
 def slugify(name: str) -> str:
@@ -470,6 +473,160 @@ def comfy_converter(model_key: str, job: Job, forced: bool = False):
 
 
 # ---------------------------------------------------------------------------
+# Style Rush pipeline
+# ---------------------------------------------------------------------------
+
+
+def run_style_rush_training(job: Job, params: dict) -> None:
+    """One dataset in, two datasets trained: the base (style) and the synthetic
+    conversion pairs (style transfer). Fixed 5 epochs — the owner watches the
+    samples and cancels when it looks right."""
+    project = params["project"]
+    model_key = params["model"]
+    trigger = (params.get("trigger") or "").strip()
+    overrides = params.get("overrides", {})
+
+    if model_key not in style_rush_models():
+        raise JobFailed(
+            f"{MODELS[model_key]['label']} não aceita control image — o Style Rush precisa "
+            f"de um modelo que suporte (Flux Klein ou Qwen Image Edit)")
+    if not trigger:
+        raise JobFailed("defina a trigger word antes de treinar no modo Style Rush")
+
+    model = MODELS[model_key]
+    engine = model["engine"]
+    pdir = project_dir(project)
+    slug = slugify(project)
+    dataset_dir = pdir / "dataset"
+    convert_dir = pdir / "dataset_convert"
+    output_dir = pdir / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stats = ds.inspect(dataset_dir)
+    if stats["items"] == 0:
+        raise JobFailed("importe o dataset antes de treinar")
+    if stats["videos"]:
+        raise JobFailed("Style Rush é só para datasets de imagem")
+
+    job.set_phases(["Engine", "Modelos base", "Captions", "Dataset de conversão",
+                    "Configuração", "Cache de latents", "Cache do text encoder",
+                    "Treino", "Finalização"])
+
+    gpu = gpu_info()
+    vram_gb = gpu.get("vram_mb", 24576) / 1024
+    job.extra["gpu"] = gpu
+    job.log(f"GPU: {gpu.get('name', '?')} ({vram_gb:.0f} GB) · trigger: {trigger}")
+
+    job.start_phase("Engine")
+    ensure_engine(engine, job)
+    job.end_phase("Engine")
+
+    job.start_phase("Modelos base")
+    ensure_models(model_key, job)
+    job.end_phase("Modelos base")
+
+    job.start_phase("Captions")
+    if stats["missing_captions"]:
+        job.log(f"{stats['missing_captions']} itens sem caption — gerando com "
+                f"generic-style e trigger {trigger}")
+        generate_captions(dataset_dir, "image", "generic-style", {"style_name": trigger}, job)
+        stats = ds.inspect(dataset_dir)
+        if stats["missing_captions"]:
+            raise JobFailed(f"{stats['missing_captions']} itens continuam sem caption")
+    else:
+        job.log("Todas as imagens já têm caption.")
+    job.end_phase("Captions")
+
+    job.start_phase("Dataset de conversão")
+    convert_stats = sr.build_convert_dataset(dataset_dir, convert_dir, trigger, job)
+    job.extra["style_rush"] = convert_stats
+    job.end_phase("Dataset de conversão")
+
+    job.start_phase("Configuração")
+    schedule = dict(STYLE_RUSH_SCHEDULE)
+    for key in ("epochs", "num_repeats", "save_every_n_epochs"):
+        if overrides.get(key):
+            schedule[key] = int(overrides[key])
+    tier = vram_tier(model_key, vram_gb)
+    batch_size = tier.get("batch_size", 1)
+    resolution = overrides.get("resolution") or model.get("resolution", [1024, 1024])
+    subsets = [
+        image_subset(dataset_dir, pdir / "cache" / "images", schedule["num_repeats"]),
+        image_subset(convert_dir, pdir / "cache" / "convert", schedule["num_repeats"],
+                     control_dir=convert_dir / "control",
+                     control_resolution=CONTROL_RESOLUTION),
+    ]
+    dataset_toml = write_dataset_toml(model_key, pdir / "dataset.toml", subsets,
+                                      resolution, batch_size)
+
+    sample_path = None
+    if overrides.get("sampling", True) and supports_sampling(engine):
+        sample_path = write_sample_prompts(
+            pdir / "sample_prompts.txt",
+            overrides.get("sample_prompt") or SAMPLE_PROMPT, trigger, resolution)
+
+    total_items = stats["items"] + convert_stats["pairs"]
+    cfg = build_train_config(model_key, overrides, schedule, {"items": total_items},
+                             vram_gb, dataset_toml, output_dir, slug, batch_size,
+                             sample_prompts=sample_path)
+    job.extra["schedule"] = schedule
+    job.extra["config_summary"] = {
+        "network_module": cfg.get("network_module"),
+        "network_dim": cfg.get("network_dim"), "network_alpha": cfg.get("network_alpha"),
+        "learning_rate": cfg.get("learning_rate"),
+        "epochs": schedule["epochs"], "batch_size": batch_size,
+        "base": stats["items"], "convert": convert_stats["pairs"],
+        "fp8": bool(cfg.get("fp8_base")), "blocks_to_swap": cfg.get("blocks_to_swap", 0),
+    }
+    job.log(f"Config: {json.dumps(job.extra['config_summary'], ensure_ascii=False)}")
+    job.end_phase("Configuração")
+
+    run_caches(model_key, dataset_toml, vram_gb, job)
+
+    watcher = None
+    repo_id = None
+    if overrides.get("hf_upload", True):
+        user = hf_username()
+        if user:
+            repo_id = create_repo(f"{user}/{slug}", private=overrides.get("hf_private", True),
+                                  job=job)
+        else:
+            job.log("⚠ Sem token HF (defina HF_TOKEN) — upload desativado.")
+    if repo_id:
+        job.extra["hf_repo"] = repo_id
+        upload_text(repo_id, "README.md",
+                    model_card(project, model["label"], stats, schedule, cfg), job)
+        upload_text(repo_id, "trainero_config.json",
+                    json.dumps({"model": model_key, "mode": "style-rush", "trigger": trigger,
+                                "schedule": schedule, "style_rush": convert_stats,
+                                "config": {k: v for k, v in cfg.items()
+                                           if isinstance(v, (str, int, float, bool))}},
+                               indent=2, ensure_ascii=False), job)
+        convert = comfy_converter(model_key, job, forced=bool(overrides.get("comfy_convert")))
+        watcher = UploadWatcher(repo_id, output_dir, job, convert=convert)
+        watcher.start()
+
+    job.start_phase("Treino")
+    try:
+        launch_training(model_key, cfg, pdir, job)
+    finally:
+        if watcher:
+            job.log("Varredura final de checkpoints para o HF...")
+            watcher.stop_and_sweep()
+    job.end_phase("Treino")
+
+    job.start_phase("Finalização")
+    finals = sorted(output_dir.glob("*.safetensors"))
+    if not finals:
+        raise JobFailed("o treino terminou sem produzir checkpoints")
+    job.extra["outputs"] = [f.name for f in finals]
+    job.log(f"✔ {len(finals)} checkpoints em {output_dir}")
+    if repo_id:
+        job.log(f"✔ Tudo em https://huggingface.co/{repo_id}")
+    job.end_phase("Finalização")
+
+
+# ---------------------------------------------------------------------------
 # Full pipeline
 # ---------------------------------------------------------------------------
 
@@ -490,6 +647,9 @@ def run_training(job: Job, params: dict) -> None:
         from .sliders import run_slider_training
 
         return run_slider_training(job, params)
+
+    if mode == "style-rush":
+        return run_style_rush_training(job, params)
 
     stats = ds.inspect(dataset_dir)
     if stats["items"] == 0:
