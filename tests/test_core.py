@@ -56,6 +56,42 @@ class TestPresets(unittest.TestCase):
 
         json.dumps(public_presets())
 
+    def test_style_rush_models(self):
+        from trainero.presets import style_rush_models
+
+        keys = style_rush_models()
+        self.assertIn("flux-klein", keys)
+        self.assertIn("qwen-image-edit", keys)
+        self.assertNotIn("wan-22", keys)
+        self.assertNotIn("anima", keys)
+
+    def test_style_rush_schedule_is_fixed(self):
+        from trainero.presets import STYLE_RUSH_SCHEDULE
+
+        self.assertEqual(STYLE_RUSH_SCHEDULE,
+                         {"num_repeats": 1, "epochs": 5, "save_every_n_epochs": 1})
+
+    def test_sample_prompt_is_prose(self):
+        from trainero.presets import SAMPLE_PROMPT
+
+        self.assertGreater(len(SAMPLE_PROMPT.split()), 60)
+        self.assertNotIn("\n", SAMPLE_PROMPT)
+        self.assertNotIn("--", SAMPLE_PROMPT)  # flags are added by write_sample_prompts
+
+    def test_comfy_convert_is_data(self):
+        self.assertEqual(MODELS["anima"]["comfy_convert"],
+                         {"script": "networks/convert_anima_lora_to_comfy.py"})
+        for key in MODEL_ORDER:
+            cc = MODELS[key].get("comfy_convert")
+            if cc is not None:
+                self.assertIsInstance(cc, dict, key)
+                self.assertTrue({"script", "convert_lora"} & set(cc), key)
+
+    def test_public_presets_expose_control(self):
+        pub = public_presets()
+        self.assertTrue(pub["flux-klein"]["supports_control"])
+        self.assertFalse(pub["krea2"]["supports_control"])
+
 
 class TestTrainConfig(unittest.TestCase):
     def _cfg(self, key, overrides=None, n=30):

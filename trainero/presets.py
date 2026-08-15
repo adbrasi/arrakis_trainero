@@ -144,7 +144,8 @@ MODELS = {
         "resolution": [1024, 1024],
         "bucket_reso_steps": 64,
         "exposures_per_image": 660,
-        "comfy_convert": True,  # sd-scripts LoRA needs convert_anima_lora_to_comfy.py
+        # sd-scripts LoRA keys do not match what ComfyUI loads for Anima.
+        "comfy_convert": {"script": "networks/convert_anima_lora_to_comfy.py"},
         "vram_tiers": [
             {"min_gb": 44, "train": {}, "batch_size": 16},
             {"min_gb": 30, "train": {}, "batch_size": 8},
@@ -181,6 +182,7 @@ MODELS = {
             "timestep_sampling": "flux2_shift", "weighting_scheme": "none",
         },
         "resolution": [1024, 1024],
+        "supports_control": True,   # FLUX.2 reference image = control_directory
         "target_steps": 2000,
         "vram_tiers": [
             {"min_gb": 70, "train": {}},
@@ -241,6 +243,7 @@ MODELS = {
         },
         "resolution": [1024, 1024],
         "needs_control": True,  # dataset must ship a control/ folder
+        "supports_control": True,
         "control_resolution": [1024, 1024],
         "target_steps": 2000,
         "vram_tiers": [
@@ -368,6 +371,42 @@ NETWORK_MODULES = {
 LORAPLUS_RATIO = 16  # owner's value in image_lora_arrakis
 
 
+# ---------------------------------------------------------------------------
+# Style Rush
+# ---------------------------------------------------------------------------
+# The synthetic conversion dataset is always SLOT_COUNT pairs and the owner
+# cancels when the samples look right, so there is no target_steps math here.
+
+STYLE_RUSH_SCHEDULE = {"num_repeats": 1, "epochs": 5, "save_every_n_epochs": 1}
+CONTROL_RESOLUTION = [1024, 1024]
+
+# ---------------------------------------------------------------------------
+# Sampling during training
+# ---------------------------------------------------------------------------
+# One prompt, the same for every image model. It is written to exercise, in a
+# single frame, everything that reveals a LoRA going wrong: face and gaze, hands
+# holding an object, fabric, an animal, warm directional light with shadow, and
+# a background with depth.
+
+SAMPLE_PROMPT = (
+    "A young woman sits alone at a tall window in a quiet apartment at golden hour, "
+    "one knee drawn up onto the cushioned sill, both hands wrapped around a chipped "
+    "ceramic mug. Late sunlight falls across her in long amber bars, warm on her cheek "
+    "and throat, and fine dust turns slowly in the air. A grey cat lies curled asleep "
+    "against her hip, one paw over its face. Her hair spills loose over one shoulder, "
+    "her sweater slipping wide at the collar, and she looks out through the glass with "
+    "a soft, unhurried gaze while the city beyond dissolves into hazy blue rooftops."
+)
+SAMPLE_STEPS = 28
+SAMPLE_GUIDANCE = 4.0
+SAMPLE_SEED = 42
+
+
+def style_rush_models() -> list[str]:
+    """Models that accept a control image, so they can learn style conversion."""
+    return [k for k in MODEL_ORDER if MODELS[k].get("supports_control")]
+
+
 def net_types_for(model_key: str) -> list[str]:
     model = MODELS[model_key]
     if "net_types" in model:
@@ -422,6 +461,7 @@ def public_presets() -> dict:
                                "lr_scheduler", "timestep_sampling")},
             "resolution": m.get("resolution"),
             "needs_control": m.get("needs_control", False),
+            "supports_control": m.get("supports_control", False),
             "supports_slider_native": m.get("supports_slider_native", False),
             "ltx": m.get("ltx"),
         }
