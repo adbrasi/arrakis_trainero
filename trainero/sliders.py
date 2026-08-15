@@ -24,8 +24,9 @@ from .hf_upload import create_repo, hf_username, upload_text
 from .jobs import Job, JobFailed
 from .models_download import ensure_models, resolve
 from .presets import MODELS, suggest_schedule, vram_tier
-from .training import (_cli_args, _script, build_train_config, launch_training,
-                       project_dir, run_caches, slugify, write_dataset_toml)
+from .training import (_cli_args, _script, build_train_config, image_subset,
+                       launch_training, project_dir, run_caches, slugify,
+                       video_subset, write_dataset_toml)
 
 MAKE_SLIDER = REPO_DIR / "trainero" / "tools" / "make_slider.py"
 
@@ -170,8 +171,15 @@ def _dataset_pair_slider(job: Job, params: dict) -> None:
     for side, sdir, stats in (("pos", pos_dir, pos), ("neg", neg_dir, neg)):
         out = pdir / f"output_{side}"
         out.mkdir(parents=True, exist_ok=True)
-        toml = write_dataset_toml(model_key, pdir, sdir, pdir / f"cache_{side}",
-                                  schedule, resolution, batch_size, stats, model.get("ltx"))
+        subsets = []
+        if stats.get("images"):
+            subsets.append(image_subset(sdir, pdir / f"cache_{side}" / "images",
+                                        schedule["num_repeats"]))
+        if stats.get("videos"):
+            subsets.append(video_subset(sdir, pdir / f"cache_{side}" / "videos",
+                                        schedule["num_repeats"]))
+        toml = write_dataset_toml(model_key, pdir / f"dataset_{side}.toml", subsets,
+                                  resolution, batch_size, model.get("ltx"))
         cfg = build_train_config(model_key, overrides, schedule, stats, vram_gb,
                                  toml, out, f"{slug}_{side}", batch_size)
         runs.append((side, toml, cfg, out))

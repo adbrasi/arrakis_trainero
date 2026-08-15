@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from trainero.dataset import archive_ext, detect_source
 from trainero.presets import (MODEL_ORDER, MODELS, net_types_for,
                               public_presets, suggest_schedule, vram_tier)
-from trainero.training import (_cli_args, build_train_config, slugify,
+from trainero.training import (_cli_args, build_train_config, image_subset, slugify,
                                write_dataset_toml)
 
 
@@ -142,58 +142,68 @@ class TestTrainConfig(unittest.TestCase):
 
 
 class TestDatasetToml(unittest.TestCase):
-    def test_musubi_image(self):
+    def _write(self, key, subsets, resolution=(1024, 1024), batch_size=1, ltx_cfg=None):
         import tempfile
 
-        with tempfile.TemporaryDirectory() as td:
-            pdir = Path(td)
-            toml = write_dataset_toml("qwen-image", pdir, pdir / "dataset", pdir / "cache",
-                                      {"num_repeats": 3, "epochs": 10, "save_every_n_epochs": 1},
-                                      [1024, 1024], 1, {"images": 10, "videos": 0})
-            text = toml.read_text()
-            self.assertIn("image_directory", text)
-            self.assertIn("num_repeats = 3", text)
-            self.assertIn("enable_bucket = true", text)
-            self.assertNotIn("control_directory", text)
+        td = Path(tempfile.mkdtemp())
+        # the writer really creates the cache dirs, so they must live in the
+        # temp dir; the dataset dirs stay fake because nothing touches them.
+        for i, sub in enumerate(subsets):
+            sub["cache"] = td / "cache" / f"s{i}"
+        return write_dataset_toml(key, td / "dataset.toml", subsets, list(resolution),
+                                  batch_size, ltx_cfg)
+
+    def test_musubi_image(self):
+        toml = self._write("qwen-image", [
+            image_subset(Path("/ds"), Path("/cache"), 3),
+        ])
+        text = toml.read_text()
+        self.assertIn("image_directory", text)
+        self.assertIn("num_repeats = 3", text)
+        self.assertIn("enable_bucket = true", text)
+        self.assertNotIn("control_directory", text)
 
     def test_musubi_edit_has_control(self):
-        import tempfile
+        toml = self._write("qwen-image-edit", [
+            image_subset(Path("/ds"), Path("/cache"), 1,
+                         control_dir=Path("/ds/control"), control_resolution=[1024, 1024]),
+        ])
+        text = toml.read_text()
+        self.assertIn("control_directory", text)
+        self.assertIn("control_resolution = [1024, 1024]", text)
 
-        with tempfile.TemporaryDirectory() as td:
-            pdir = Path(td)
-            toml = write_dataset_toml("qwen-image-edit", pdir, pdir / "dataset", pdir / "cache",
-                                      {"num_repeats": 1, "epochs": 10, "save_every_n_epochs": 1},
-                                      [1024, 1024], 1, {"images": 10, "videos": 0})
-            text = toml.read_text()
-            self.assertIn("control_directory", text)
-            self.assertIn("control_resolution = [1024, 1024]", text)
+    def test_two_subsets_only_one_has_control(self):
+        toml = self._write("flux-klein", [
+            image_subset(Path("/ds"), Path("/cache/images"), 1),
+            image_subset(Path("/conv"), Path("/cache/convert"), 1,
+                         control_dir=Path("/conv/control"), control_resolution=[1024, 1024]),
+        ])
+        text = toml.read_text()
+        self.assertEqual(text.count("[[datasets]]"), 2)
+        self.assertEqual(text.count("control_directory"), 1)
+        self.assertEqual(text.count("control_resolution"), 1)
+        self.assertIn('image_directory = "/ds"', text)
+        self.assertIn('image_directory = "/conv"', text)
 
     def test_ltx_video(self):
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as td:
-            pdir = Path(td)
-            toml = write_dataset_toml("ltx-23", pdir, pdir / "dataset", pdir / "cache",
-                                      {"num_repeats": 1, "epochs": 10, "save_every_n_epochs": 1},
-                                      [768, 512], 1, {"images": 0, "videos": 8},
-                                      {"resolution": "768x512x81", "fps": 25.0})
-            text = toml.read_text()
-            self.assertIn("video_directory", text)
-            self.assertIn("target_frames = [81]", text)
-            self.assertIn("target_fps = 25.0", text)
+        toml = self._write("ltx-23", [
+            {"dir": Path("/ds"), "cache": Path("/cache"), "num_repeats": 1,
+             "media": "video", "control_dir": None, "control_resolution": None},
+        ], resolution=(768, 512),
+            ltx_cfg={"resolution": "768x512x81", "fps": 25.0})
+        text = toml.read_text()
+        self.assertIn("video_directory", text)
+        self.assertIn("target_frames = [81]", text)
+        self.assertIn("target_fps = 25.0", text)
 
     def test_sdscripts_anima(self):
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as td:
-            pdir = Path(td)
-            toml = write_dataset_toml("anima", pdir, pdir / "dataset", pdir / "cache",
-                                      {"num_repeats": 8, "epochs": 80, "save_every_n_epochs": 8},
-                                      [1024, 1024], 8, {"images": 30, "videos": 0})
-            text = toml.read_text()
-            self.assertIn("[[datasets.subsets]]", text)
-            self.assertIn("bucket_reso_steps = 64", text)
-            self.assertIn("num_repeats = 8", text)
+        toml = self._write("anima", [
+            image_subset(Path("/ds"), Path("/cache"), 8),
+        ], batch_size=8)
+        text = toml.read_text()
+        self.assertIn("[[datasets.subsets]]", text)
+        self.assertIn("bucket_reso_steps = 64", text)
+        self.assertIn("num_repeats = 8", text)
 
 
 class TestDetectSource(unittest.TestCase):

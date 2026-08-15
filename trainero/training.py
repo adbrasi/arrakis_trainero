@@ -24,8 +24,8 @@ from .engines import engine_dir, ensure_engine, venv_bin, venv_python
 from .hf_upload import UploadWatcher, create_repo, hf_username, model_card, upload_text
 from .jobs import Job, JobFailed
 from .models_download import ensure_models, resolve
-from .presets import (LORAPLUS_RATIO, MODELS, NETWORK_MODULES, net_types_for,
-                      suggest_schedule, vram_tier)
+from .presets import (CONTROL_RESOLUTION, LORAPLUS_RATIO, MODELS, NETWORK_MODULES,
+                      net_types_for, suggest_schedule, vram_tier)
 
 
 def slugify(name: str) -> str:
@@ -59,14 +59,33 @@ def _toml_lines(d: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 # dataset.toml
 # ---------------------------------------------------------------------------
+# A subset is one [[datasets]] block. Style Rush writes two — the base dataset
+# and the conversion dataset with its control_directory — and the musubi loader
+# keeps their batches apart on its own (buckets are split by control count), so
+# nothing else in the pipeline has to know there is more than one.
 
-def write_dataset_toml(model_key: str, pdir: Path, dataset_dir: Path, cache_dir: Path,
-                       schedule: dict, resolution: list[int], batch_size: int,
-                       stats: dict, ltx_cfg: dict | None = None) -> Path:
+
+def image_subset(dataset_dir: Path, cache_dir: Path, num_repeats: int,
+                 control_dir: Path | None = None,
+                 control_resolution: list[int] | None = None) -> dict:
+    return {"dir": dataset_dir, "cache": cache_dir, "num_repeats": num_repeats,
+            "media": "image", "control_dir": control_dir,
+            "control_resolution": control_resolution}
+
+
+def video_subset(dataset_dir: Path, cache_dir: Path, num_repeats: int) -> dict:
+    return {"dir": dataset_dir, "cache": cache_dir, "num_repeats": num_repeats,
+            "media": "video", "control_dir": None, "control_resolution": None}
+
+
+def write_dataset_toml(model_key: str, path: Path, subsets: list[dict],
+                       resolution: list[int], batch_size: int,
+                       ltx_cfg: dict | None = None) -> Path:
     model = MODELS[model_key]
     engine = model["engine"]
-    path = pdir / ("dataset.toml" if dataset_dir.name == "dataset" else f"dataset_{dataset_dir.name}.toml")
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for sub in subsets:
+        sub["cache"].mkdir(parents=True, exist_ok=True)
 
     if engine == "sd-scripts":
         lines = [
@@ -84,10 +103,14 @@ def write_dataset_toml(model_key: str, pdir: Path, dataset_dir: Path, cache_dir:
             f"resolution = {_toml_value(resolution)}",
             f"batch_size = {batch_size}",
             "",
-            "  [[datasets.subsets]]",
-            f"  image_dir = {_toml_value(str(dataset_dir))}",
-            f"  num_repeats = {schedule['num_repeats']}",
         ]
+        for sub in subsets:
+            lines += [
+                "  [[datasets.subsets]]",
+                f"  image_dir = {_toml_value(str(sub['dir']))}",
+                f"  num_repeats = {sub['num_repeats']}",
+                "",
+            ]
         path.write_text("\n".join(lines) + "\n")
         return path
 
@@ -101,37 +124,33 @@ def write_dataset_toml(model_key: str, pdir: Path, dataset_dir: Path, cache_dir:
         "bucket_no_upscale = true",
         "",
     ]
-    has_videos = stats.get("videos", 0) > 0
-    has_images = stats.get("images", 0) > 0
-
-    if has_images:
-        block = {
-            "image_directory": str(dataset_dir),
-            "cache_directory": str(cache_dir / "images"),
-            "num_repeats": schedule["num_repeats"],
-        }
-        if model.get("needs_control"):
-            block["control_directory"] = str(dataset_dir / "control")
-            block["control_resolution"] = model.get("control_resolution", [1024, 1024])
-        lines += ["[[datasets]]"] + _toml_lines(block) + [""]
-
-    if has_videos:
-        block = {
-            "video_directory": str(dataset_dir),
-            "cache_directory": str(cache_dir / "videos"),
-            "num_repeats": schedule["num_repeats"],
-        }
-        if engine == "musubi-ltx":
-            frames = int((ltx_cfg or {}).get("resolution", "768x512x81").split("x")[2])
-            block["target_frames"] = [frames]
-            block["target_fps"] = float((ltx_cfg or {}).get("fps", 25.0))
-            block["frame_extraction"] = "full"
-            block["max_frames"] = frames
-        else:  # wan
-            vd = MODELS[model_key].get("video_dataset", {})
-            block["target_frames"] = vd.get("target_frames", [1, 33, 65])
-            block["frame_extraction"] = vd.get("frame_extraction", "full")
-            block["max_frames"] = vd.get("max_frames", 81)
+    for sub in subsets:
+        if sub["media"] == "image":
+            block = {
+                "image_directory": str(sub["dir"]),
+                "cache_directory": str(sub["cache"]),
+                "num_repeats": sub["num_repeats"],
+            }
+            if sub.get("control_dir"):
+                block["control_directory"] = str(sub["control_dir"])
+                block["control_resolution"] = sub.get("control_resolution") or CONTROL_RESOLUTION
+        else:
+            block = {
+                "video_directory": str(sub["dir"]),
+                "cache_directory": str(sub["cache"]),
+                "num_repeats": sub["num_repeats"],
+            }
+            if engine == "musubi-ltx":
+                frames = int((ltx_cfg or {}).get("resolution", "768x512x81").split("x")[2])
+                block["target_frames"] = [frames]
+                block["target_fps"] = float((ltx_cfg or {}).get("fps", 25.0))
+                block["frame_extraction"] = "full"
+                block["max_frames"] = frames
+            else:  # wan
+                vd = model.get("video_dataset", {})
+                block["target_frames"] = vd.get("target_frames", [1, 33, 65])
+                block["frame_extraction"] = vd.get("frame_extraction", "full")
+                block["max_frames"] = vd.get("max_frames", 81)
         lines += ["[[datasets]]"] + _toml_lines(block) + [""]
 
     path.write_text("\n".join(lines) + "\n")
@@ -455,8 +474,17 @@ def run_training(job: Job, params: dict) -> None:
             resolution = [w, h]
         except (ValueError, KeyError):
             raise JobFailed(f"resolução LTX inválida: {ltx_cfg.get('resolution')!r} (use LxAxF, ex. 768x512x81)")
-    dataset_toml = write_dataset_toml(model_key, pdir, dataset_dir, pdir / "cache",
-                                      schedule, resolution, batch_size, stats, ltx_cfg)
+    subsets = []
+    if stats.get("images"):
+        subsets.append(image_subset(
+            dataset_dir, pdir / "cache" / "images", schedule["num_repeats"],
+            control_dir=(dataset_dir / "control") if model.get("needs_control") else None,
+            control_resolution=model.get("control_resolution")))
+    if stats.get("videos"):
+        subsets.append(video_subset(dataset_dir, pdir / "cache" / "videos",
+                                    schedule["num_repeats"]))
+    dataset_toml = write_dataset_toml(model_key, pdir / "dataset.toml", subsets,
+                                      resolution, batch_size, ltx_cfg)
     cfg = build_train_config(model_key, overrides, schedule, stats, vram_gb,
                              dataset_toml, output_dir, slug, batch_size)
     job.extra["schedule"] = schedule
