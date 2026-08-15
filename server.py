@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -25,10 +26,46 @@ from trainero.config import (IMAGE_EXTS, VIDEO_EXTS, WEB_PORT, ensure_dirs,
                              gpu_info, hf_token, load_state, update_state)
 from trainero.engines import is_installed
 from trainero.presets import (CAPTION_PROFILES, MODEL_ORDER, MODELS,
-                              public_presets, suggest_schedule)
+                              public_presets, style_rush_models, suggest_schedule)
 from trainero.training import project_dir, run_training, slugify
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
+
+# musubi writes samples as <output_name>_e{epoch:06d}_{idx:02d}_{ts}[_{seed}].png
+# and falls back to a bare step counter when the run is step-based.
+_SAMPLE_RE = re.compile(r"_(e?)(\d{6})_(\d{2})_")
+
+
+def parse_sample_name(name: str) -> tuple[int, int]:
+    """(epoch, index) from a sample filename; (-1, -1) when it does not match."""
+    m = _SAMPLE_RE.search(name)
+    if not m:
+        return (-1, -1)
+    epoch = int(m.group(2)) if m.group(1) == "e" else -1
+    return (epoch, int(m.group(3)))
+
+
+def list_samples(sample_dir: Path) -> list[dict]:
+    """Samples newest first — the UI shows the freshest epoch at the top."""
+    try:
+        files = [p for p in sample_dir.iterdir() if p.is_file() and p.suffix.lower() == ".png"]
+    except OSError:
+        return []
+    # epoch leads: it is the real ordering when the trainer knows it. mtime only
+    # breaks ties (step-based runs report epoch -1 for every file).
+    files.sort(key=lambda p: (parse_sample_name(p.name)[0], p.stat().st_mtime, p.name),
+               reverse=True)
+    out = []
+    for p in files:
+        epoch, idx = parse_sample_name(p.name)
+        out.append({"name": p.name, "epoch": epoch, "idx": idx})
+    return out
+
+
+def safe_sample_name(name: str) -> bool:
+    """A plain .png basename — no separators, no traversal."""
+    return bool(name) and name == Path(name).name and name.lower().endswith(".png") \
+        and ".." not in name
 
 
 def current_project() -> str:
@@ -37,7 +74,11 @@ def current_project() -> str:
 
 def dataset_dir(side: str = "pos") -> Path:
     pdir = project_dir(current_project() or "projeto")
-    return pdir / ("dataset" if side != "neg" else "dataset_neg")
+    return pdir / {"neg": "dataset_neg", "convert": "dataset_convert"}.get(side, "dataset")
+
+
+def sample_dir() -> Path:
+    return project_dir(current_project() or "projeto") / "output" / "sample"
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -79,7 +120,27 @@ class Handler(SimpleHTTPRequestHandler):
         if url.path == "/api/logs":
             job = jobs.current()
             return self._json({"log": job.log_tail() if job else ""})
+        if url.path == "/api/samples":
+            return self._json({"samples": list_samples(sample_dir())})
+        if url.path == "/api/sample":
+            name = parse_qs(url.query).get("name", [""])[0]
+            return self._serve_sample(name)
         return super().do_GET()
+
+    def _serve_sample(self, name: str):
+        if not safe_sample_name(name):
+            return self._error("nome de sample inválido")
+        path = sample_dir() / name
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return self._error("sample não encontrado", 404)
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "max-age=3600")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _status(self):
         job = jobs.current()
@@ -94,6 +155,9 @@ class Handler(SimpleHTTPRequestHandler):
             "gpu": gpu_info(),
             "hf_token": bool(hf_token()),
             "openrouter": bool(os.environ.get("OPENROUTER_API_KEY")),
+            "trigger": load_state().get("trigger", ""),
+            "dataset_convert": ds.inspect(dataset_dir("convert")) if project else {},
+            "style_rush_models": style_rush_models(),
             "engines": {name: is_installed(name) for name in ("musubi", "musubi-ltx", "sd-scripts", "captioner")},
         }
         if project and stats.get("items"):
@@ -134,10 +198,11 @@ class Handler(SimpleHTTPRequestHandler):
             return self._error(str(exc), 409)
 
     def _set_project(self):
-        name = (self._body_json().get("name") or "").strip()
+        body = self._body_json()
+        name = (body.get("name") or "").strip()
         if not name:
             return self._error("nome vazio")
-        update_state(project=name)
+        update_state(project=name, trigger=(body.get("trigger") or "").strip())
         pdir = project_dir(name)
         (pdir / "dataset").mkdir(parents=True, exist_ok=True)
         self._json({"ok": True, "slug": slugify(name)})
@@ -249,6 +314,7 @@ class Handler(SimpleHTTPRequestHandler):
             "project": project,
             "model": model_key,
             "mode": body.get("mode", "lora"),
+            "trigger": (body.get("trigger") or load_state().get("trigger") or "").strip(),
             "overrides": body.get("overrides") or {},
             "slider_targets": body.get("slider_targets") or [],
         }
