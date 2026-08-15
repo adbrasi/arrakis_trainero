@@ -262,6 +262,44 @@ class TestSamplingInConfig(unittest.TestCase):
         self.assertNotIn("sample_prompts", cfg)
 
 
+class TestComfyConvert(unittest.TestCase):
+    def test_anima_uses_its_script(self):
+        from trainero.training import comfy_convert_command
+
+        cmd = comfy_convert_command("anima", Path("/out/a.safetensors"),
+                                    Path("/out/a_comfy.safetensors"))
+        self.assertIsNotNone(cmd)
+        self.assertTrue(any("convert_anima_lora_to_comfy.py" in str(c) for c in cmd))
+        self.assertIn("/out/a.safetensors", [str(c) for c in cmd])
+
+    def test_models_without_the_key_convert_nothing(self):
+        from trainero.training import comfy_convert_command
+
+        for key in ("flux-klein", "qwen-image", "krea2", "wan-22"):
+            self.assertIsNone(
+                comfy_convert_command(key, Path("/o/a.safetensors"),
+                                      Path("/o/a_comfy.safetensors")), key)
+
+    def test_forced_uses_convert_lora_on_musubi(self):
+        from trainero.training import comfy_convert_command
+
+        cmd = [str(c) for c in comfy_convert_command(
+            "flux-klein", Path("/o/a.safetensors"), Path("/o/a_comfy.safetensors"),
+            forced=True)]
+        self.assertTrue(any(c.endswith("convert_lora.py") for c in cmd))
+        self.assertIn("--target", cmd)
+        self.assertIn("other", cmd)
+        self.assertIn("--input", cmd)
+        self.assertIn("--output", cmd)
+
+    def test_forced_on_sdscripts_still_uses_the_script(self):
+        from trainero.training import comfy_convert_command
+
+        cmd = comfy_convert_command("anima", Path("/o/a.safetensors"),
+                                    Path("/o/a_comfy.safetensors"), forced=True)
+        self.assertTrue(any("convert_anima_lora_to_comfy.py" in str(c) for c in cmd))
+
+
 class TestDetectSource(unittest.TestCase):
     def test_kinds(self):
         self.assertEqual(detect_source("https://mega.nz/folder/abc#key"), "mega")

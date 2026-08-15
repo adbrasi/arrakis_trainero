@@ -406,15 +406,43 @@ def launch_training(model_key: str, cfg: dict, pdir: Path, job: Job, toml_name: 
 
 
 # ---------------------------------------------------------------------------
-# Anima -> ComfyUI conversion (runs in the sd-scripts venv)
+# ComfyUI format conversion (runs in the engine venv)
 # ---------------------------------------------------------------------------
+# ComfyUI's model_lora_keys_unet maps `lora_unet_<flattened key>` generically for
+# every architecture, which is exactly what musubi saves — so musubi LoRAs load
+# as-is. The exception is a backend whose module names differ from what ComfyUI
+# loads: sd-scripts' Anima, which ships its own converter. That is why only the
+# Anima preset carries `comfy_convert`. The advanced panel can force conversion
+# on any musubi model via `convert_lora.py --target other` if a model turns out
+# to need it in practice.
 
-def anima_comfy_converter(job: Job):
-    edir = engine_dir("sd-scripts")
-    py = str(venv_python("sd-scripts"))
-    script = edir / "networks" / "convert_anima_lora_to_comfy.py"
+
+def comfy_convert_command(model_key: str, src: Path, dst: Path,
+                          forced: bool = False) -> list[str] | None:
+    model = MODELS[model_key]
+    engine = model["engine"]
+    spec = model.get("comfy_convert")
+    if spec is None:
+        if not forced or engine == "sd-scripts":
+            return None
+        spec = {"convert_lora": True}
+
+    py = str(venv_python(engine))
+    edir = engine_dir(engine)
+    if "script" in spec:
+        return [py, str(edir / spec["script"]), str(src), str(dst)]
+    return [py, str(edir / _script(engine, "convert_lora.py")),
+            "--input", str(src), "--output", str(dst), "--target", "other"]
+
+
+def comfy_converter(model_key: str, job: Job, forced: bool = False):
+    """A fn(ckpt) -> converted path|None for UploadWatcher, or None if unneeded."""
+    probe = comfy_convert_command(model_key, Path("probe"), Path("probe_comfy"), forced)
+    if probe is None:
+        return None
+    script = Path(probe[1])
     if not script.exists():
-        job.log("⚠ convert_anima_lora_to_comfy.py não existe neste sd-scripts — enviando só o formato nativo.")
+        job.log(f"⚠ {script.name} não existe neste engine — enviando só o formato nativo.")
         return None
 
     def convert(ckpt: Path) -> Path | None:
@@ -428,7 +456,9 @@ def anima_comfy_converter(job: Job):
         dest = ckpt.with_name(ckpt.stem + "_comfy.safetensors")
         if dest.exists():
             return None
-        res = subprocess.run([py, str(script), str(ckpt), str(dest)], cwd=str(edir),
+        cmd = comfy_convert_command(model_key, ckpt, dest, forced)
+        res = subprocess.run([str(c) for c in cmd],
+                             cwd=str(engine_dir(MODELS[model_key]["engine"])),
                              capture_output=True, text=True, timeout=600)
         if res.returncode != 0:
             job.log(f"⚠ conversão Comfy falhou: {res.stderr[-400:]}")
@@ -567,7 +597,7 @@ def run_training(job: Job, params: dict) -> None:
                     json.dumps({"model": model_key, "schedule": schedule,
                                 "config": {k: v for k, v in cfg.items() if isinstance(v, (str, int, float, bool))}},
                                indent=2, ensure_ascii=False), job)
-        convert = anima_comfy_converter(job) if model.get("comfy_convert") else None
+        convert = comfy_converter(model_key, job, forced=bool(overrides.get("comfy_convert")))
         watcher = UploadWatcher(repo_id, output_dir, job, convert=convert)
         watcher.start()
 
