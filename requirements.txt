@@ -1,2 +1,3 @@
 # Server venv only — training engines get their own venvs (see trainero/engines.py)
 huggingface_hub[hf_xet]>=0.31.4,<2.0
+pillow>=10.0
