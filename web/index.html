@@ -33,11 +33,18 @@
     <div class="card-head"><span class="step-n">1</span><h2>Projeto</h2></div>
     <div class="row">
       <input id="project-name" type="text" placeholder="nome do LoRA (ex.: makima_v1)" autocomplete="off">
+      <input id="trigger-word" type="text" placeholder="trigger word (ex.: makima_style)" autocomplete="off">
       <div class="mode-toggle" id="mode-toggle">
         <button data-mode="lora" class="active">LoRA</button>
         <button data-mode="slider">Concept Slider</button>
+        <button data-mode="style-rush">Style Rush</button>
       </div>
     </div>
+    <p class="hint" id="style-rush-hint" hidden>
+      Style Rush: manda só o dataset de estilo. O trainer gera 50 pares de conversão com
+      GPT Image (~$0.55), treina 5 epochs salvando checkpoint e sample a cada época, e você
+      cancela quando achar bom.
+    </p>
   </section>
 
   <!-- 2 · Dataset -->
@@ -123,6 +130,9 @@
       <label>Repeats <input type="number" id="adv-repeats" min="1"></label>
       <label>Salvar a cada N epochs <input type="number" id="adv-save" min="1"></label>
       <label id="adv-ltx-res-wrap" hidden>Resolução LTX (LxAxF) <input type="text" id="adv-ltx-res" placeholder="768x512x81"></label>
+      <label class="check"><input type="checkbox" id="adv-sampling" checked> Gerar samples a cada época</label>
+      <label class="check"><input type="checkbox" id="adv-comfy"> Converter LoRA p/ formato ComfyUI</label>
+      <label class="wide">Prompt do sample <input type="text" id="adv-sample-prompt" placeholder="(padrão do trainer)"></label>
       <label class="check"><input type="checkbox" id="adv-hf" checked> Criar repo no HuggingFace</label>
       <label class="check"><input type="checkbox" id="adv-hf-private" checked> Repo privado</label>
     </div>
@@ -140,6 +150,7 @@
     </div>
     <div class="metrics" id="metrics"></div>
     <div id="hf-link-row" hidden></div>
+    <div class="samples" id="samples" hidden></div>
     <pre class="console" id="console"></pre>
   </section>
 

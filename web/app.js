@@ -14,6 +14,7 @@ const state = {
   projectSet: false,
   advTouched: new Set(),
   uploading: false,
+  samples: [],
 };
 
 // ---------------------------------------------------------------- helpers
@@ -41,15 +42,17 @@ const post = (path, body) => api(path, {
 
 // ---------------------------------------------------------------- project
 let projectTimer = null;
-$("#project-name").addEventListener("input", () => {
-  clearTimeout(projectTimer);
-  projectTimer = setTimeout(saveProject, 600);
-});
+for (const id of ["#project-name", "#trigger-word"]) {
+  $(id).addEventListener("input", () => {
+    clearTimeout(projectTimer);
+    projectTimer = setTimeout(saveProject, 600);
+  });
+}
 async function saveProject() {
   const name = $("#project-name").value.trim();
   if (!name) return;
   try {
-    await post("/api/project", { name });
+    await post("/api/project", { name, trigger: $("#trigger-word").value.trim() });
     state.projectSet = true;
     refreshTrainButton();
   } catch (e) { toast(e.message, "error"); }
@@ -69,16 +72,37 @@ function sliderIsNative() {
     state.presets?.models[state.model]?.supports_slider_native;
 }
 
+function styleRush() { return state.mode === "style-rush"; }
+
 function renderModeUI() {
   const slider = state.mode === "slider";
   const native = sliderIsNative();
-  $("#dataset-title").textContent = slider ? (native ? "Pares de prompt do slider" : "Datasets do slider") : "Dataset";
+  const rush = styleRush();
+  $("#dataset-title").textContent = slider
+    ? (native ? "Pares de prompt do slider" : "Datasets do slider")
+    : rush ? "Dataset de estilo" : "Dataset";
   $("#dataset-panels").hidden = slider && native;
   $("#slider-prompts").hidden = !(slider && native);
   $(".ds-panel[data-side=neg]").hidden = !slider || native;
   $(".ds-panel[data-side=pos] .ds-label").hidden = !slider || native;
+  $("#style-rush-hint").hidden = !rush;
   if (slider && native && !$("#pair-list").children.length) addPair();
+  renderModelAvailability();
   refreshTrainButton();
+}
+
+function renderModelAvailability() {
+  const allowed = styleRush() ? (state.status?.style_rush_models || []) : null;
+  $$(".model-btn").forEach((b) => {
+    const ok = !allowed || allowed.includes(b.dataset.key);
+    b.disabled = !ok;
+    b.classList.toggle("unavailable", !ok);
+  });
+  if (allowed && state.model && !allowed.includes(state.model)) {
+    state.model = null;
+    $$(".model-btn").forEach((b) => b.classList.remove("selected"));
+    $("#preset-line").hidden = true;
+  }
 }
 
 // slider prompt pairs (LTX)
@@ -291,17 +315,29 @@ function collectOverrides() {
   if (touched.has("adv-repeats")) o.num_repeats = parseInt($("#adv-repeats").value, 10);
   if (touched.has("adv-save")) o.save_every_n_epochs = parseInt($("#adv-save").value, 10);
   if (touched.has("adv-ltx-res")) o.ltx_resolution = $("#adv-ltx-res").value.trim();
+  o.sampling = $("#adv-sampling").checked;
+  o.comfy_convert = $("#adv-comfy").checked;
+  const sp = $("#adv-sample-prompt").value.trim();
+  if (sp) o.sample_prompt = sp;
+  const trig = $("#trigger-word").value.trim();
+  if (trig) o.trigger = trig;
   return o;
 }
 
 // ---------------------------------------------------------------- train
 $("#btn-train").addEventListener("click", async () => {
   if (!requireProject() || !state.model) return;
+  if (styleRush() && !$("#trigger-word").value.trim()) {
+    toast("Style Rush precisa de uma trigger word", "error");
+    $("#trigger-word").focus();
+    return;
+  }
   await saveProject();
   try {
     await post("/api/train", {
       model: state.model,
       mode: state.mode,
+      trigger: $("#trigger-word").value.trim(),
       overrides: collectOverrides(),
       slider_targets: sliderTargets(),
     });
@@ -323,7 +359,8 @@ function refreshTrainButton() {
     : (s.dataset?.items || 0) > 0;
   const needNeg = state.mode === "slider" && !sliderIsNative();
   const negOk = !needNeg || (s.dataset_neg?.items || 0) > 0;
-  $("#btn-train").disabled = !!busy || !state.model || !hasData || !negOk;
+  const rushOk = !styleRush() || (!!s.openrouter && !!$("#trigger-word").value.trim());
+  $("#btn-train").disabled = !!busy || !state.model || !hasData || !negOk || !rushOk;
   $("#btn-cancel").hidden = !busy;
 }
 
@@ -341,6 +378,7 @@ async function poll() {
     $("#project-name").value = s.project;
     state.projectSet = true;
   }
+  if (s.trigger && !$("#trigger-word").value) $("#trigger-word").value = s.trigger;
   // chips
   const gpu = s.gpu || {};
   const gc = $("#gpu-chip");
@@ -397,6 +435,7 @@ function renderJob(job) {
     const files = job.extra.hf_files?.length ? ` · ${job.extra.hf_files.length} arquivos enviados` : "";
     hfRow.innerHTML = `🤗 <a href="https://huggingface.co/${job.extra.hf_repo}" target="_blank">${job.extra.hf_repo}</a>${files}`;
   } else hfRow.hidden = true;
+  fetchSamples();
   fetchLog();
 }
 
@@ -411,6 +450,29 @@ async function fetchLog() {
       el.textContent = log;
       if (stick) el.scrollTop = el.scrollHeight;
     }
+  } catch { /* transient */ }
+}
+
+let lastSampleKey = "";
+async function fetchSamples() {
+  try {
+    const { samples } = await api("/api/samples");
+    state.samples = samples;
+    const key = samples.map((s) => s.name).join("|");
+    if (key === lastSampleKey) return;
+    lastSampleKey = key;
+    const box = $("#samples");
+    box.hidden = samples.length === 0;
+    box.innerHTML = samples.slice(0, 12).map((s) => {
+      const label = s.epoch >= 0 ? `epoch ${s.epoch}` : s.name;
+      const href = `/api/sample?name=${encodeURIComponent(s.name)}`;
+      return `<figure>
+        <a href="${href}" target="_blank">
+          <img src="${href}" alt="${label}" loading="lazy">
+        </a>
+        <figcaption>${label}</figcaption>
+      </figure>`;
+    }).join("");
   } catch { /* transient */ }
 }
 
