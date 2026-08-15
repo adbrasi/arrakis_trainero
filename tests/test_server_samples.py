@@ -23,6 +23,12 @@ class TestParseSampleName(unittest.TestCase):
     def test_unknown_name(self):
         self.assertEqual(server.parse_sample_name("whatever.png"), (-1, -1))
 
+    def test_digits_in_the_project_slug_do_not_win(self):
+        # "makima_202601_01_v2" is a legal slug and matches the pattern too
+        self.assertEqual(
+            server.parse_sample_name("makima_202601_01_v2_e000003_00_20260815120000_42.png"),
+            (3, 0))
+
 
 class TestListSamples(unittest.TestCase):
     def test_newest_first(self):
@@ -44,6 +50,12 @@ class TestSafeSampleName(unittest.TestCase):
     def test_rejects_traversal(self):
         for bad in ("../secret.png", "a/b.png", "", "..", "x.txt"):
             self.assertFalse(server.safe_sample_name(bad), bad)
+
+    def test_rejects_nul_byte(self):
+        # open() answers a NUL with ValueError, which is not an OSError and
+        # would escape the handler's except clause
+        self.assertFalse(server.safe_sample_name("a\x00.png"))
+        self.assertFalse(server.safe_sample_name("a.png\x00"))
 
     def test_accepts_plain_png(self):
         self.assertTrue(server.safe_sample_name("m_e000001_00_x_42.png"))

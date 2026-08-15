@@ -264,7 +264,12 @@ MODELS = {
             ("Comfy-Org/Ideogram-4", "text_encoders/qwen3vl_8b_fp8_scaled.safetensors", "qwen3vl_8b_fp8_scaled.safetensors"),
             ("Comfy-Org/Ideogram-4", "vae/flux2-vae.safetensors", "flux2-vae.safetensors"),
         ],
-        "model_args": {"dit": "ideogram4_fp8_scaled.safetensors"},
+        "model_args": {
+            "dit": "ideogram4_fp8_scaled.safetensors",
+            # same as Wan: sampling reads args.vae / args.text_encoder
+            "vae": "flux2-vae.safetensors",
+            "text_encoder": "qwen3vl_8b_fp8_scaled.safetensors",
+        },
         "cache_latents_args": {"vae": "flux2-vae.safetensors", "vae_dtype": "bfloat16"},
         "cache_te_args": {"text_encoder": "qwen3vl_8b_fp8_scaled.safetensors"},
         "network_module": "networks.lora_ideogram4",
@@ -332,6 +337,10 @@ MODELS = {
         "model_args": {
             "dit": "wan2.2_t2v_low_noise_14B_fp16.safetensors",
             "dit_high_noise": "wan2.2_t2v_high_noise_14B_fp16.safetensors",
+            # sampling loads the VAE and T5 from these same args (trainer_base
+            # _prepare_sampling); without them --sample_prompts crashes the run
+            "vae": "wan_2.1_vae.safetensors",
+            "t5": "models_t5_umt5-xxl-enc-bf16.pth",
         },
         "extra_args": {"task": "t2v-A14B"},
         "cache_latents_args": {"vae": "wan_2.1_vae.safetensors"},

@@ -22,7 +22,7 @@ from pathlib import Path
 
 from . import imagegen
 from .config import IMAGE_EXTS, REPO_DIR
-from .jobs import JobFailed
+from .jobs import Cancelled, JobFailed
 
 SLOT_COUNT = 50
 CAPTION_TEMPLATE = "convert the style of this image to the {trigger} style"
@@ -139,11 +139,28 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
 
     pending = [s for s in slots if not done(s["slot"])]
     totals["pairs"] = len(slots) - len(pending)
+
+    # the caption carries the trigger word, so a run with a changed trigger has
+    # to rewrite it even for slots it will not regenerate
+    for slot in slots:
+        if (convert_dir / f"{slot['slot']}.png").exists():
+            (convert_dir / f"{slot['slot']}.txt").write_text(caption, encoding="utf-8")
+
     if pending:
         job.log(f"Gerando {len(pending)} imagens de conversão com {imagegen.MODEL} "
                 f"(quality low) — ~${0.011 * len(pending):.2f}")
     else:
         job.log(f"Dataset de conversão já completo ({len(slots)} pares).")
+
+    def record(name: str, entry: dict, **deltas) -> None:
+        """Persist one slot's outcome. The manifest is written on every slot, not
+        once at the end: a cancelled run (job.check_cancel raises) or a dead pod
+        would otherwise lose the record of images already paid for."""
+        with lock:
+            for k, v in deltas.items():
+                totals[k] += v
+            manifest["slots"][name] = entry
+            _save_manifest(convert_dir, manifest)
 
     def work(slot: dict) -> None:
         job.check_cancel()
@@ -152,30 +169,28 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
         for source in slot["sources"]:  # primary, then the fallback image
             try:
                 png, cost = _generate_with_retries(generate, slot["prompt"], Path(source))
+                (control_dir / f"{name}.png").write_bytes(png)
+                shutil.copyfile(source, convert_dir / f"{name}.png")
+                (convert_dir / f"{name}.txt").write_text(caption, encoding="utf-8")
             except imagegen.RefusedError as exc:
                 refusals += 1
-                with lock:
-                    manifest["slots"][name] = {"status": "refused", "prompt": slot["prompt"],
-                                               "source": source, "error": str(exc)}
+                record(name, {"status": "refused", "prompt": slot["prompt"],
+                              "source": source, "error": str(exc)})
                 continue
-            except imagegen.ImageGenError as exc:
-                with lock:
-                    totals["failed"] += 1
-                    totals["refused"] += refusals
-                    manifest["slots"][name] = {"status": "failed", "prompt": slot["prompt"],
-                                               "source": source, "error": str(exc)}
-                job.log(f"⚠ {name}: {exc}")
+            except Cancelled:
+                raise
+            except Exception as exc:
+                # one unreadable file (an .avif this Pillow cannot open) or one
+                # malformed response must cost its own slot, never the phase
+                record(name, {"status": "failed", "prompt": slot["prompt"], "source": source,
+                              "error": f"{type(exc).__name__}: {exc}"},
+                       failed=1, refused=refusals)
+                job.log(f"⚠ {name}: {type(exc).__name__}: {exc}")
                 return
 
-            (control_dir / f"{name}.png").write_bytes(png)
-            shutil.copyfile(source, convert_dir / f"{name}.png")
-            (convert_dir / f"{name}.txt").write_text(caption, encoding="utf-8")
-            with lock:
-                totals["pairs"] += 1
-                totals["refused"] += refusals
-                totals["cost"] += cost
-                manifest["slots"][name] = {"status": "ok", "prompt": slot["prompt"],
-                                           "source": source, "cost": cost}
+            record(name, {"status": "ok", "prompt": slot["prompt"], "source": source,
+                          "cost": cost},
+                   pairs=1, refused=refusals, cost=cost)
             return
 
         with lock:
@@ -185,7 +200,6 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
     if pending:
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             list(pool.map(work, pending))
-        _save_manifest(convert_dir, manifest)
 
     if totals["pairs"] == 0:
         raise JobFailed(

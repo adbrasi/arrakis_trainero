@@ -38,9 +38,12 @@ _SAMPLE_RE = re.compile(r"_(e?)(\d{6})_(\d{2})_")
 
 def parse_sample_name(name: str) -> tuple[int, int]:
     """(epoch, index) from a sample filename; (-1, -1) when it does not match."""
-    m = _SAMPLE_RE.search(name)
-    if not m:
+    # the LAST match, not the first: a project named "makima_202601_01_v2" puts a
+    # digit run in the slug that would otherwise be read as the epoch
+    matches = list(_SAMPLE_RE.finditer(name))
+    if not matches:
         return (-1, -1)
+    m = matches[-1]
     epoch = int(m.group(2)) if m.group(1) == "e" else -1
     return (epoch, int(m.group(3)))
 
@@ -63,9 +66,13 @@ def list_samples(sample_dir: Path) -> list[dict]:
 
 
 def safe_sample_name(name: str) -> bool:
-    """A plain .png basename — no separators, no traversal."""
-    return bool(name) and name == Path(name).name and name.lower().endswith(".png") \
-        and ".." not in name
+    """A plain .png basename — no separators, no traversal, no NUL.
+
+    A NUL byte survives Path().name and endswith() but makes open() raise
+    ValueError, which is not an OSError — it would escape the handler.
+    """
+    return bool(name) and "\x00" not in name and name == Path(name).name \
+        and name.lower().endswith(".png") and ".." not in name
 
 
 def current_project() -> str:
@@ -202,7 +209,12 @@ class Handler(SimpleHTTPRequestHandler):
         name = (body.get("name") or "").strip()
         if not name:
             return self._error("nome vazio")
-        update_state(project=name, trigger=(body.get("trigger") or "").strip())
+        # only touch the trigger when the client actually sent one: the UI omits
+        # it until it has read the stored value, so a fast typist cannot wipe it
+        fields = {"project": name}
+        if "trigger" in body:
+            fields["trigger"] = (body.get("trigger") or "").strip()
+        update_state(**fields)
         pdir = project_dir(name)
         (pdir / "dataset").mkdir(parents=True, exist_ok=True)
         self._json({"ok": True, "slug": slugify(name)})

@@ -24,6 +24,20 @@ class TestPresets(unittest.TestCase):
             self.assertTrue(m["vram_tiers"], key)
             self.assertEqual(m["vram_tiers"][-1]["min_gb"], 0, f"{key}: last tier must catch all")
 
+    def test_every_model_can_render_a_sample(self):
+        """--sample_prompts makes the trainer load the VAE and the text encoder
+        from the very args model_args writes into the config (trainer_base
+        _prepare_sampling). A preset missing them only crashes after the engine
+        install, the 40 GB download and the caching — so it is caught here."""
+        te_keys = ("text_encoder", "t5", "qwen3", "gemma_root")
+        for key in MODEL_ORDER:
+            m = MODELS[key]
+            if m["engine"] == "musubi-ltx":
+                continue  # ltx2_checkpoint carries the VAE, gemma_root is the TE
+            args = m["model_args"]
+            self.assertIn("vae", args, key)
+            self.assertTrue(set(te_keys) & set(args), key)
+
     def test_vram_tiers_descending(self):
         for key in MODEL_ORDER:
             mins = [t["min_gb"] for t in MODELS[key]["vram_tiers"]]

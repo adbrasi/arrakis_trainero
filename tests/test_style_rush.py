@@ -37,13 +37,21 @@ def _png_bytes(color=b"\x00"):
     return buf.getvalue()
 
 
+#: originals are 64x48, the stub the fake generator returns is 8x8 — the size is
+#: what tells control (generated) from target (original) apart on disk.
+SOURCE_SIZE = (64, 48)
+GENERATED_SIZE = (8, 8)
+
+
 def _make_dataset(root: Path, n: int) -> Path:
     from PIL import Image
 
     base = root / "dataset"
     base.mkdir(parents=True, exist_ok=True)
     for i in range(n):
-        Image.new("RGB", (64, 48)).save(base / f"img_{i:03d}.png")
+        # mixed extensions on purpose: real datasets are not all PNG
+        ext = ".png" if i % 2 == 0 else ".jpg"
+        Image.new("RGB", SOURCE_SIZE).save(base / f"img_{i:03d}{ext}")
         (base / f"img_{i:03d}.txt").write_text("makima, a girl")
     return base
 
@@ -142,6 +150,26 @@ class TestBuildConvertDataset(unittest.TestCase):
             caption = (convert / "slot_00.txt").read_text()
             self.assertEqual(caption, "convert the style of this image to the makima style")
 
+    def test_control_is_the_generated_image_and_target_is_the_original(self):
+        """Swapping these two teaches the LoRA the inverse conversion — 50 API
+        calls and a whole training run wasted, with no symptom until inference."""
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = _make_dataset(root, 60)
+            convert = root / "dataset_convert"
+
+            def fake_generate(prompt, image_path, timeout=300.0):
+                return _png_bytes(), 0.011
+
+            build_convert_dataset(base, convert, "makima", _FakeJob(),
+                                  generate=fake_generate, workers=2)
+            with Image.open(convert / "control" / "slot_00.png") as im:
+                self.assertEqual(im.size, GENERATED_SIZE, "control = saída do GPT Image")
+            with Image.open(convert / "slot_00.png") as im:
+                self.assertEqual(im.size, SOURCE_SIZE, "target = imagem original do dono")
+
     def test_refusal_retries_with_a_different_image(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -184,12 +212,14 @@ class TestBuildConvertDataset(unittest.TestCase):
             root = Path(td)
             base = _make_dataset(root, 10)
             convert = root / "dataset_convert"
-            attempts = {}
+            attempts, calls, failed_at = {}, [], []
 
             def fake_generate(prompt, image_path, timeout=300.0):
                 key = str(image_path)
+                calls.append((prompt, key))
                 attempts[key] = attempts.get(key, 0) + 1
-                if attempts[key] == 1:
+                if attempts[key] == 1:  # every image fails once, then works
+                    failed_at.append(len(calls) - 1)
                     raise RetriableError("HTTP 503")
                 return _png_bytes(), 0.011
 
@@ -198,6 +228,11 @@ class TestBuildConvertDataset(unittest.TestCase):
                                                generate=fake_generate, workers=1)
             self.assertEqual(result["pairs"], SLOT_COUNT)
             self.assertEqual(result["refused"], 0)
+            self.assertEqual(len(failed_at), 10)  # one per distinct image
+            # a transient error retries the SAME image; falling through to the
+            # moderation fallback would be a different (wrong) recovery
+            for i in failed_at:
+                self.assertEqual(calls[i + 1], calls[i], f"retry {i} trocou de imagem")
 
     def test_resume_does_not_regenerate(self):
         with tempfile.TemporaryDirectory() as td:
@@ -239,6 +274,93 @@ class TestBuildConvertDataset(unittest.TestCase):
             self.assertEqual(entry["status"], "ok")
             self.assertTrue(entry["prompt"])
             self.assertTrue(entry["source"])
+
+    def test_cancelling_keeps_what_was_already_paid_for(self):
+        """The owner cancelling mid-phase must not throw away the manifest —
+        without it the next run regenerates all 50 slots and pays again."""
+        from trainero.jobs import Cancelled
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = _make_dataset(root, 60)
+            convert = root / "dataset_convert"
+            made = []
+
+            class _CancelJob(_FakeJob):
+                def check_cancel(self):
+                    if len(made) >= 10:
+                        raise Cancelled()
+
+            def fake_generate(prompt, image_path, timeout=300.0):
+                made.append(prompt)
+                return _png_bytes(), 0.011
+
+            with self.assertRaises(Cancelled):
+                build_convert_dataset(base, convert, "makima", _CancelJob(),
+                                      generate=fake_generate, workers=1)
+
+            manifest = json.loads((convert / MANIFEST_NAME).read_text())
+            self.assertEqual(len(manifest["slots"]), 10)
+
+            second = []
+
+            def counting_generate(prompt, image_path, timeout=300.0):
+                second.append(prompt)
+                return _png_bytes(), 0.011
+
+            result = build_convert_dataset(base, convert, "makima", _FakeJob(),
+                                           generate=counting_generate, workers=1)
+            self.assertEqual(len(second), SLOT_COUNT - 10, "regerou o que já estava pago")
+            self.assertEqual(result["pairs"], SLOT_COUNT)
+
+    def test_one_broken_image_costs_its_slot_not_the_phase(self):
+        """Pillow cannot open every extension in IMAGE_EXTS (.avif). A single
+        unreadable file must not abort the other 49 slots."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = _make_dataset(root, 60)
+            convert = root / "dataset_convert"
+            first = sorted(p for p in base.iterdir() if p.suffix in (".png", ".jpg"))[0]
+
+            def fake_generate(prompt, image_path, timeout=300.0):
+                if Path(image_path) == first:
+                    raise OSError("cannot identify image file")
+                return _png_bytes(), 0.011
+
+            result = build_convert_dataset(base, convert, "makima", _FakeJob(),
+                                           generate=fake_generate, workers=2)
+            self.assertEqual(result["failed"], 1)
+            self.assertEqual(result["pairs"], SLOT_COUNT - 1)
+            manifest = json.loads((convert / MANIFEST_NAME).read_text())
+            bad = [e for e in manifest["slots"].values() if e["status"] == "failed"]
+            self.assertEqual(len(bad), 1)
+            self.assertIn("OSError", bad[0]["error"])
+
+    def test_changing_the_trigger_rewrites_the_captions(self):
+        """Slots are not regenerated on resume, but the caption carries the
+        trigger word — leaving it stale would train the wrong token."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = _make_dataset(root, 60)
+            convert = root / "dataset_convert"
+
+            def fake_generate(prompt, image_path, timeout=300.0):
+                return _png_bytes(), 0.011
+
+            build_convert_dataset(base, convert, "makima", _FakeJob(),
+                                  generate=fake_generate, workers=2)
+            calls = []
+
+            def counting_generate(prompt, image_path, timeout=300.0):
+                calls.append(prompt)
+                return _png_bytes(), 0.011
+
+            build_convert_dataset(base, convert, "outro_estilo", _FakeJob(),
+                                  generate=counting_generate, workers=2)
+            self.assertEqual(calls, [], "não deve pagar a API de novo")
+            for slot in ("slot_00", "slot_49"):
+                self.assertEqual((convert / f"{slot}.txt").read_text(),
+                                 "convert the style of this image to the outro_estilo style")
 
     def test_empty_base_dataset_fails(self):
         with tempfile.TemporaryDirectory() as td:

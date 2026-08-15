@@ -15,6 +15,7 @@ const state = {
   advTouched: new Set(),
   uploading: false,
   samples: [],
+  triggerHydrated: false,
 };
 
 // ---------------------------------------------------------------- helpers
@@ -51,8 +52,12 @@ for (const id of ["#project-name", "#trigger-word"]) {
 async function saveProject() {
   const name = $("#project-name").value.trim();
   if (!name) return;
+  const body = { name };
+  // before the first /api/status lands the field is empty because we have not
+  // read the stored value yet — sending it would erase the saved trigger
+  if (state.triggerHydrated) body.trigger = $("#trigger-word").value.trim();
   try {
-    await post("/api/project", { name, trigger: $("#trigger-word").value.trim() });
+    await post("/api/project", body);
     state.projectSet = true;
     refreshTrainButton();
   } catch (e) { toast(e.message, "error"); }
@@ -86,9 +91,18 @@ function renderModeUI() {
   $(".ds-panel[data-side=neg]").hidden = !slider || native;
   $(".ds-panel[data-side=pos] .ds-label").hidden = !slider || native;
   $("#style-rush-hint").hidden = !rush;
+  renderConvertProgress();
   if (slider && native && !$("#pair-list").children.length) addPair();
   renderModelAvailability();
   refreshTrainButton();
+}
+
+// pairs already on disk, so a resumed run shows what it will not pay for again
+function renderConvertProgress() {
+  const el = $("#convert-progress");
+  const pairs = state.status?.dataset_convert?.control_images || 0;
+  el.hidden = !styleRush() || pairs === 0;
+  if (!el.hidden) el.textContent = `${pairs}/50 pares de conversão já gerados.`;
 }
 
 function renderModelAvailability() {
@@ -378,7 +392,12 @@ async function poll() {
     $("#project-name").value = s.project;
     state.projectSet = true;
   }
-  if (s.trigger && !$("#trigger-word").value) $("#trigger-word").value = s.trigger;
+  // read the stored trigger exactly once: re-filling it every poll would undo
+  // the owner clearing the field (the save is debounced 600ms behind it)
+  if (!state.triggerHydrated) {
+    $("#trigger-word").value = s.trigger || "";
+    state.triggerHydrated = true;
+  }
   // chips
   const gpu = s.gpu || {};
   const gc = $("#gpu-chip");
@@ -400,6 +419,10 @@ async function poll() {
     $("#status-text").textContent = busy ? s.job.title : "pronto";
   }
   renderDatasetStats();
+  // both depend on the status payload, so they also recover from the first poll
+  // landing after the owner already picked a mode
+  renderModelAvailability();
+  renderConvertProgress();
   fillAdvanced();
   refreshTrainButton();
 }
