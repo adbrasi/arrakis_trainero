@@ -1,8 +1,13 @@
 # Style Rush — Design
 
-Data: 2026-08-15. Status: aprovado pelo dono (sampling em todo modo, prompt padrão único,
-`control_resolution = [1024, 1024]`, balanceamento 70/30, moderação `low` com uma segunda
-tentativa em outra imagem).
+Data: 2026-08-15. Status: aprovado pelo dono.
+
+Decisões do dono, na ordem em que foram dadas: dataset de conversão **sempre com 50 pares**,
+independente do tamanho do dataset enviado; **5 epochs no máximo** (ele cancela quando achar
+que está bom); **checkpoint e sample a cada época**; sampling **em todo modo**, com **um**
+prompt padrão de t2i começando pela trigger phrase; `control_resolution = [1024, 1024]`;
+moderação `low` com uma segunda tentativa em outra imagem; conversão pro formato ComfyUI
+onde for necessária.
 
 ## O que é
 
@@ -15,20 +20,20 @@ O LoRA resultante sabe duas coisas:
 1. **gerar** no estilo do dataset (t2i, disparado pela trigger word);
 2. **converter** uma imagem de qualquer outro estilo para esse estilo (edição com control image).
 
-O dataset sintético é o que ensina (2): para cada imagem do dataset, o GPT Image produz uma
-versão dela em **outro** estilo; essa versão vira a *control image* e a imagem original vira
-o *target*. O modelo aprende o caminho "estilo qualquer → meu estilo".
+O dataset sintético é o que ensina (2): para cada imagem, o GPT Image produz uma versão dela
+em **outro** estilo; essa versão vira a *control image* e a imagem original vira o *target*.
+O modelo aprende o caminho "estilo qualquer → meu estilo".
 
 ## Fluxo do dono
 
 Nome do projeto → **trigger word** → arrasta o dataset → **TREINAR**. Nada mais. Tudo abaixo
-acontece como fase do job, com log e progresso na mesma página.
+acontece como fase do job, com log, progresso e galeria de samples na mesma página.
 
 ## Modelos elegíveis
 
 Só os que aceitam control image no musubi: **Flux Klein 9B** (`klein-base-9b`, default) e
-**Qwen Image Edit**. A elegibilidade é derivada de uma chave `supports_control` no preset —
-não existe lista paralela.
+**Qwen Image Edit**. A elegibilidade sai de uma chave `supports_control` no preset — não
+existe lista paralela.
 
 Verificado no musubi-tuner (`kohya-ss/musubi-tuner@main`):
 
@@ -52,15 +57,24 @@ Inalterado.
 `data_araknideo`, profile **`generic-style`**, `--prompt_var style_name=<trigger>`. Esse
 profile já obriga a caption a começar exatamente com a trigger word (system prompt:
 "Every caption MUST start with exactly this trigger phrase"). Roda apenas se houver itens
-sem `.txt`; itens com caption manual são preservados.
+sem `.txt`; captions manuais são preservadas.
 
-### 3. Dataset de conversão
+### 3. Dataset de conversão — sempre 50 pares
 
-Amostra **até 50** imagens do dataset base (todas, se houver menos). Sorteio determinístico
-(seed fixa) para que uma retomada reproduza a mesma seleção.
+`data/style_prompts.txt` tem **50 prompts de estilo**, um por linha (expansão das 9 linhas do
+dono). São 50 slots; slot `i` usa o prompt `i`.
 
-Cada slot recebe **um prompt de estilo distinto** de `data/style_prompts.txt` (50 linhas,
-expandido a partir das 9 do dono). Chamada à Images API do OpenRouter:
+A imagem de origem de cada slot vem do dataset base, percorrido em ordem embaralhada com
+seed fixa e **circular**:
+
+- dataset com ≥ 50 imagens → 50 imagens distintas;
+- dataset com menos → as imagens se repetem, sempre com prompts diferentes (30 imagens → cada
+  uma aparece 1 ou 2 vezes, com estilos distintos).
+
+O tamanho do dataset enviado não muda nada além de quais imagens são sorteadas. Sem fórmula
+de balanceamento: os dois datasets entram no treino com `num_repeats = 1`.
+
+Chamada à Images API do OpenRouter, uma por slot:
 
 ```
 POST https://openrouter.ai/api/v1/images
@@ -69,32 +83,34 @@ POST https://openrouter.ai/api/v1/images
   "prompt": "<linha do style_prompts.txt>",
   "n": 1,
   "quality": "low",
-  "aspect_ratio": "<1:1 | 3:2 | 2:3 | 4:3 | 3:4 | 16:9 | 9:16, o mais próximo do original>",
+  "aspect_ratio": "<1:1|3:2|2:3|4:3|3:4|16:9|9:16, o mais próximo do original>",
   "moderation": "low",
   "input_references": [{"type": "image_url", "image_url": {"url": "data:image/...;base64,..."}}]
 }
 ```
 
-Confirmado no catálogo `/api/v1/images/models`: `openai/gpt-image-2` aceita
-`input_references` (0–16), `quality` (`auto|low|medium|high`), `aspect_ratio` e passthrough
-de `moderation`. Não aceita `size`/`resolution` — a saída de `quality: low` já é 1K nativo,
-que é o pedido do dono.
+Confirmado no catálogo `/api/v1/images/models`: `openai/gpt-image-2` aceita `input_references`
+(0–16), `quality` (`auto|low|medium|high`), `aspect_ratio` e passthrough de `moderation`.
+Não aceita `size`/`resolution` — a saída de `quality: low` já é 1K nativo, que é o pedido.
 
 Custo (pricing do endpoint OpenAI no OpenRouter): `output_image` $3e-5/token,
-`input_image` $8e-6/token → ~$0.011 por imagem, **~$0.55 pelas 50**.
+`input_image` $8e-6/token → ~$0.011 por imagem, **~$0.55 pelos 50 slots**.
 
-**Recusa da moderação:** o slot tenta uma segunda vez com **outra imagem** do pool ainda não
-usado. Duas tentativas por slot, sempre no mesmo modelo. Falhou duas vezes → o slot é
-descartado e o dataset fecha com menos pares; o log diz quantos e por quê.
+**Recusa da moderação:** o slot tenta uma segunda vez com **outra imagem** do pool, mesmo
+prompt e mesmo modelo. Duas tentativas por slot, no máximo. Falhou nas duas → o slot é
+descartado e o log diz quantos caíram e por quê.
 
 Saída, em `projects/<slug>/dataset_convert/`:
 
 | Arquivo | Conteúdo |
 |---|---|
-| `<stem>.png` | cópia da imagem original (target) |
-| `control/<stem>.png` | saída do GPT Image (control) |
-| `<stem>.txt` | `convert the style of this image to the <trigger> style` — idêntico nos 50 |
-| `.style_rush.json` | manifest: imagem de origem, prompt usado, status, custo |
+| `<slot>.png` | cópia da imagem de origem (target) |
+| `control/<slot>.png` | saída do GPT Image (control) |
+| `<slot>.txt` | `convert the style of this image to the <trigger> style` — idêntico nos 50 |
+| `.style_rush.json` | manifest: slot, imagem de origem, prompt, status, custo |
+
+O nome do arquivo é o índice do slot (`slot_00`…`slot_49`), não o nome da imagem original —
+é o que permite a mesma imagem aparecer em slots diferentes quando o dataset tem menos de 50.
 
 O manifest torna a fase idempotente: cancelar e reapertar TREINAR não regera o que já existe.
 
@@ -102,7 +118,7 @@ Paralelismo: `ThreadPoolExecutor` com 4 workers (50 chamadas sequenciais levaria
 
 ### 4. Configuração
 
-Um `dataset.toml` com dois subsets:
+Um `dataset.toml` com dois subsets, ambos `num_repeats = 1`:
 
 ```toml
 [general]
@@ -122,26 +138,18 @@ image_directory = ".../dataset_convert"
 cache_directory = ".../cache/convert"
 control_directory = ".../dataset_convert/control"
 control_resolution = [1024, 1024]
-num_repeats = 3
+num_repeats = 1
 ```
 
-`control_resolution = [1024, 1024]` (não os `[2024, 2024]` do inference oficial do FLUX.2):
+`control_resolution = [1024, 1024]`, não os `[2024, 2024]` do inference oficial do FLUX.2:
 1024 dá 4096 tokens de referência, o que já dobra o comprimento da sequência dos batches de
-conversão; 2024 daria 4x isso em VRAM e tempo por step sem ganho para este uso, já que a
-saída do GPT Image é 1K nativo.
+conversão; 2024 custaria 4x isso em VRAM e tempo por step sem ganho aqui, já que a saída do
+GPT Image é 1K nativo.
 
-**Balanceamento 70/30.** As exposições — não os itens — ficam 70% no base e 30% na conversão:
-
-```
-repeats_base = clamp(round(250 / N_base), 1, 20)
-repeats_conv = clamp(round(repeats_base * (30/70) * (N_base / N_conv)), 1, 40)
-itens_por_epoch = N_base*repeats_base + N_conv*repeats_conv
-epochs = clamp(round(target_steps * batch_size / itens_por_epoch), 4, 40)
-save_every_n_epochs = max(1, round(epochs / 10))
-```
-
-Exemplo (200 base, 50 conv): repeats 1 e 2 → 200 vs 100 exposições (67/33), 7 epochs,
-~2100 steps. Exemplo (30 base, 30 conv): repeats 8 e 3 → 240 vs 90 (73/27), 6 epochs.
+**Schedule do Style Rush:** `num_repeats = 1`, `max_train_epochs = 5`,
+`save_every_n_epochs = 1`, `sample_every_n_epochs = 1`. Nada de `target_steps` ou cálculo de
+epochs — o dono olha os samples e cancela quando achar bom. Os outros modos (LoRA padrão e
+Concept Slider) mantêm o `suggest_schedule` que existe hoje.
 
 `write_dataset_toml` passa a receber uma **lista de subsets**; o modo LoRA normal e o slider
 passam uma lista de um elemento. Um único caminho de código escreve todos os TOMLs.
@@ -152,20 +160,10 @@ Inalterado: um comando cada, o `--dataset_config` cobre os dois subsets.
 
 ### 6. Treino com sampling
 
-`--sample_prompts <pdir>/sample_prompts.txt --sample_every_n_epochs <save_every> --sample_at_first`.
+`--sample_prompts <pdir>/sample_prompts.txt --sample_every_n_epochs 1 --sample_at_first`.
 
-Sampling é **ligado em todos os modos e modelos**, não só no Style Rush. A frequência é
-amarrada ao `save_every_n_epochs`: cada sample corresponde ao checkpoint recém-salvo,
-o que dá ~10 samples por treino sem desperdiçar tempo de GPU.
-
-O suporte a `--sample_prompts` está confirmado no musubi upstream (`training/parser_common.py`,
-`training/trainer_base.py`) e o `flux_2_train_network.py` implementa `do_inference` com
-`control_image_path`. Para os outros dois engines — `musubi-ltx` (fork LTX 2.3) e `sd-scripts`
-(Anima) — a existência do argumento é verificada na instalação do engine; se um deles não
-tiver o argumento, o sampling fica desligado **para aquele modelo**, registrado no log, e o
-resto do preset segue igual. Nada de emular sampling por fora do trainer.
-
-**Um prompt padrão**, começando pela trigger word:
+Sampling é **ligado em todos os modos e modelos**, não só no Style Rush, a cada época.
+Um único prompt, começando pela trigger word:
 
 ```
 <trigger>, a girl with long hair sitting on her bed in a sunlit bedroom, holding a cup of
@@ -173,14 +171,48 @@ coffee, a cat curled up on her lap, looking at the viewer, detailed background
 --w 1024 --h 1024 --d 42 --s 28 --g 4.0
 ```
 
-Editável num campo do painel avançado. Fora do Style Rush a trigger word é opcional; sem
-ela, o prompt vai sem prefixo. Para modelos de vídeo, o `--f` sai do preset.
+Editável num campo do painel avançado. Fora do Style Rush a trigger é opcional; sem ela o
+prompt vai sem prefixo. Para modelos de vídeo o `--f` sai do preset.
+
+Suporte confirmado no musubi upstream (`training/parser_common.py:286-304`,
+`training/trainer_base.py:853`); `docs/krea2.md:233` documenta o uso com `--text_encoder`.
+Para `musubi-ltx` (fork LTX 2.3) e `sd-scripts` (Anima) a existência do argumento é verificada
+na instalação do engine; faltando, o sampling fica desligado **para aquele modelo**, com aviso
+no log, e o resto do preset segue igual. Nada de emular sampling por fora do trainer.
+
 Samples caem em `output/sample/<output_name>_e{epoch:06d}_{idx:02d}_{ts}_{seed}.png`
-(padrão do `trainer_base.py:1001`).
+(`trainer_base.py:1001`).
 
-### 7. Upload HF
+### 7. Upload HF + formato ComfyUI
 
-Inalterado (watcher de checkpoints + model card).
+O watcher de checkpoints já existente sobe cada `.safetensors` novo. O que muda: a conversão
+pro formato ComfyUI, hoje hardcoded no Anima, vira uma chave de dados no preset.
+
+```python
+"comfy_convert": {"script": "networks/convert_anima_lora_to_comfy.py"}   # Anima (sd-scripts)
+"comfy_convert": {"convert_lora": True}                                  # musubi: --target other
+```
+
+`{"convert_lora": True}` roda, no venv do engine:
+`python convert_lora.py --input <ckpt> --output <ckpt>_comfy.safetensors --target other`.
+Os dois arquivos vão pro HF.
+
+**Quais modelos ligam isso hoje: só o Anima.** Evidência:
+
+- `comfy/lora.py::model_lora_keys_unet` (ComfyUI master) abre com um bloco **genérico para
+  toda arquitetura** que registra `lora_unet_<chave_achatada>` para cada chave do modelo —
+  exatamente o formato que o musubi salva. Os blocos `isinstance(model, QwenImage/Krea2/
+  Flux/…)` que vêm depois adicionam suporte a LoRAs em formato *diffusers*; não corrigem o
+  formato do musubi.
+- O musubi fornece script de conversão pro ComfyUI em exatamente duas arquiteturas
+  (`networks/convert_hunyuan_video_1_5_lora_to_comfy.py`, `networks/convert_z_image_lora_to_comfy.py`)
+  e nenhuma delas está no Trainero.
+- `docs/wan.md:205`: "The trained LoRA weights are seemed to be compatible with ComfyUI".
+- Anima é sd-scripts e tem script dedicado no próprio repo.
+
+Como isso é inferência sobre o comportamento do ComfyUI e não teste em GPU, o painel avançado
+ganha um checkbox **"Converter LoRA p/ formato ComfyUI"** (default: o que o preset declarar).
+Se o Flux Klein precisar na prática, é marcar a caixa — ou uma linha no `presets.py`.
 
 ## UI
 
@@ -190,7 +222,8 @@ Inalterado (watcher de checkpoints + model card).
   captions e pelo prompt de sample. Obrigatório no Style Rush.
 - **Galeria de samples** no card de progresso: grade das últimas imagens, mais recente
   primeiro, alimentada pelo polling que já existe.
-- Painel avançado ganha: checkbox `Gerar samples` (ON) e o campo do prompt de sample.
+- Painel avançado ganha: checkbox `Gerar samples` (ON), campo do prompt de sample e checkbox
+  `Converter LoRA p/ formato ComfyUI`.
 
 API nova: `GET /api/samples` (lista `{name, epoch, idx}` de `output/sample/*.png`) e
 `GET /api/sample?name=<basename>` (serve o PNG; valida basename, sem travessia).
@@ -200,12 +233,12 @@ API nova: `GET /api/samples` (lista `{name, epoch, idx}` de `output/sample/*.png
 | Arquivo | Papel |
 |---|---|
 | `trainero/imagegen.py` | cliente da Images API do OpenRouter: monta payload, faz POST, decodifica b64. stdlib `urllib` + Pillow. Sem estado. |
-| `trainero/style_rush.py` | monta o dataset de conversão: amostragem, retry em outra imagem, manifest, escrita dos pares. |
+| `trainero/style_rush.py` | monta o dataset de conversão: 50 slots, retry em outra imagem, manifest, escrita dos pares. |
 | `data/style_prompts.txt` | os 50 prompts de estilo, um por linha, editável. |
-| `trainero/presets.py` | `supports_control`, `style_rush_split = 0.7`, `sample_prompt` default. |
-| `trainero/training.py` | `write_dataset_toml` por lista de subsets; `write_sample_prompts`; `run_style_rush_training`. |
+| `trainero/presets.py` | `supports_control`, `comfy_convert` como dado, `sample_prompt` default, schedule fixo do Style Rush. |
+| `trainero/training.py` | `write_dataset_toml` por lista de subsets; `write_sample_prompts`; conversor ComfyUI genérico; `run_style_rush_training`. |
 | `server.py` | endpoints `/api/samples` e `/api/sample`; `side="convert"`. |
-| `web/*` | modo, trigger no topo, galeria, dois campos no painel avançado. |
+| `web/*` | modo, trigger no topo, galeria, campos novos no painel avançado. |
 
 Dependência nova: **Pillow** (ler dimensões para o aspect ratio, converter e salvar).
 HTTP fica em `urllib` da stdlib — nenhuma dependência de rede nova no venv do servidor.
@@ -215,24 +248,25 @@ HTTP fica em `urllib` da stdlib — nenhuma dependência de rede nova no venv do
 Mesma regra do resto do projeto: nada de gambiarra. Falha em qualquer fase para o job com a
 causa real no log e na UI.
 
-- Sem `OPENROUTER_API_KEY` → o modo Style Rush nem habilita o botão, com a mensagem dizendo
-  qual variável falta.
-- Todas as 50 recusadas → job falha dizendo que o dataset de conversão ficou vazio, em vez de
-  treinar um LoRA que não aprende a converter.
-- Falha parcial → segue com os pares que deram certo e o log informa o número final.
+- Sem `OPENROUTER_API_KEY` → o modo Style Rush nem habilita o botão, dizendo qual variável falta.
 - Trigger word vazia no Style Rush → erro antes de gastar um centavo de API.
+- Todos os 50 slots recusados → job falha dizendo que o dataset de conversão ficou vazio, em
+  vez de treinar um LoRA que não aprende a converter.
+- Falha parcial → segue com os slots que deram certo e o log informa o número final.
 
 ## Testes
 
 Puros, sem GPU nem rede:
 
-- balanceamento 70/30: as exposições batem em datasets de tamanhos variados (grande/pequeno,
-  base menor que conv, conv vazio).
+- seleção de slots: 50 slots sempre; ≥50 imagens → todas distintas; <50 → repetição circular
+  com prompts distintos; dataset vazio → erro.
 - `write_dataset_toml` com dois subsets produz TOML com exatamente um `control_directory`.
 - `build_payload` do `imagegen`: aspect ratio escolhido para dimensões variadas, quality low,
   moderation low, referência como data URI.
-- `style_rush`: retomada a partir de um manifest parcial não regera nada; recusa consome a
+- `style_rush`: retomada a partir de manifest parcial não regera nada; recusa consome a
   segunda tentativa com outra imagem e para por aí.
-- `write_sample_prompts`: trigger na frente, flags `--w/--h/--d/--s/--g` presentes.
+- `write_sample_prompts`: trigger na frente, flags `--w/--h/--d/--s/--g` presentes; sem
+  trigger, prompt sem prefixo.
+- schedule do Style Rush: repeats 1, epochs 5, save 1, sample 1, independente do dataset.
 
 Smoke: servidor sobe e `/api/samples` responde vazio sem projeto.
