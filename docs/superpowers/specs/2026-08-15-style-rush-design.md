@@ -163,13 +163,23 @@ Inalterado: um comando cada, o `--dataset_config` cobre os dois subsets.
 `--sample_prompts <pdir>/sample_prompts.txt --sample_every_n_epochs 1 --sample_at_first`.
 
 Sampling é **ligado em todos os modos e modelos**, não só no Style Rush, a cada época.
-Um único prompt, começando pela trigger word:
+
+Um único prompt padrão, o mesmo para **todos os modelos de imagem**, em prosa inglesa
+descritiva, precedido pela trigger word:
 
 ```
-<trigger>, a girl with long hair sitting on her bed in a sunlit bedroom, holding a cup of
-coffee, a cat curled up on her lap, looking at the viewer, detailed background
---w 1024 --h 1024 --d 42 --s 28 --g 4.0
+<trigger>, A young woman sits alone at a tall window in a quiet apartment at golden hour,
+one knee drawn up onto the cushioned sill, both hands wrapped around a chipped ceramic mug.
+Late sunlight falls across her in long amber bars, warm on her cheek and throat, and fine
+dust turns slowly in the air. A grey cat lies curled asleep against her hip, one paw over
+its face. Her hair spills loose over one shoulder, her sweater slipping wide at the collar,
+and she looks out through the glass with a soft, unhurried gaze while the city beyond
+dissolves into hazy blue rooftops. --w 1024 --h 1024 --d 42 --s 28 --g 4.0
 ```
+
+O texto é escolhido para exercitar de uma vez as coisas que revelam se o LoRA está aprendendo
+ou queimando: rosto e olhar, mãos segurando um objeto, tecido, um animal, luz direcional
+quente com sombra, e um fundo com profundidade.
 
 Editável num campo do painel avançado. Fora do Style Rush a trigger é opcional; sem ela o
 prompt vai sem prefixo. Para modelos de vídeo o `--f` sai do preset.
