@@ -20,11 +20,13 @@ from pathlib import Path
 
 from . import dataset as ds
 from .config import PROJECTS_DIR, gpu_info
-from .engines import engine_dir, ensure_engine, venv_bin, venv_python
+from .engines import (engine_dir, ensure_engine, supports_sampling, venv_bin,
+                      venv_python)
 from .hf_upload import UploadWatcher, create_repo, hf_username, model_card, upload_text
 from .jobs import Job, JobFailed
 from .models_download import ensure_models, resolve
 from .presets import (CONTROL_RESOLUTION, LORAPLUS_RATIO, MODELS, NETWORK_MODULES,
+                      SAMPLE_GUIDANCE, SAMPLE_PROMPT, SAMPLE_SEED, SAMPLE_STEPS,
                       net_types_for, suggest_schedule, vram_tier)
 
 
@@ -158,12 +160,41 @@ def write_dataset_toml(model_key: str, path: Path, subsets: list[dict],
 
 
 # ---------------------------------------------------------------------------
+# Sample prompts
+# ---------------------------------------------------------------------------
+# One prompt, every model. The trainer writes the images to output_dir/sample/
+# and the UI polls that folder — nothing here has to move files around.
+
+
+def sample_prompt_line(prompt_text: str, trigger: str, resolution: list[int],
+                       frames: int | None = None) -> str:
+    text = prompt_text.strip()
+    if trigger.strip():
+        text = f"{trigger.strip()}, {text}"
+    width, height = int(resolution[0]), int(resolution[1])
+    parts = [text, f"--w {width}", f"--h {height}"]
+    if frames:
+        parts.append(f"--f {int(frames)}")
+    parts += [f"--d {SAMPLE_SEED}", f"--s {SAMPLE_STEPS}", f"--g {SAMPLE_GUIDANCE}"]
+    return " ".join(parts)
+
+
+def write_sample_prompts(path: Path, prompt_text: str, trigger: str,
+                         resolution: list[int], frames: int | None = None) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(sample_prompt_line(prompt_text, trigger, resolution, frames) + "\n",
+                    encoding="utf-8")
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Train config
 # ---------------------------------------------------------------------------
 
 def build_train_config(model_key: str, overrides: dict, schedule: dict, stats: dict,
                        vram_gb: float, dataset_toml: Path, output_dir: Path,
-                       output_name: str, batch_size: int) -> dict:
+                       output_name: str, batch_size: int,
+                       sample_prompts: Path | None = None) -> dict:
     """Resolved flat dict of training args (musubi/sd-scripts arg names)."""
     model = MODELS[model_key]
     tier = vram_tier(model_key, vram_gb)
@@ -214,6 +245,10 @@ def build_train_config(model_key: str, overrides: dict, schedule: dict, stats: d
         "max_data_loader_n_workers": 2,
         "persistent_data_loader_workers": True,
     })
+    if sample_prompts is not None:
+        cfg["sample_prompts"] = str(sample_prompts)
+        cfg["sample_every_n_epochs"] = 1
+        cfg["sample_at_first"] = True
     if model["engine"] == "sd-scripts":
         cfg["attn_mode"] = "torch"
         cfg["lr_warmup_steps"] = 0.1  # ratio
@@ -474,6 +509,20 @@ def run_training(job: Job, params: dict) -> None:
             resolution = [w, h]
         except (ValueError, KeyError):
             raise JobFailed(f"resolução LTX inválida: {ltx_cfg.get('resolution')!r} (use LxAxF, ex. 768x512x81)")
+    sample_path = None
+    if overrides.get("sampling", True) and supports_sampling(engine):
+        frames = None
+        if model["media"] == "video":
+            frames = int(ltx_cfg["resolution"].split("x")[2]) if engine == "musubi-ltx" \
+                else (model.get("video_dataset", {}).get("max_frames") or 81)
+        sample_path = write_sample_prompts(
+            pdir / "sample_prompts.txt",
+            overrides.get("sample_prompt") or SAMPLE_PROMPT,
+            overrides.get("trigger", ""), resolution, frames)
+        job.log(f"Samples a cada época: {sample_path}")
+    elif overrides.get("sampling", True):
+        job.log(f"⚠ engine {engine} não tem --sample_prompts — sampling desligado.")
+
     subsets = []
     if stats.get("images"):
         subsets.append(image_subset(
@@ -486,7 +535,8 @@ def run_training(job: Job, params: dict) -> None:
     dataset_toml = write_dataset_toml(model_key, pdir / "dataset.toml", subsets,
                                       resolution, batch_size, ltx_cfg)
     cfg = build_train_config(model_key, overrides, schedule, stats, vram_gb,
-                             dataset_toml, output_dir, slug, batch_size)
+                             dataset_toml, output_dir, slug, batch_size,
+                             sample_prompts=sample_path)
     job.extra["schedule"] = schedule
     job.extra["config_summary"] = {
         "network_module": cfg.get("network_module"),

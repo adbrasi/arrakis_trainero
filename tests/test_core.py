@@ -206,6 +206,62 @@ class TestDatasetToml(unittest.TestCase):
         self.assertIn("num_repeats = 8", text)
 
 
+class TestSamplePrompts(unittest.TestCase):
+    def test_line_has_trigger_and_flags(self):
+        from trainero.presets import SAMPLE_PROMPT
+        from trainero.training import sample_prompt_line
+
+        line = sample_prompt_line(SAMPLE_PROMPT, "makima", [1024, 1024])
+        self.assertTrue(line.startswith("makima, A young woman"))
+        self.assertIn("--w 1024", line)
+        self.assertIn("--h 1024", line)
+        self.assertIn("--d 42", line)
+        self.assertIn("--s 28", line)
+        self.assertIn("--g 4.0", line)
+        self.assertNotIn("\n", line)
+
+    def test_no_trigger_means_no_prefix(self):
+        from trainero.training import sample_prompt_line
+
+        line = sample_prompt_line("a cat", "", [1024, 1024])
+        self.assertTrue(line.startswith("a cat --w"))
+
+    def test_video_gets_frame_count(self):
+        from trainero.training import sample_prompt_line
+
+        line = sample_prompt_line("a cat", "trg", [768, 512], frames=81)
+        self.assertIn("--f 81", line)
+
+    def test_write_creates_single_line_file(self):
+        import tempfile
+        from trainero.training import write_sample_prompts
+
+        with tempfile.TemporaryDirectory() as td:
+            path = write_sample_prompts(Path(td) / "sample_prompts.txt",
+                                        "a cat", "trg", [1024, 1024])
+            lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+            self.assertEqual(len(lines), 1)
+
+
+class TestSamplingInConfig(unittest.TestCase):
+    def test_sampling_args_present(self):
+        stats = {"items": 30, "images": 30, "videos": 0}
+        sched = suggest_schedule("flux-klein", 30)
+        cfg = build_train_config("flux-klein", {}, sched, stats, 48,
+                                 Path("/tmp/ds.toml"), Path("/tmp/out"), "test", 1,
+                                 sample_prompts=Path("/tmp/sp.txt"))
+        self.assertEqual(cfg["sample_prompts"], "/tmp/sp.txt")
+        self.assertEqual(cfg["sample_every_n_epochs"], 1)
+        self.assertTrue(cfg["sample_at_first"])
+
+    def test_no_sampling_when_not_requested(self):
+        stats = {"items": 30, "images": 30, "videos": 0}
+        sched = suggest_schedule("flux-klein", 30)
+        cfg = build_train_config("flux-klein", {}, sched, stats, 48,
+                                 Path("/tmp/ds.toml"), Path("/tmp/out"), "test", 1)
+        self.assertNotIn("sample_prompts", cfg)
+
+
 class TestDetectSource(unittest.TestCase):
     def test_kinds(self):
         self.assertEqual(detect_source("https://mega.nz/folder/abc#key"), "mega")

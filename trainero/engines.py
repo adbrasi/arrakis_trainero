@@ -113,3 +113,28 @@ def ensure_system_tool(tool: str, apt_pkg: str, job: Job) -> bool:
     except Exception:
         pass
     return shutil.which(tool) is not None
+
+
+def supports_sampling(engine: str) -> bool:
+    """Whether this engine's trainer accepts --sample_prompts.
+
+    Confirmed present in musubi upstream. The LTX fork and sd-scripts are
+    checked by reading their sources — cheaper and safer than running the
+    trainer with a flag it may reject.
+    """
+    if engine == "musubi":
+        return True
+    root = engine_dir(engine)
+    if not root.exists():
+        return False
+    for py in root.rglob("*.py"):
+        # the engine's own .venv holds tens of thousands of files and none of
+        # them is the trainer — scanning it would cost seconds for nothing
+        if ".venv" in py.parts or "site-packages" in py.parts:
+            continue
+        try:
+            if "--sample_prompts" in py.read_text(encoding="utf-8", errors="ignore"):
+                return True
+        except OSError:
+            continue
+    return False
