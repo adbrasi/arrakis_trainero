@@ -65,6 +65,37 @@ def list_samples(sample_dir: Path) -> list[dict]:
     return out
 
 
+#: how many thumbnails the contact sheet shows before collapsing into "+N"
+THUMB_LIMIT = 24
+THUMB_EDGE = 220
+
+
+def dataset_thumbs(directory: Path, limit: int = THUMB_LIMIT) -> tuple[list[str], int]:
+    """The first `limit` image names in a dataset, plus how many there are."""
+    try:
+        names = sorted(p.name for p in directory.iterdir()
+                       if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
+    except OSError:
+        return [], 0
+    return names[:limit], len(names)
+
+
+def render_thumb(path: Path, edge: int = THUMB_EDGE) -> bytes:
+    """A small square-ish JPEG. The browser would otherwise pull full-size
+    originals — a 40-image dataset of 4K art is hundreds of MB per poll."""
+    import io
+
+    from PIL import Image
+
+    with Image.open(path) as im:
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        im.thumbnail((edge, edge), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=78)
+    return buf.getvalue()
+
+
 def safe_sample_name(name: str) -> bool:
     """A plain .png basename — no separators, no traversal, no NUL.
 
@@ -132,7 +163,31 @@ class Handler(SimpleHTTPRequestHandler):
         if url.path == "/api/sample":
             name = parse_qs(url.query).get("name", [""])[0]
             return self._serve_sample(name)
+        if url.path == "/api/dataset/thumbs":
+            side = parse_qs(url.query).get("side", ["pos"])[0]
+            names, total = dataset_thumbs(dataset_dir(side))
+            return self._json({"names": names, "total": total})
+        if url.path == "/api/dataset/thumb":
+            q = parse_qs(url.query)
+            return self._serve_thumb(q.get("side", ["pos"])[0], q.get("name", [""])[0])
         return super().do_GET()
+
+    def _serve_thumb(self, side: str, name: str):
+        if not name or "\x00" in name or name != Path(name).name or ".." in name:
+            return self._error("nome inválido")
+        path = dataset_dir(side) / name
+        if path.suffix.lower() not in IMAGE_EXTS:
+            return self._error("não é imagem")
+        try:
+            data = render_thumb(path)
+        except (OSError, ValueError):
+            return self._error("miniatura indisponível", 404)
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "max-age=60")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _serve_sample(self, name: str):
         if not safe_sample_name(name):

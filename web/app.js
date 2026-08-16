@@ -69,7 +69,7 @@ $("#mode-toggle").addEventListener("click", (ev) => {
   if (!btn) return;
   state.mode = btn.dataset.mode;
   $$("#mode-toggle button").forEach((b) => b.classList.toggle("active", b === btn));
-  renderModeUI();
+  applyMode();
 });
 
 function sliderIsNative() {
@@ -79,30 +79,38 @@ function sliderIsNative() {
 
 function styleRush() { return state.mode === "style-rush"; }
 
-function renderModeUI() {
-  const slider = state.mode === "slider";
-  const native = sliderIsNative();
-  const rush = styleRush();
-  $("#dataset-title").textContent = slider
-    ? (native ? "Pares de prompt do slider" : "Datasets do slider")
-    : rush ? "Dataset de estilo" : "Dataset";
-  $("#dataset-panels").hidden = slider && native;
-  $("#slider-prompts").hidden = !(slider && native);
-  $(".ds-panel[data-side=neg]").hidden = !slider || native;
-  $(".ds-panel[data-side=pos] .ds-label").hidden = !slider || native;
-  $("#style-rush-hint").hidden = !rush;
-  renderConvertProgress();
-  if (slider && native && !$("#pair-list").children.length) addPair();
-  renderModelAvailability();
-  refreshTrainButton();
-}
+// What each mode is called and what it needs. Visibility itself belongs to the
+// CSS via <html data-mode>: a boolean per element per mode is exactly how the
+// modes started leaking into each other.
+const MODES = {
+  "lora": {
+    title: "Dataset",
+    triggerHelp: "opcional — a palavra que invoca o estilo nos seus prompts",
+  },
+  "slider": {
+    title: "Datasets do slider",
+    nativeTitle: "Pares de prompt",
+    triggerHelp: "opcional — a palavra que invoca o efeito nos seus prompts",
+  },
+  "style-rush": {
+    title: "Dataset de estilo",
+    triggerHelp: "obrigatória — entra em toda caption e no prompt de conversão",
+  },
+};
 
-// pairs already on disk, so a resumed run shows what it will not pay for again
-function renderConvertProgress() {
-  const el = $("#convert-progress");
-  const pairs = state.status?.dataset_convert?.control_images || 0;
-  el.hidden = !styleRush() || pairs === 0;
-  if (!el.hidden) el.textContent = `${pairs}/50 pares de conversão já gerados.`;
+function applyMode() {
+  const root = document.documentElement;
+  const native = sliderIsNative();
+  root.dataset.mode = state.mode;
+  root.dataset.native = native ? "1" : "0";
+  const m = MODES[state.mode];
+  $("#dataset-title").textContent = (native && m.nativeTitle) || m.title;
+  $("#trigger-help").textContent = m.triggerHelp;
+  if (native && !$("#pair-list").children.length) addPair();
+  if (state.status) renderDatasetStats();
+  renderModelAvailability();
+  renderStepState();
+  refreshTrainButton();
 }
 
 function renderModelAvailability() {
@@ -198,19 +206,84 @@ async function uploadFiles(files, side) {
   poll();
 }
 
+// ---------------------------------------------------------------- state lines
+// The margin of every block says, in one short line, what is still missing.
+// Reading the margin top to bottom has to be enough to know what to do next.
+function renderStepState() {
+  const s = state.status || {};
+  const items = s.dataset?.items || 0;
+  const named = !!$("#project-name").value.trim();
+  const trigger = !!$("#trigger-word").value.trim();
+
+  const project = $("#state-project");
+  if (!named) setState(project, "falta o nome", false);
+  else if (styleRush() && !trigger) setState(project, "falta a trigger word", false);
+  else setState(project, named && trigger ? "nome e trigger" : "nomeado", true);
+
+  const ds = $("#state-dataset");
+  const negNeeded = state.mode === "slider" && !sliderIsNative();
+  const negItems = s.dataset_neg?.items || 0;
+  if (sliderIsNative()) setState(ds, `${sliderTargets().length} pares`, sliderTargets().length > 0);
+  else if (!items) setState(ds, "vazio", false);
+  else if (negNeeded && !negItems) setState(ds, "falta o lado (−)", false);
+  else setState(ds, "pronto", true);
+
+  $("#dataset-count").hidden = !items || sliderIsNative();
+  $("#dataset-n").textContent = items;
+
+  const model = $("#state-model");
+  if (!state.model) setState(model, "nenhum escolhido", false);
+  else setState(model, state.presets.models[state.model].label, true);
+}
+
+function setState(el, text, done) {
+  el.textContent = text;
+  el.classList.toggle("done", done);
+}
+
+// ---------------------------------------------------------------- contact sheet
+// Seeing the images is the whole point: a count alone never told anyone whether
+// they uploaded the right folder.
+const sheetKey = {};
+async function renderContactSheet(side, items) {
+  const box = $(`#thumbs-${side}`);
+  const panel = $(`.ds-panel[data-side=${side}]`);
+  panel.classList.toggle("filled", items > 0);
+  if (!items) { box.hidden = true; box.innerHTML = ""; sheetKey[side] = ""; return; }
+  try {
+    const { names, total } = await api(`/api/dataset/thumbs?side=${side}`);
+    const key = `${total}:${names.join("|")}`;
+    if (key === sheetKey[side]) return;
+    sheetKey[side] = key;
+    const cells = names.map((n) => {
+      const src = `/api/dataset/thumb?side=${side}&name=${encodeURIComponent(n)}`;
+      return `<img src="${src}" alt="" loading="lazy">`;
+    });
+    if (total > names.length) cells.push(`<div class="more">+${total - names.length}</div>`);
+    box.innerHTML = cells.join("");
+    box.hidden = false;
+  } catch { /* transient */ }
+}
+
 function renderDatasetStats() {
   const s = state.status || {};
   for (const [side, stats] of [["pos", s.dataset], ["neg", s.dataset_neg]]) {
     const panel = $(`.ds-panel[data-side=${side}]`);
     const box = panel.querySelector(".ds-stats");
+    renderContactSheet(side, stats?.images || 0);
     if (!stats || !stats.items) { box.hidden = true; continue; }
     box.hidden = false;
     const parts = [];
     if (stats.images) parts.push(`<span><b>${stats.images}</b> imagens</span>`);
     if (stats.videos) parts.push(`<span><b>${stats.videos}</b> vídeos</span>`);
-    parts.push(`<span><b>${stats.captions}</b> captions</span>`);
     if (stats.control_images) parts.push(`<span><b>${stats.control_images}</b> control</span>`);
-    if (stats.missing_captions) parts.push(`<span class="warn">⚠ ${stats.missing_captions} sem caption</span>`);
+    // Style Rush writes the captions during training, so counting them here is
+    // noise at best and a false alarm at worst
+    if (styleRush()) parts.push(`<span>captions escritas no treino</span>`);
+    else {
+      parts.push(`<span><b>${stats.captions}</b> captions</span>`);
+      if (stats.missing_captions) parts.push(`<span class="warn">${stats.missing_captions} sem caption</span>`);
+    }
     parts.push(`<span class="clear" data-side="${side}">limpar</span>`);
     box.innerHTML = parts.join("");
     box.querySelector(".clear").addEventListener("click", async () => {
@@ -226,10 +299,12 @@ function renderDatasetStats() {
 function renderCaptionCard() {
   const s = state.status || {};
   const missing = (s.dataset?.missing_captions || 0) + (s.dataset_neg?.missing_captions || 0);
-  const show = missing > 0 && !(sliderIsNative());
+  // Style Rush writes the captions itself during training, with the trigger word
+  // from step 01 — asking the owner to do it here offers a worse path.
+  const show = missing > 0 && !sliderIsNative() && !styleRush();
   $("#caption-card").hidden = !show;
   if (!show) return;
-  $("#caption-msg").textContent = `${missing} itens sem caption — gere com LLM ou suba os .txt`;
+  $("#caption-msg").textContent = `${missing} itens sem caption`;
   $("#caption-key-hint").hidden = !!s.openrouter;
   $("#btn-captions").disabled = !s.openrouter;
   const isVideo = (s.dataset?.videos || 0) > 0;
@@ -281,7 +356,7 @@ function selectModel(key) {
   $("#preset-line").textContent =
     `${m.label} · ${m.engine} · lora dim ${t.network_dim}/${t.network_alpha ?? "auto"} · lr ${t.learning_rate} · ${t.optimizer_type} · epochs automáticos`;
   fillAdvanced();
-  renderModeUI();
+  applyMode();
 }
 
 // ---------------------------------------------------------------- advanced
@@ -368,14 +443,26 @@ $("#btn-cancel").addEventListener("click", async () => {
 function refreshTrainButton() {
   const s = state.status || {};
   const busy = s.job && s.job.status === "running";
-  const hasData = sliderIsNative()
-    ? sliderTargets().length > 0 || state.mode !== "slider"
-    : (s.dataset?.items || 0) > 0;
-  const needNeg = state.mode === "slider" && !sliderIsNative();
-  const negOk = !needNeg || (s.dataset_neg?.items || 0) > 0;
-  const rushOk = !styleRush() || (!!s.openrouter && !!$("#trigger-word").value.trim());
-  $("#btn-train").disabled = !!busy || !state.model || !hasData || !negOk || !rushOk;
+  // one ordered list of what is missing: the first entry becomes the hint next
+  // to the button, so there is never a disabled control with no explanation
+  const blockers = [];
+  if (!$("#project-name").value.trim()) blockers.push("dê um nome ao projeto");
+  if (styleRush() && !$("#trigger-word").value.trim()) blockers.push("preencha a trigger word");
+  if (sliderIsNative()) {
+    if (!sliderTargets().length) blockers.push("adicione um par de prompts");
+  } else if (!(s.dataset?.items || 0)) {
+    blockers.push("importe as imagens");
+  }
+  if (state.mode === "slider" && !sliderIsNative() && !(s.dataset_neg?.items || 0)) {
+    blockers.push("importe o dataset do lado (−)");
+  }
+  if (!state.model) blockers.push("escolha um modelo");
+  if (styleRush() && !s.openrouter) blockers.push("defina OPENROUTER_API_KEY no pod");
+
+  $("#btn-train").disabled = !!busy || blockers.length > 0;
   $("#btn-cancel").hidden = !busy;
+  $("#next-action").textContent = busy ? "treinando — cancele quando os samples ficarem bons"
+    : blockers.length ? `falta: ${blockers[0]}` : "tudo pronto";
 }
 
 // ---------------------------------------------------------------- polling
@@ -406,11 +493,11 @@ async function poll() {
   const hc = $("#hf-chip");
   hc.hidden = false;
   hc.textContent = s.hf_token ? "HF ✓" : "HF token ausente";
-  hc.className = `chip ${s.hf_token ? "ok" : "bad"}`;
+  hc.className = `readout ${s.hf_token ? "ok" : "bad"}`;
   const oc = $("#or-chip");
   oc.hidden = false;
   oc.textContent = s.openrouter ? "OpenRouter ✓" : "OpenRouter —";
-  oc.className = `chip ${s.openrouter ? "ok" : ""}`;
+  oc.className = `readout ${s.openrouter ? "ok" : "bad"}`;
 
   renderJob(s.job);
   if (!state.uploading) {
@@ -422,7 +509,7 @@ async function poll() {
   // both depend on the status payload, so they also recover from the first poll
   // landing after the owner already picked a mode
   renderModelAvailability();
-  renderConvertProgress();
+  renderStepState();
   fillAdvanced();
   refreshTrainButton();
 }

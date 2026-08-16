@@ -61,5 +61,37 @@ class TestSafeSampleName(unittest.TestCase):
         self.assertTrue(server.safe_sample_name("m_e000001_00_x_42.png"))
 
 
+class TestDatasetThumbs(unittest.TestCase):
+    def test_lists_images_and_total(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            for i in range(30):
+                Image.new("RGB", (64, 48)).save(d / f"img_{i:03d}.png")
+            (d / "img_000.txt").write_text("caption")  # captions are not images
+            names, total = server.dataset_thumbs(d, limit=24)
+            self.assertEqual(total, 30)
+            self.assertEqual(len(names), 24)
+            self.assertTrue(all(n.endswith(".png") for n in names))
+
+    def test_missing_dir_is_empty(self):
+        self.assertEqual(server.dataset_thumbs(Path("/nope/ds")), ([], 0))
+
+    def test_thumb_is_small(self):
+        import io
+
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "big.png"
+            Image.new("RGB", (4000, 3000)).save(src)
+            data = server.render_thumb(src, edge=220)
+            with Image.open(io.BytesIO(data)) as im:
+                self.assertLessEqual(max(im.size), 220)
+                self.assertEqual(im.format, "JPEG")
+            self.assertLess(len(data), src.stat().st_size)
+
+
 if __name__ == "__main__":
     unittest.main()
