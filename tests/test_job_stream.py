@@ -107,6 +107,19 @@ class TestCarriageReturnProgress(unittest.TestCase):
         self.assertAlmostEqual(self.job.progress.get("loss"), 0.052)
         self.assertEqual(self.job.progress.get("epoch"), 2)
 
+    def test_a_sampler_bar_does_not_hijack_the_training_progress(self):
+        """Krea 2's sampler prints "Denoising steps: 14/28" once per epoch. An
+        unanchored match let that 28-step bar replace the real 32-step training
+        progress, so the UI bar jumped backwards every time a sample rendered."""
+        self.job.run(child("""
+            import sys
+            sys.stderr.write("steps:  50%|     | 16/32 [01:00<01:00, avr_loss=0.39]\\r")
+            sys.stderr.write("Denoising steps:  50%|     | 14/28 [00:20<00:20]\\r")
+            sys.stderr.write("\\n")
+        """), parse_progress=True)
+        self.assertEqual(self.job.progress.get("step"), 16)
+        self.assertEqual(self.job.progress.get("total_steps"), 32)
+
 
 if __name__ == "__main__":
     unittest.main()

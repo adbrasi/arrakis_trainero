@@ -20,7 +20,11 @@ _lock = threading.RLock()
 _current: "Job | None" = None
 
 # steps:  4%|▌  | 120/3000 [01:00<23:00, 2.0it/s, avr_loss=0.052]
-_STEP_RE = re.compile(r"steps?:\s*\d+%.*?\|\s*(\d+)/(\d+)")
+# Anchored on purpose: the trainers name their bar exactly "steps", while the
+# samplers underneath them print bars of their own ("Denoising steps: 14/28" on
+# Krea 2). An unanchored match let a 28-step sampler overwrite the training
+# progress every epoch, so the UI bar jumped backwards mid-run.
+_STEP_RE = re.compile(r"^\s*steps?:\s*\d+%.*?\|\s*(\d+)/(\d+)")
 _LOSS_RE = re.compile(r"(?:avr_loss|loss)[=:]\s*([0-9.]+(?:e-?\d+)?)")
 _EPOCH_RE = re.compile(r"epoch (\d+)/(\d+)", re.IGNORECASE)
 # keeps the terminator so the reader knows a \r frame from a finished line
