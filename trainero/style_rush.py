@@ -107,11 +107,45 @@ def _generate_with_retries(generate, prompt: str, source: Path):
     raise last
 
 
+def fit_control_to_target(png: bytes, target: Path) -> bytes:
+    """Center-crop the generated image to the target's exact aspect ratio.
+
+    This is what makes a pair a pair. musubi buckets the control and the target
+    independently — BucketSelector.calculate_bucket_resolution derives the shape
+    from each image's OWN aspect ratio, and resize_image_to_bucket then scales to
+    cover and center-crops. Two different ratios therefore become two different
+    bucket shapes cropped along different axes, so the model would be shown a
+    control framed differently from the target it must reproduce.
+
+    The generated image rarely matches: gpt-image-2 only renders the handful of
+    ratios in SUPPORTED_RATIOS, so a 1000x800 source (1.25) comes back as 4:3.
+    Cropping here, before anything is written, makes both land in one bucket.
+    """
+    import io
+
+    from PIL import Image
+
+    with Image.open(target) as t:
+        target_ratio = t.size[0] / t.size[1]
+    with Image.open(io.BytesIO(png)) as control:
+        width, height = control.size
+        if abs(width / height - target_ratio) < 1e-3:
+            return png
+        if width / height > target_ratio:  # too wide — trim the sides
+            new_w, new_h = round(height * target_ratio), height
+        else:                              # too tall — trim top and bottom
+            new_w, new_h = width, round(width / target_ratio)
+        left, top = (width - new_w) // 2, (height - new_h) // 2
+        buf = io.BytesIO()
+        control.crop((left, top, left + new_w, top + new_h)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
                           generate=imagegen.generate, workers: int = 4) -> dict:
     """Produce SLOT_COUNT (control, target, caption) triples under convert_dir.
 
-    control/<slot>.png  the restyled image from GPT Image
+    control/<slot>.png  the restyled image, cropped to the target's aspect ratio
     <slot>.png          an untouched copy of the source image (the target)
     <slot>.txt          the same caption for every slot
 
@@ -169,6 +203,7 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
         for source in slot["sources"]:  # primary, then the fallback image
             try:
                 png, cost = _generate_with_retries(generate, slot["prompt"], Path(source))
+                png = fit_control_to_target(png, Path(source))
                 (control_dir / f"{name}.png").write_bytes(png)
                 shutil.copyfile(source, convert_dir / f"{name}.png")
                 (convert_dir / f"{name}.txt").write_text(caption, encoding="utf-8")

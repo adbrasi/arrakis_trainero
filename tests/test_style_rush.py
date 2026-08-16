@@ -165,8 +165,11 @@ class TestBuildConvertDataset(unittest.TestCase):
 
             build_convert_dataset(base, convert, "makima", _FakeJob(),
                                   generate=fake_generate, workers=2)
+            # the control is the 8px stub (cropped to the target's ratio, so its
+            # long edge stays 8); the target is the owner's untouched original
             with Image.open(convert / "control" / "slot_00.png") as im:
-                self.assertEqual(im.size, GENERATED_SIZE, "control = saída do GPT Image")
+                self.assertEqual(max(im.size), max(GENERATED_SIZE),
+                                 "control = saída do GPT Image")
             with Image.open(convert / "slot_00.png") as im:
                 self.assertEqual(im.size, SOURCE_SIZE, "target = imagem original do dono")
 
@@ -372,6 +375,128 @@ class TestBuildConvertDataset(unittest.TestCase):
             with self.assertRaises(JobFailed):
                 build_convert_dataset(base, root / "dataset_convert", "makima", _FakeJob(),
                                       generate=lambda *a, **k: (_png_bytes(), 0.0))
+
+
+def musubi_bucket(size, resolution=(1024, 1024), reso_steps=32):
+    """Port of musubi's BucketSelector.calculate_bucket_resolution (bucket.py).
+
+    The shape an image gets during training depends only on its aspect ratio,
+    the area budget and the architecture's step size — so two images share a
+    bucket if and only if they share a ratio (after step rounding).
+    """
+    import math
+
+    max_area = resolution[0] * resolution[1]
+    width, height = size
+    ratio = width / height
+    w = int(math.sqrt(max_area * ratio)) // reso_steps * reso_steps
+    h = int(math.sqrt(max_area / ratio)) // reso_steps * reso_steps
+    return (max(w, reso_steps), max(h, reso_steps))
+
+
+class TestControlTargetPairing(unittest.TestCase):
+    """The pair has to survive musubi's independent bucketing of each side."""
+
+    #: what a real mixed dataset looks like: square, portrait, landscape,
+    #: ultrawide, off-ratio, tiny and oversized
+    SHAPES = [(1024, 1024), (896, 1152), (1920, 1080), (2560, 1080), (1000, 800),
+              (512, 384), (4096, 3072), (768, 1024), (1500, 1500), (640, 1136)]
+
+    def _generated_for(self, source_size):
+        """What gpt-image-2 gives back: its own nearest supported ratio at ~1K."""
+        import io
+
+        from PIL import Image
+
+        from trainero.imagegen import SUPPORTED_RATIOS, aspect_ratio_for
+
+        label = aspect_ratio_for(*source_size)
+        ratio = dict(SUPPORTED_RATIOS)[label]
+        w = round((1024 * 1024 * ratio) ** 0.5)
+        h = round((1024 * 1024 / ratio) ** 0.5)
+        buf = io.BytesIO()
+        Image.new("RGB", (w, h), (90, 90, 90)).save(buf, format="PNG")
+        return buf.getvalue()
+
+    def test_control_and_target_land_in_the_same_bucket(self):
+        import io
+
+        from PIL import Image
+
+        from trainero.style_rush import fit_control_to_target
+
+        with tempfile.TemporaryDirectory() as td:
+            for size in self.SHAPES:
+                src = Path(td) / f"src_{size[0]}x{size[1]}.png"
+                Image.new("RGB", size).save(src)
+                fitted = fit_control_to_target(self._generated_for(size), src)
+                with Image.open(io.BytesIO(fitted)) as c:
+                    control_size = c.size
+                self.assertEqual(musubi_bucket(control_size), musubi_bucket(size),
+                                 f"{size} -> control {control_size} cai em outro bucket")
+
+    def test_aspect_ratio_is_preserved_exactly(self):
+        import io
+
+        from PIL import Image
+
+        from trainero.style_rush import fit_control_to_target
+
+        with tempfile.TemporaryDirectory() as td:
+            for size in self.SHAPES:
+                src = Path(td) / f"src_{size[0]}x{size[1]}.png"
+                Image.new("RGB", size).save(src)
+                fitted = fit_control_to_target(self._generated_for(size), src)
+                with Image.open(io.BytesIO(fitted)) as c:
+                    got, want = c.size[0] / c.size[1], size[0] / size[1]
+                # one pixel of rounding on the short side, nothing more
+                self.assertAlmostEqual(got, want, delta=want * 0.005, msg=str(size))
+
+    def test_matching_ratio_is_passed_through_untouched(self):
+        from PIL import Image
+
+        from trainero.style_rush import fit_control_to_target
+
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "src.png"
+            Image.new("RGB", (1024, 1024)).save(src)
+            png = self._generated_for((1024, 1024))
+            self.assertIs(fit_control_to_target(png, src), png)
+
+    def test_whole_dataset_of_mixed_shapes_pairs_correctly(self):
+        """End to end: 50 slots over a dataset where every image differs."""
+        import io
+
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = root / "dataset"
+            base.mkdir()
+            sizes = {}
+            for i, size in enumerate(self.SHAPES * 2):  # 20 images, all shapes
+                name = f"img_{i:03d}.png"
+                Image.new("RGB", size).save(base / name)
+                sizes[str(base / name)] = size
+
+            def fake_generate(prompt, image_path, timeout=300.0):
+                return self._generated_for(sizes[str(image_path)]), 0.0142
+
+            result = build_convert_dataset(base, root / "conv", "makima", _FakeJob(),
+                                           generate=fake_generate, workers=4)
+            self.assertEqual(result["pairs"], SLOT_COUNT)
+
+            conv = root / "conv"
+            manifest = json.loads((conv / MANIFEST_NAME).read_text())
+            for i in range(SLOT_COUNT):
+                slot = f"slot_{i:02d}"
+                with Image.open(conv / f"{slot}.png") as t:
+                    target = t.size
+                with Image.open(conv / "control" / f"{slot}.png") as c:
+                    control = c.size
+                self.assertEqual(target, sizes[manifest["slots"][slot]["source"]], slot)
+                self.assertEqual(musubi_bucket(control), musubi_bucket(target),
+                                 f"{slot}: control {control} vs target {target}")
 
 
 class TestStyleRushGuards(unittest.TestCase):
