@@ -4,6 +4,7 @@
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
+let pollTimer = null;
 
 const state = {
   presets: null,
@@ -435,6 +436,24 @@ $("#btn-train").addEventListener("click", async () => {
   } catch (e) { toast(e.message, "error"); }
 });
 
+$("#btn-shutdown").addEventListener("click", async () => {
+  const busy = state.status?.job?.status === "running";
+  const msg = busy
+    ? "Há um treino rodando. Desligar cancela o treino e encerra o servidor. Continuar?"
+    : "Encerrar o servidor e liberar a porta 8090?";
+  if (!confirm(msg)) return;
+  try {
+    await post("/api/shutdown", { force: busy });
+  } catch (e) {
+    // the socket usually dies before the response lands — that IS the success case
+    if (!/Failed to fetch|NetworkError|load failed/i.test(e.message)) {
+      return toast(e.message, "error");
+    }
+  }
+  clearInterval(pollTimer);
+  $("#curtain").hidden = false;
+});
+
 $("#btn-cancel").addEventListener("click", async () => {
   if (!confirm("Cancelar o job atual?")) return;
   await post("/api/cancel");
@@ -595,5 +614,5 @@ async function fetchSamples() {
     renderModels();
   } catch (e) { toast(`presets: ${e.message}`, "error"); }
   await poll();
-  setInterval(poll, 2500);
+  pollTimer = setInterval(poll, 2500);
 })();

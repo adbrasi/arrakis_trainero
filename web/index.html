@@ -24,8 +24,17 @@
     <span class="readout" id="hf-chip" hidden></span>
     <span class="readout" id="or-chip" hidden></span>
     <span class="readout state"><span id="status-dot" class="dot"></span><span id="status-text">carregando</span></span>
+    <button class="readout power" id="btn-shutdown" title="Encerra o servidor e libera a porta 8090">Desligar</button>
   </div>
 </header>
+
+<div class="curtain" id="curtain" hidden>
+  <div>
+    <h2>Servidor desligado</h2>
+    <p>A porta 8090 está livre. Para subir de novo, no terminal do pod:</p>
+    <pre>curl -L https://raw.githubusercontent.com/adbrasi/arrakis_trainero/main/bootstrap.sh | bash</pre>
+  </div>
+</div>
 
 <main class="sheet">
 

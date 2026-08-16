@@ -60,11 +60,21 @@ make_venv() {
   fi
 }
 
+free_port() {
+  # uma instância anterior segurando a porta é o motivo mais comum de o bootstrap
+  # morrer com "Address already in use" na segunda vez que se roda o comando.
+  # pkill cobre o caso normal; fuser é o reforço e pode não existir no container.
+  pkill -f "[s]erver\.py" >/dev/null 2>&1 || true
+  command -v fuser >/dev/null 2>&1 && fuser -k "$PORT/tcp" >/dev/null 2>&1 || true
+  sleep 1
+}
+
 main() {
   install_system_deps
   install_uv
   clone_repo
   make_venv
+  free_port
   log "subindo em http://0.0.0.0:$PORT  (abra a porta $PORT no painel do pod)"
   cd "$APP_DIR"
   exec "$APP_DIR/.venv/bin/python" server.py

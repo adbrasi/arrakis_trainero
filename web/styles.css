@@ -353,3 +353,19 @@ input:focus, select:focus, .dropzone:focus-visible, button:focus-visible {
 /* a dropzone muda de convite para "adicionar mais" quando já há imagens */
 .dz-more, .ds-panel.filled .dz-empty { display: none; }
 .ds-panel.filled .dz-more { display: inline; }
+
+/* desligar: a única saída sem caçar o pid no pod */
+.power { cursor: pointer; font-family: var(--mono); }
+.power:hover { color: var(--signal); border-color: var(--signal); }
+
+.curtain {
+  position: fixed; inset: 0; z-index: 100; display: grid; place-items: center;
+  background: var(--board); padding: 24px; text-align: center;
+}
+.curtain h2 { font-size: 20px; font-weight: 600; }
+.curtain p { color: var(--ink-2); font-size: 14px; margin-top: 6px; }
+.curtain pre {
+  font-family: var(--mono); font-size: 11.5px; margin-top: 14px; padding: 12px 14px;
+  background: var(--ink); color: #cfcbc2; border-radius: 3px;
+  overflow-x: auto; text-align: left; max-width: 100%;
+}

@@ -9,4 +9,8 @@ if [ ! -x .venv/bin/python ]; then
     python3 -m venv .venv && .venv/bin/pip install -q -r requirements.txt
   fi
 fi
+PORT="${WEB_PORT:-8090}"
+# libera a porta se uma instância anterior ficou pendurada
+pkill -f "[s]erver\.py" >/dev/null 2>&1 || true
+command -v fuser >/dev/null 2>&1 && fuser -k "$PORT/tcp" >/dev/null 2>&1 || true
 exec .venv/bin/python server.py

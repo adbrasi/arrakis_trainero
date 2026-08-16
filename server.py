@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -255,6 +256,8 @@ class Handler(SimpleHTTPRequestHandler):
                 if job and job.status == "running":
                     job.cancel()
                 return self._json({"ok": True})
+            if url.path == "/api/shutdown":
+                return self._shutdown()
             return self._error("rota desconhecida", 404)
         except RuntimeError as exc:  # job slot busy
             return self._error(str(exc), 409)
@@ -273,6 +276,20 @@ class Handler(SimpleHTTPRequestHandler):
         pdir = project_dir(name)
         (pdir / "dataset").mkdir(parents=True, exist_ok=True)
         self._json({"ok": True, "slug": slugify(name)})
+
+    def _shutdown(self):
+        """Stop the server from the UI. Without this the only way out is finding
+        the pid on the pod, and a leftover process makes the next bootstrap fail
+        with 'Address already in use'."""
+        job = jobs.current()
+        if job and job.status == "running" and not self._body_json().get("force"):
+            return self._error("há um job rodando — cancele antes ou confirme para encerrar", 409)
+        if job and job.status == "running":
+            job.cancel()
+        self._json({"ok": True})
+        # shutdown() blocks until serve_forever returns, so it can never run on
+        # the thread that is currently serving this request
+        threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     def _require_project(self) -> str | None:
         project = current_project()
@@ -396,14 +413,20 @@ def main():
     ensure_dirs()
     port = WEB_PORT
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    # without this a handler thread can keep the process alive after shutdown,
+    # and the port stays taken until someone hunts down the pid
+    server.daemon_threads = True
     print(f"⚔ Arrakis Trainero em http://0.0.0.0:{port}")
     try:
         server.serve_forever()
+        print("Desligado pela interface. Até logo.")
     except KeyboardInterrupt:
         job = jobs.current()
         if job and job.status == "running":
             job.cancel()
         print("\nAté logo.")
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
