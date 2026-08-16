@@ -206,11 +206,8 @@ input:focus, select:focus, .dropzone:focus-visible, button:focus-visible {
 }
 .ds-stats b { color: var(--ink); font-weight: 600; }
 .ds-stats .warn { color: var(--signal); }
-.ds-stats .clear {
-  color: var(--ink-3); cursor: pointer; border: 0; background: none;
-  font-family: var(--mono); font-size: 11.5px; text-decoration: underline;
-}
-.ds-stats .clear:hover { color: var(--signal); }
+/* limpar é uma ação destrutiva: precisa parecer um botão, não um link */
+.ds-stats .clear { margin-left: auto; }
 .link-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .link-row .link-input { flex: 1; min-width: 240px; font-family: var(--mono); font-size: 12px; }
 
@@ -375,3 +372,6 @@ input:focus, select:focus, .dropzone:focus-visible, button:focus-visible {
 [data-mode="style-rush"] .repeats-field { display: none; }
 
 .samples-head { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); }
+
+.btn.tiny { font-size: 11.5px; padding: 4px 10px; font-family: var(--mono); }
+#adv-waiting { padding: 0 14px 14px; }

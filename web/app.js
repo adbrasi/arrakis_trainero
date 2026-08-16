@@ -286,11 +286,15 @@ function renderDatasetStats() {
       parts.push(`<span><b>${stats.captions}</b> captions</span>`);
       if (stats.missing_captions) parts.push(`<span class="warn">${stats.missing_captions} sem caption</span>`);
     }
-    parts.push(`<span class="clear" data-side="${side}">limpar</span>`);
+    parts.push(`<button class="btn tiny danger clear">Limpar dataset</button>`);
     box.innerHTML = parts.join("");
     box.querySelector(".clear").addEventListener("click", async () => {
-      if (!confirm("Apagar o dataset importado deste projeto?")) return;
+      const n = stats.items;
+      if (!confirm(`Apagar ${n} ${n === 1 ? "item" : "itens"} deste dataset? `
+        + "Os arquivos saem do pod. Para começar outro treino sem perder este, "
+        + "troque o nome do projeto no passo 01.")) return;
       await post(`/api/dataset/clear?side=${side}`);
+      sheetKey[side] = "";
       poll();
     });
   }
@@ -356,7 +360,8 @@ function selectModel(key) {
   const t = m.train;
   $("#preset-line").hidden = false;
   $("#preset-line").textContent =
-    `${m.label} · ${m.engine} · lora dim ${t.network_dim}/${t.network_alpha ?? "auto"} · lr ${t.learning_rate} · ${t.optimizer_type} · epochs automáticos`;
+    `${m.label} · ${m.engine} · dim ${t.network_dim}/${t.network_alpha ?? "auto"} · lr ${t.learning_rate}`
+    + (styleRush() ? " · 5 epochs fixos" : " · epochs automáticos");
   fillAdvanced();
   applyMode();
 }
@@ -369,6 +374,11 @@ ADV_FIELDS.forEach((id) => {
 });
 
 function fillAdvanced() {
+  // an open panel of empty boxes reads as broken; say what it is waiting for
+  const waiting = $("#adv-waiting");
+  waiting.hidden = !!state.model;
+  $("#advanced .adv-grid").hidden = !state.model;
+  $("#adv-foot").hidden = !state.model;
   if (!state.model) return;
   const m = state.presets.models[state.model];
   // Style Rush trains on a fixed schedule; the suggested one belongs to the

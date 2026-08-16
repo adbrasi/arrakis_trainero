@@ -172,6 +172,7 @@
       </div>
       <details class="advanced" id="advanced">
         <summary>Ajustes finos</summary>
+        <p class="help" id="adv-waiting" hidden>Escolha um modelo no passo 03 — os valores vêm do preset dele.</p>
         <div class="adv-grid">
           <label class="field"><span class="label">Rede</span><select id="adv-net"></select></label>
           <label class="field"><span class="label">Rank</span><input type="number" id="adv-dim" min="1"></label>
@@ -184,10 +185,10 @@
           <label class="field wide"><span class="label">Prompt do sample</span><input type="text" id="adv-sample-prompt" placeholder="padrão do trainer"></label>
           <label class="check"><input type="checkbox" id="adv-loraplus"> LoRA+ <span class="help">ratio 16</span></label>
           <label class="check"><input type="checkbox" id="adv-sampling" checked> Gerar sample a cada época</label>
-          <label class="check"><input type="checkbox" id="adv-hf" checked> Criar repositório no HuggingFace</label>
-          <label class="check"><input type="checkbox" id="adv-hf-private" checked> Repositório privado</label>
+          <label class="check"><input type="checkbox" id="adv-hf" checked> Criar repo no HuggingFace</label>
+          <label class="check"><input type="checkbox" id="adv-hf-private" checked> Repo privado</label>
         </div>
-        <p class="help">Tudo já vem do preset do modelo e do tamanho do dataset. DoRA não existe nos
+        <p class="help" id="adv-foot">Tudo já vem do preset do modelo e do tamanho do dataset. DoRA não existe nos
           backends usados — LoKr e LoHa cobrem o caso.</p>
       </details>
     </div>
