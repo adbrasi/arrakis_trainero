@@ -639,6 +639,11 @@ def run_training(job: Job, params: dict) -> None:
     model_key = params["model"]
     overrides = params.get("overrides", {})
     mode = params.get("mode", "lora")
+    # one source of truth, the same one run_style_rush_training uses: the server
+    # already resolved it from the request body or the stored state. Reading it
+    # back out of `overrides` instead made it a second channel that only the UI
+    # ever filled — an API call without it silently sampled without the trigger.
+    trigger = (params.get("trigger") or "").strip()
     model = MODELS[model_key]
     engine = model["engine"]
     pdir = project_dir(project)
@@ -712,7 +717,7 @@ def run_training(job: Job, params: dict) -> None:
         sample_path = write_sample_prompts(
             pdir / "sample_prompts.txt",
             overrides.get("sample_prompt") or SAMPLE_PROMPT,
-            overrides.get("trigger", ""), resolution, frames)
+            trigger, resolution, frames)
         job.log(f"Samples a cada época: {sample_path}")
     elif overrides.get("sampling", True):
         job.log(f"⚠ engine {engine} não tem --sample_prompts — sampling desligado.")
