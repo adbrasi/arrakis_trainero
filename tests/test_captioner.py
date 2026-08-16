@@ -15,8 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from trainero import captioner
 from trainero.captioner import (DEFAULT_CAPTION_MODEL, FALLBACK_CAPTION_MODEL,
-                                TAGGER_LOG, discard_uncaptionable,
-                                generate_captions, prune_stale_log)
+                                QUARANTINE_DIR, TAGGER_LOG, generate_captions, prune_stale_log,
+                                quarantine_uncaptionable)
 
 
 class _FakeJob:
@@ -168,7 +168,7 @@ class TestDiscard(unittest.TestCase):
             ds = _dataset(Path(td), captioned=1, uncaptioned=1)
             item = ds / "falta_000.jpg"
             job = _FakeJob()
-            discard_uncaptionable(ds, [item], job)
+            quarantine_uncaptionable(ds, [item], job)
 
             self.assertFalse(item.exists())
             left = json.loads((ds / TAGGER_LOG).read_text())["processed"]
@@ -210,6 +210,35 @@ class TestInfraFailureIsNotARefusal(unittest.TestCase):
             ds = _dataset(Path(td), captioned=2, uncaptioned=1)
             _run(ds, _FakeJob(), problem="")
             self.assertFalse((ds / "falta_000.jpg").exists())
+
+    def test_the_discarded_image_is_moved_and_not_destroyed(self):
+        """The account check cannot catch every infra failure — a retired model
+        id answers nothing while the key and the balance are perfect. Moving
+        keeps that mistake recoverable; unlink on the owner's only copy does not."""
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=1, uncaptioned=1)
+            _run(ds, _FakeJob(), problem="")
+            self.assertFalse((ds / "falta_000.jpg").exists())
+            self.assertTrue((ds.parent / QUARANTINE_DIR / "falta_000.jpg").exists(),
+                            "a imagem tem de continuar existindo fora do dataset")
+
+    def test_the_quarantine_is_outside_the_dataset_the_trainer_scans(self):
+        from trainero.dataset import inspect
+
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=2, uncaptioned=1)
+            _run(ds, _FakeJob(), problem="")
+            self.assertEqual(inspect(ds)["missing_captions"], 0)
+            self.assertEqual(inspect(ds)["items"], 2, "a descartada ainda conta no dataset")
+
+    def test_an_infra_failure_does_not_flag_images_for_the_conversion(self):
+        """Flagging on an outage would exclude the whole dataset from the paid
+        conversion phase permanently, blaming moderation for a billing problem."""
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=190, uncaptioned=92)
+            with self.assertRaises(Exception):
+                _run(ds, _FakeJob(), problem="OpenRouter sem crédito")
+            self.assertEqual(captioner.flagged_names(ds), set())
 
 
 class TestFlagged(unittest.TestCase):

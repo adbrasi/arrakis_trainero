@@ -22,6 +22,7 @@ from .jobs import Job, JobFailed
 
 TAGGER_LOG = ".tagger_log.json"
 FLAGGED_FILE = ".caption_refused.json"
+QUARANTINE_DIR = "descartadas"
 
 # The captioner's CLI names this stage "grok" for historical reasons; the flag
 # takes any OpenRouter model id with vision. Override with CAPTION_MODEL.
@@ -154,27 +155,42 @@ def flagged_names(dataset_dir: Path) -> set[str]:
         return set()
 
 
-def discard_uncaptionable(dataset_dir: Path, items: list[Path], job: Job) -> None:
-    """Remove items no model would caption, so the run can go on.
+def quarantine_uncaptionable(dataset_dir: Path, items: list[Path], job: Job) -> None:
+    """Move items no model would caption out of the dataset, so the run goes on.
 
-    An uncaptioned item stops the training outright, and these have already been
-    refused by two models with different content policies. Every name is logged
-    because this deletes the owner's data.
+    Moved, not deleted. An uncaptioned item blocks the training outright, so it
+    has to leave the dataset — but the only evidence that a model *refused* is
+    that it returned nothing, which is also what a dead endpoint, a retired
+    model id and a rate limit return. The account check upstream catches the
+    common case and cannot catch all of them, and unlink on the owner's only
+    copy of an imported image is not a recoverable mistake. QUARANTINE_DIR sits
+    beside the dataset, so nothing scans it and he can look at what left.
     """
-    log = dataset_dir / TAGGER_LOG
+    dest = dataset_dir.parent / QUARANTINE_DIR
+    dest.mkdir(parents=True, exist_ok=True)
+    moved = []
     for item in items:
-        job.log(f"✗ removida (nenhum modelo aceitou): {item.name}")
-        item.with_suffix(".txt").unlink(missing_ok=True)
-        item.unlink(missing_ok=True)
+        try:
+            item.replace(dest / item.name)
+        except OSError as exc:
+            job.log(f"⚠ não consegui mover {item.name}: {exc}")
+            continue
+        txt = item.with_suffix(".txt")
+        if txt.exists():
+            txt.replace(dest / txt.name)
+        moved.append(item)
+        job.log(f"✗ fora do dataset (nenhum modelo aceitou): {item.name}")
     try:
+        log = dataset_dir / TAGGER_LOG
         data = json.loads(log.read_text())
-        gone = {str(i) for i in items}
+        gone = {str(i) for i in moved}
         data["processed"] = {k: v for k, v in data.get("processed", {}).items()
                              if k not in gone}
         log.write_text(json.dumps(data, indent=2, ensure_ascii=False))
     except (OSError, json.JSONDecodeError, AttributeError):
         pass
-    job.log(f"⚠ {len(items)} itens descartados do dataset.")
+    if moved:
+        job.log(f"⚠ {len(moved)} itens movidos para {dest}")
 
 
 def generate_captions(dataset_dir, media: str, profile: str, prompt_vars: dict[str, str],
@@ -196,18 +212,24 @@ def generate_captions(dataset_dir, media: str, profile: str, prompt_vars: dict[s
         missing = _pass(dataset_dir, media, profile, prompt_vars, job,
                         FALLBACK_CAPTION_MODEL)
 
-    if refused_by_primary:
-        record_flagged(dataset_dir, refused_by_primary)
+    # Flag only what the fallback rescued. "Still uncaptioned after pass 1" has
+    # two causes that look identical on disk — the model refused it, or the API
+    # was down — and only one of them justifies excluding the image from the
+    # paid conversion phase forever. A second model producing a caption is the
+    # proof that the first one refused on content, not that the account died.
+    rescued = [p for p in refused_by_primary if p not in set(missing)]
+    if rescued:
+        record_flagged(dataset_dir, rescued)
 
     if missing:
-        # Never delete on an infrastructure failure: out of credit looks
-        # identical to every model refusing, and one is recoverable.
+        # Never destroy on an infrastructure failure: out of credit looks
+        # exactly like every model refusing, and one of the two is recoverable.
         problem = openrouter_problem()
         if problem:
             raise JobFailed(
                 f"{problem} — {len(missing)} itens ficaram sem caption. "
-                f"Resolva e rode de novo; nada foi apagado e o que já tem "
+                f"Resolva e rode de novo; nada saiu do dataset e o que já tem "
                 f"caption não é refeito.")
-        discard_uncaptionable(dataset_dir, missing, job)
+        quarantine_uncaptionable(dataset_dir, missing, job)
 
     job.log("✔ Captions geradas.")

@@ -467,6 +467,33 @@ def comfy_converter(model_key: str, job: Job):
     return convert
 
 
+def finalise(job: Job, output_dir: Path, repo_id: str | None) -> None:
+    """Report what actually landed, not what was attempted.
+
+    The old message said "✔ Tudo em huggingface.co/<repo>" purely because a
+    repo id existed, while the only thing it had looked at was the local
+    directory. An upload disabled by a 403 mid-run, or a checkpoint the final
+    sweep missed, still read as a complete success — and the owner destroys the
+    pod on the strength of that line.
+    """
+    finals = sorted(output_dir.glob("*.safetensors"))
+    if not finals:
+        raise JobFailed("o treino terminou sem produzir checkpoints")
+    job.extra["outputs"] = [f.name for f in finals]
+    job.log(f"✔ {len(finals)} checkpoints em {output_dir}")
+    if not repo_id:
+        return
+    sent = set(job.extra.get("hf_files") or [])
+    absent = [f.name for f in finals if f.name not in sent]
+    if absent:
+        job.log(f"⚠ {len(absent)} checkpoints NÃO subiram para o HF: "
+                f"{', '.join(absent[:5])}{'…' if len(absent) > 5 else ''}")
+        job.log(f"⚠ o que subiu está em https://huggingface.co/{repo_id} — "
+                f"o resto só existe neste pod, não destrua sem copiar.")
+    else:
+        job.log(f"✔ Tudo em https://huggingface.co/{repo_id}")
+
+
 # ---------------------------------------------------------------------------
 # Style Rush pipeline
 # ---------------------------------------------------------------------------
@@ -620,13 +647,7 @@ def run_style_rush_training(job: Job, params: dict) -> None:
     job.end_phase("Treino")
 
     job.start_phase("Finalização")
-    finals = sorted(output_dir.glob("*.safetensors"))
-    if not finals:
-        raise JobFailed("o treino terminou sem produzir checkpoints")
-    job.extra["outputs"] = [f.name for f in finals]
-    job.log(f"✔ {len(finals)} checkpoints em {output_dir}")
-    if repo_id:
-        job.log(f"✔ Tudo em https://huggingface.co/{repo_id}")
+    finalise(job, output_dir, repo_id)
     job.end_phase("Finalização")
 
 
@@ -779,11 +800,5 @@ def run_training(job: Job, params: dict) -> None:
     job.end_phase("Treino")
 
     job.start_phase("Finalização")
-    finals = sorted(output_dir.glob("*.safetensors"))
-    if not finals:
-        raise JobFailed("o treino terminou sem produzir checkpoints")
-    job.extra["outputs"] = [f.name for f in finals]
-    job.log(f"✔ {len(finals)} checkpoints em {output_dir}")
-    if repo_id:
-        job.log(f"✔ Tudo em https://huggingface.co/{repo_id}")
+    finalise(job, output_dir, repo_id)
     job.end_phase("Finalização")

@@ -47,6 +47,13 @@ def _make_dataset(root: Path, n: int) -> Path:
     return base
 
 
+def _png_bytes() -> bytes:
+    import io
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 8)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def _paths(base: Path) -> list[Path]:
     return sorted(p for p in base.iterdir() if p.suffix.lower() in {".png", ".jpg"})
 
@@ -193,6 +200,109 @@ class TestContentFlagged(unittest.TestCase):
             images = _paths(_make_dataset(Path(td), 60))
             self.assertEqual(plan_slots(images, load_style_prompts()),
                              plan_slots(images, load_style_prompts(), avoid=set()))
+
+
+class TestConversionFailureModes(unittest.TestCase):
+    """The conversion phase is the only one that spends real money per item."""
+
+    def _base(self, root: Path, n: int) -> Path:
+        from PIL import Image
+        base = root / "dataset"
+        base.mkdir(parents=True, exist_ok=True)
+        for i in range(n):
+            Image.new("RGB", (64, 48)).save(base / f"img_{i:03d}.png")
+        return base
+
+    def test_running_out_of_credit_fails_the_phase_instead_of_the_slot(self):
+        """402 answers every remaining slot the same way and instantly. Treated
+        as a per-slot failure it left a dataset 60% short and the training ran
+        to completion on it without one error."""
+        from trainero.imagegen import AccountError
+        from trainero.style_rush import build_convert_dataset
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = self._base(root, 60)
+            calls = {"n": 0}
+
+            def generate(prompt, image_path, timeout=300.0):
+                calls["n"] += 1
+                if calls["n"] > 5:
+                    raise AccountError("OpenRouter sem crédito (HTTP 402)")
+                return _png_bytes(), 0.0142
+
+            with self.assertRaises(JobFailed) as ctx:
+                build_convert_dataset(base, root / "dataset_convert", "makima",
+                                      _FakeJob(), generate=generate, workers=1)
+            self.assertIn("crédito", str(ctx.exception).lower())
+            self.assertLess(calls["n"], 50, "continuou chamando a API depois do 402")
+
+    def test_an_image_paid_for_but_not_written_still_counts_as_spent(self):
+        """The cost is reported to the owner and has to match the invoice."""
+        from trainero.style_rush import build_convert_dataset
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = self._base(root, 60)
+            convert = root / "dataset_convert"
+
+            def generate(prompt, image_path, timeout=300.0):
+                return b"nao e um png", 0.0142  # pago, mas quebra ao gravar
+
+            job = _FakeJob()
+            with self.assertRaises(JobFailed):
+                build_convert_dataset(base, convert, "makima", job,
+                                      generate=generate, workers=1)
+
+            manifest = json.loads((convert / ".style_rush.json").read_text())
+            paid = [e for e in manifest["slots"].values() if e.get("paid")]
+            self.assertTrue(paid, "gastou e não registrou que gastou")
+            self.assertTrue(all(e.get("cost") for e in paid))
+
+    def test_a_refused_image_is_not_sent_again_inside_the_same_run(self):
+        """With few images and 50 slots the same picture is the source many
+        times over; each rediscovery of the same refusal costs a paid call."""
+        from trainero.imagegen import RefusedError
+        from trainero.style_rush import build_convert_dataset
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = self._base(root, 3)
+            banned = str(base / "img_000.png")
+            seen = []
+
+            def generate(prompt, image_path, timeout=300.0):
+                seen.append(str(image_path))
+                if str(image_path) == banned:
+                    raise RefusedError("moderação recusou a imagem (HTTP 400)")
+                return _png_bytes(), 0.0142
+
+            build_convert_dataset(base, root / "dataset_convert", "makima",
+                                  _FakeJob(), generate=generate, workers=1)
+
+            self.assertEqual(seen.count(banned), 1,
+                             f"pagou {seen.count(banned)}x pela mesma recusa")
+
+    def test_the_refusal_survives_into_the_next_run(self):
+        from trainero.imagegen import RefusedError
+        from trainero.style_rush import build_convert_dataset, content_flagged
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = self._base(root, 3)
+            convert = root / "dataset_convert"
+            banned = str(base / "img_000.png")
+
+            def generate(prompt, image_path, timeout=300.0):
+                if str(image_path) == banned:
+                    raise RefusedError("moderação recusou a imagem (HTTP 400)")
+                return _png_bytes(), 0.0142
+
+            build_convert_dataset(base, convert, "makima", _FakeJob(),
+                                  generate=generate, workers=1)
+
+            self.assertIn("img_000.png", content_flagged(base, convert),
+                          "a recusa sumiu quando o fallback do slot deu certo")
 
 
 class TestConvertSources(unittest.TestCase):

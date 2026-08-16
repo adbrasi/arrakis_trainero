@@ -108,9 +108,15 @@ class UploadWatcher:
             f.write(name + "\n")
 
     def _loop(self):
-        while not self._stop.is_set():
-            self._stop.wait(30)
-            self._sweep(wait_stable=not self._stop.is_set())
+        while True:
+            stopping = self._stop.wait(30)
+            self._sweep(wait_stable=not stopping)
+            # The flag is read AFTER the sweep on purpose. Checking it in the
+            # while condition lost the final sweep whenever stop landed while a
+            # sweep was already in flight — a 2 GB upload takes minutes, and the
+            # last checkpoint, the one that matters, never went up.
+            if stopping:
+                return
 
     def _sweep(self, wait_stable: bool):
         if self._disabled:

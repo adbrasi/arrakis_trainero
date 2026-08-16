@@ -135,6 +135,19 @@ class TestErrorClassification(unittest.TestCase):
         for code in (429, 500, 502, 503, 504):
             self.assertIsInstance(classify_http_error(code, "boom"), RetriableError, code)
 
+    def test_no_credit_and_dead_key_are_account_errors_not_slot_failures(self):
+        """402 and 401 answer every remaining slot the same way and instantly.
+        Classified as an ordinary slot failure, running out of credit at pair 20
+        left the conversion dataset 60% short and the training finished on it
+        without reporting a single error."""
+        from trainero.imagegen import AccountError
+
+        for code in (401, 402):
+            exc = classify_http_error(code, '{"error":{"message":"requires more credits"}}')
+            self.assertIsInstance(exc, AccountError, code)
+            self.assertNotIsInstance(exc, RetriableError, code)
+            self.assertNotIsInstance(exc, RefusedError, code)
+
     def test_auth_error_is_fatal(self):
         exc = classify_http_error(401, "no key")
         self.assertNotIsInstance(exc, RetriableError)

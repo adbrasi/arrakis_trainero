@@ -120,8 +120,10 @@ def content_flagged(base_dir: Path, convert_dir: Path) -> set[str]:
     manifest records what gpt-image-2 refused on an earlier run. Both are the
     same fact about the image, and both cost money to rediscover.
     """
+    manifest = _load_manifest(convert_dir)
     flagged = captioner.flagged_names(base_dir)
-    for entry in _load_manifest(convert_dir).get("slots", {}).values():
+    flagged |= set(manifest.get("refused_images", []))
+    for entry in manifest.get("slots", {}).values():
         if entry.get("status") == "refused" and entry.get("source"):
             flagged.add(Path(entry["source"]).name)
     return flagged
@@ -238,6 +240,11 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
     else:
         job.log(f"Dataset de conversão já completo ({len(slots)} pares).")
 
+    # Refusals live per image, not per slot: the slot entry gets overwritten the
+    # moment its fallback image succeeds, which used to erase the only record
+    # that the primary image had been refused at all.
+    refused_now: set[str] = set(manifest.get("refused_images", []))
+
     def record(name: str, entry: dict, **deltas) -> None:
         """Persist one slot's outcome. The manifest is written on every slot, not
         once at the end: a cancelled run (job.check_cancel raises) or a dead pod
@@ -248,31 +255,68 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
             manifest["slots"][name] = entry
             _save_manifest(convert_dir, manifest)
 
+    def note_refused(source: str) -> None:
+        with lock:
+            refused_now.add(Path(source).name)
+            manifest["refused_images"] = sorted(refused_now)
+            _save_manifest(convert_dir, manifest)
+
+    # ThreadPoolExecutor.map keeps dispatching after a task raises — the error
+    # only surfaces when the results are consumed. Without this the whole plan
+    # still runs, and a dead account is asked 50 more times.
+    account_dead: list[Exception] = []
+
     def work(slot: dict) -> None:
+        if account_dead:
+            return
         job.check_cancel()
         name = slot["slot"]
         refusals = 0
         for source in slot["sources"]:  # primary, then the fallback image
+            # A refusal is a fact about the image, not about the slot. With 50
+            # slots over few images the same picture is the source many times
+            # over, so without this every worker pays to rediscover the same no.
+            if Path(source).name in refused_now:
+                continue
             try:
                 png, cost = _generate_with_retries(generate, slot["prompt"], Path(source))
-                png = fit_control_to_target(png, Path(source))
-                (control_dir / f"{name}.png").write_bytes(png)
-                shutil.copyfile(source, convert_dir / f"{name}.png")
-                (convert_dir / f"{name}.txt").write_text(caption, encoding="utf-8")
+            except imagegen.AccountError as exc:
+                with lock:            # not this slot's problem — it ends the phase
+                    account_dead.append(exc)
+                return
             except imagegen.RefusedError as exc:
                 refusals += 1
+                note_refused(source)
                 record(name, {"status": "refused", "prompt": slot["prompt"],
                               "source": source, "error": str(exc)})
                 continue
             except Cancelled:
                 raise
             except Exception as exc:
-                # one unreadable file (an .avif this Pillow cannot open) or one
-                # malformed response must cost its own slot, never the phase
+                # failed before the call was billed: one unreadable file (an
+                # .avif this Pillow cannot open) costs its own slot, never the
+                # phase
                 record(name, {"status": "failed", "prompt": slot["prompt"], "source": source,
                               "error": f"{type(exc).__name__}: {exc}"},
                        failed=1, refused=refusals)
                 job.log(f"⚠ {name}: {type(exc).__name__}: {exc}")
+                return
+
+            # billed from here on, so the cost is counted whatever happens next
+            try:
+                png = fit_control_to_target(png, Path(source))
+                (control_dir / f"{name}.png").write_bytes(png)
+                shutil.copyfile(source, convert_dir / f"{name}.png")
+                (convert_dir / f"{name}.txt").write_text(caption, encoding="utf-8")
+            except Cancelled:
+                raise
+            except Exception as exc:
+                record(name, {"status": "failed", "prompt": slot["prompt"], "source": source,
+                              "paid": True, "cost": cost,
+                              "error": f"{type(exc).__name__}: {exc}"},
+                       failed=1, refused=refusals, cost=cost)
+                job.log(f"⚠ {name}: imagem paga mas não gravada "
+                        f"({type(exc).__name__}: {exc}) — ${cost:.4f} perdidos")
                 return
 
             record(name, {"status": "ok", "prompt": slot["prompt"], "source": source,
@@ -287,6 +331,11 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
     if pending:
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             list(pool.map(work, pending))
+        if account_dead:
+            _save_manifest(convert_dir, manifest)
+            raise JobFailed(
+                f"{account_dead[0]} — {totals['pairs']} de {len(slots)} pares prontos. "
+                f"Resolva e rode de novo: o que já foi pago não é refeito.")
 
     if totals["pairs"] == 0:
         raise JobFailed(

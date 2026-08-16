@@ -61,6 +61,15 @@ class RefusedError(ImageGenError):
     """Moderation refused this image. Retry with a different one."""
 
 
+class AccountError(ImageGenError):
+    """The account cannot serve any request: no credit, or a dead key.
+
+    Separate from the others because it is not a property of the slot. Treated
+    as one more slot failure, it turns "the credit ran out at pair 20" into a
+    conversion dataset silently 60% short, and the training runs to completion
+    on it without a single error."""
+
+
 def aspect_ratio_for(width: int, height: int) -> str:
     """Nearest supported aspect ratio, in log space so 4:3 and 3:4 are symmetric."""
     if width <= 0 or height <= 0:
@@ -125,6 +134,12 @@ def classify_http_error(status: int, text: str) -> ImageGenError:
     low = text.lower()
     if status in (400, 403, 422) and any(m in low for m in _REFUSAL_MARKERS):
         return RefusedError(f"moderação recusou a imagem (HTTP {status})")
+    # 401/402 answer every subsequent slot the same way and instantly, so
+    # letting them look like per-slot failures burns through the whole plan in
+    # seconds and leaves a half-built dataset that nothing downstream notices.
+    if status in (401, 402):
+        return AccountError("OpenRouter sem crédito ou com chave inválida "
+                            f"(HTTP {status}): {text[:200]}")
     if status == 429 or status >= 500:
         return RetriableError(f"HTTP {status}: {text[:300]}")
     return ImageGenError(f"HTTP {status}: {text[:300]}")
