@@ -64,6 +64,19 @@
         <input id="project-name" type="text" placeholder="makima_v1" autocomplete="off">
         <span class="help">vira o nome do arquivo e do repositório no HuggingFace</span>
       </label>
+      <div class="field">
+        <span class="label">Dataset</span>
+        <div class="seg" id="source-toggle">
+          <button type="button" data-source="new" class="active">Novo</button>
+          <button type="button" data-source="copy">Copiar de outro projeto</button>
+        </div>
+        <div class="source-copy" id="source-copy" hidden>
+          <select id="source-project"><option value="">—</option></select>
+          <button type="button" class="btn quiet" id="btn-fork">Copiar dataset</button>
+        </div>
+        <span class="help" id="source-help" hidden></span>
+      </div>
+
       <label class="field trigger-field">
         <span class="label">Trigger word</span>
         <input id="trigger-word" type="text" placeholder="makima_style" autocomplete="off">

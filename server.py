@@ -21,10 +21,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from trainero import dataset as ds
 from trainero import jobs
+from trainero import project as pj
 from trainero.jobs import JobFailed
 from trainero.captioner import generate_captions
 from trainero.config import (IMAGE_EXTS, VIDEO_EXTS, WEB_PORT, ensure_dirs,
-                             gpu_info, hf_token, load_state, update_state)
+                             gpu_info, hf_token, load_state, save_state,
+                             update_state)
 from trainero.engines import is_installed
 from trainero.presets import (CAPTION_PROFILES, MODEL_ORDER, MODELS,
                               STYLE_RUSH_SCHEDULE, public_presets,
@@ -137,6 +139,29 @@ def current_project() -> str:
     return load_state().get("project", "")
 
 
+def current_meta() -> dict:
+    project = current_project()
+    return pj.load_meta(project_dir(project)) if project else {}
+
+
+def migrate_global_trigger() -> None:
+    """Move the one trigger the global state may still hold into its project.
+
+    Ran once at startup. Leaving it in state.json is what made the trigger
+    follow the session instead of the dataset; leaving it in *both* places
+    would be a second channel, so it is removed from state as it moves.
+    """
+    state = load_state()
+    trigger, project = state.get("trigger"), state.get("project")
+    if trigger and project:
+        pdir = project_dir(project)
+        if pdir.is_dir() and not pj.load_meta(pdir).get("trigger"):
+            pj.save_meta(pdir, name=project, trigger=trigger)
+    if "trigger" in state:
+        state.pop("trigger")
+        save_state(state)
+
+
 def dataset_dir(side: str = "pos") -> Path:
     pdir = project_dir(current_project() or "projeto")
     return pdir / {"neg": "dataset_neg", "convert": "dataset_convert",
@@ -183,6 +208,10 @@ class Handler(SimpleHTTPRequestHandler):
             return self._status()
         if url.path == "/api/presets":
             return self._presets()
+        if url.path == "/api/projects":
+            current = current_project()
+            return self._json({"projects": pj.list_projects(),
+                               "current": slugify(current) if current else ""})
         if url.path == "/api/logs":
             job = jobs.current()
             return self._json({"log": job.log_tail() if job else ""})
@@ -239,6 +268,7 @@ class Handler(SimpleHTTPRequestHandler):
         project = current_project()
         stats = ds.inspect(dataset_dir("pos")) if project else {}
         stats_neg = ds.inspect(dataset_dir("neg")) if project else {}
+        meta = current_meta()
         payload = {
             "project": project,
             "dataset": stats,
@@ -247,7 +277,9 @@ class Handler(SimpleHTTPRequestHandler):
             "gpu": gpu_info(),
             "hf_token": bool(hf_token()),
             "openrouter": bool(os.environ.get("OPENROUTER_API_KEY")),
-            "trigger": load_state().get("trigger", ""),
+            "trigger": meta.get("trigger", ""),
+            "trigger_locked": bool(meta.get("origin")),
+            "origin": (meta.get("origin") or {}).get("project", ""),
             "dataset_convert": ds.inspect(dataset_dir("convert")) if project else {},
             "dataset_restore": ds.inspect(dataset_dir("restore")) if project else {},
             "style_rush_models": style_rush_models(),
@@ -274,6 +306,8 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             if url.path == "/api/project":
                 return self._set_project()
+            if url.path == "/api/project/fork":
+                return self._fork_project()
             if url.path == "/api/dataset/import":
                 return self._import(query)
             if url.path == "/api/dataset/file":
@@ -300,15 +334,36 @@ class Handler(SimpleHTTPRequestHandler):
         name = (body.get("name") or "").strip()
         if not name:
             return self._error("nome vazio")
-        # only touch the trigger when the client actually sent one: the UI omits
-        # it until it has read the stored value, so a fast typist cannot wipe it
-        fields = {"project": name}
-        if "trigger" in body:
-            fields["trigger"] = (body.get("trigger") or "").strip()
-        update_state(**fields)
+        update_state(project=name)
         pdir = project_dir(name)
         (pdir / "dataset").mkdir(parents=True, exist_ok=True)
-        self._json({"ok": True, "slug": slugify(name)})
+        fields = {"name": name}
+        # only touch the trigger when the client actually sent one: the UI omits
+        # it until it has read the stored value, so a fast typist cannot wipe it
+        if "trigger" in body and not pj.trigger_locked(pdir):
+            fields["trigger"] = (body.get("trigger") or "").strip()
+        pj.save_meta(pdir, **fields)
+        self._json({"ok": True, "slug": slugify(name),
+                    "trigger": pj.load_meta(pdir).get("trigger", "")})
+
+    def _fork_project(self):
+        """Fill the current (empty) project with another project's dataset."""
+        project = self._require_project()
+        if not project:
+            return
+        if not self._require_idle():
+            return
+        source = (self._body_json().get("source") or "").strip()
+        if not source:
+            return self._error("escolha o projeto de origem")
+        try:
+            copied = pj.fork_dataset(project_dir(source), project_dir(project))
+        except pj.ForkError as exc:
+            return self._error(str(exc), 409)
+        except OSError as exc:
+            return self._error(f"cópia falhou: {exc}", 500)
+        self._json({"ok": True, "copied": copied,
+                    "stats": ds.inspect(dataset_dir("pos"))})
 
     def _shutdown(self):
         """Stop the server from the UI. Without this the only way out is finding
@@ -409,7 +464,11 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if not self._require_idle():
             return
-        ds.clear_dataset(project_dir(project), query.get("side", "pos"))
+        side = query.get("side", "pos")
+        pdir = project_dir(project)
+        ds.clear_dataset(pdir, side)
+        if side == "pos":
+            pj.clear_origin(pdir)
         self._json({"ok": True})
 
     def _captions(self):
@@ -445,7 +504,7 @@ class Handler(SimpleHTTPRequestHandler):
             "project": project,
             "model": model_key,
             "mode": body.get("mode", "lora"),
-            "trigger": (body.get("trigger") or load_state().get("trigger") or "").strip(),
+            "trigger": (body.get("trigger") or current_meta().get("trigger") or "").strip(),
             "overrides": body.get("overrides") or {},
             "slider_targets": body.get("slider_targets") or [],
         }
@@ -458,6 +517,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 def main():
     ensure_dirs()
+    migrate_global_trigger()
     port = WEB_PORT
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     # without this a handler thread can keep the process alive after shutdown,

@@ -53,13 +53,31 @@ def upload_text(repo_id: str, path_in_repo: str, content: str, job: Job) -> None
         job.log(f"⚠ upload de {path_in_repo} falhou: {exc}")
 
 
+def model_card(label: str, base_model: str) -> str:
+    """The one thing a LoRA page has to say: which model it was trained on.
+
+    Not a generated description — prose nobody wrote goes stale the moment
+    anything is edited by hand, and the rest of the run is already in the repo
+    as data. `base_model` is the field HuggingFace indexes and renders as
+    "Finetuned from", so the name is stated once, where it is machine-readable.
+    """
+    front = ["---"]
+    if base_model:
+        front.append(f"base_model: {base_model}")
+    front += ["tags:", "  - lora", "---", "", f"# {label}", ""]
+    return "\n".join(front)
+
+
 def upload_run_files(repo_id: str, job: Job, *, info: dict, captions: dict) -> None:
     """Put what the run actually was into the repo, as data.
 
-    No model card: a generated README is prose nobody wrote and nobody reads,
-    and it goes stale the moment anything is edited by hand. The facts belong
-    in files — the resolved config, and the captions the LoRA was trained on.
+    The README carries the base model and nothing else; the facts belong in
+    files — the resolved config, and the captions the LoRA was trained on.
     """
+    label = info.get("model_label") or info.get("model") or ""
+    if label:
+        upload_text(repo_id, "README.md",
+                    model_card(label, info.get("base_model", "")), job)
     upload_text(repo_id, "trainero_config.json",
                 json.dumps(info, indent=2, ensure_ascii=False), job)
     if captions:

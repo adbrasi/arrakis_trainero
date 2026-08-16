@@ -8,7 +8,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from trainero.hf_upload import UploadWatcher
+from trainero import hf_upload
+from trainero.hf_upload import UploadWatcher, model_card, upload_run_files
 
 
 class _FakeJob:
@@ -75,6 +76,49 @@ class TestUploadWatcher(unittest.TestCase):
 
             self.assertTrue(w._disabled, "403 tem de desligar os uploads do run")
             self.assertEqual(api.return_value.upload_file.call_count, 1)
+
+
+class TestModelCard(unittest.TestCase):
+    """The repo page has to say which model the LoRA was trained on — that is
+    the one fact a downloaded .safetensors cannot carry by itself."""
+
+    def test_the_card_names_the_model_and_nothing_else(self):
+        card = model_card("Qwen Image", "Comfy-Org/Qwen-Image_ComfyUI")
+        self.assertIn("base_model: Comfy-Org/Qwen-Image_ComfyUI", card)
+        self.assertIn("# Qwen Image", card)
+        # no prose: everything else about the run is already in the repo as data
+        body = card.split("---")[-1].strip().splitlines()
+        self.assertEqual(body, ["# Qwen Image"])
+
+    def test_a_preset_without_a_base_model_still_produces_valid_frontmatter(self):
+        card = model_card("Krea 2", "")
+        self.assertNotIn("base_model:", card)
+        self.assertTrue(card.startswith("---\n"))
+        self.assertIn("# Krea 2", card)
+
+    def test_every_preset_carries_the_repo_its_weights_come_from(self):
+        """Reading downloads[0] instead would be inferring the fact from an
+        ordering that nothing guarantees."""
+        from trainero.presets import MODELS
+
+        for key, model in MODELS.items():
+            base = model.get("base_model", "")
+            self.assertTrue(base, f"{key} sem base_model")
+            self.assertEqual(base, model["downloads"][0][0],
+                             f"{key}: base_model não é de onde os pesos vêm")
+
+    def test_upload_run_files_really_writes_the_readme(self):
+        """model_card can be perfect while nothing calls it."""
+        sent = {}
+        job = _FakeJob()
+        with mock.patch.object(hf_upload, "upload_text",
+                               lambda repo, path, content, j: sent.__setitem__(path, content)):
+            upload_run_files("dono/p", job, captions={},
+                             info={"model": "qwen-image", "model_label": "Qwen Image",
+                                   "base_model": "Comfy-Org/Qwen-Image_ComfyUI"})
+        self.assertIn("README.md", sent)
+        self.assertIn("base_model: Comfy-Org/Qwen-Image_ComfyUI", sent["README.md"])
+        self.assertIn("trainero_config.json", sent)
 
 
 if __name__ == "__main__":

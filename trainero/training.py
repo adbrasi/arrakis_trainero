@@ -686,6 +686,7 @@ def run_style_rush_training(job: Job, params: dict) -> None:
         job.extra["hf_repo"] = repo_id
         upload_run_files(repo_id, job, info={
             "project": project, "model": model_key, "model_label": model["label"],
+            "base_model": model.get("base_model", ""),
             "mode": "style-rush", "trigger": trigger, "schedule": schedule,
             "dataset": stats, "style_rush": convert_stats, "restore": restore_stats,
             "config": {k: v for k, v in cfg.items() if isinstance(v, (str, int, float, bool))},
@@ -840,6 +841,7 @@ def run_training(job: Job, params: dict) -> None:
         job.extra["hf_repo"] = repo_id
         upload_run_files(repo_id, job, info={
             "project": project, "model": model_key, "model_label": model["label"],
+            "base_model": model.get("base_model", ""),
             "mode": mode, "trigger": trigger, "schedule": schedule, "dataset": stats,
             "config": {k: v for k, v in cfg.items() if isinstance(v, (str, int, float, bool))},
         }, captions=ds.captions_map(dataset_dir))

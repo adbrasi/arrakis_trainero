@@ -85,6 +85,7 @@ MODELS = {
     # ------------------------------------------------------------------ IMAGEM
     "krea2": {
         "label": "Krea 2",
+        "base_model": "krea/Krea-2-Raw",
         "group": "imagem",
         "media": "image",
         "engine": "musubi",
@@ -116,6 +117,7 @@ MODELS = {
     },
     "anima": {
         "label": "Anima",
+        "base_model": "circlestone-labs/Anima",
         "group": "imagem",
         "media": "image",
         "engine": "sd-scripts",
@@ -157,6 +159,7 @@ MODELS = {
     },
     "flux-klein": {
         "label": "Flux Klein",
+        "base_model": "black-forest-labs/FLUX.2-klein-base-9B",
         "group": "imagem",
         "media": "image",
         "engine": "musubi",
@@ -195,6 +198,7 @@ MODELS = {
     },
     "qwen-image": {
         "label": "Qwen Image",
+        "base_model": "Comfy-Org/Qwen-Image_ComfyUI",
         "group": "imagem",
         "media": "image",
         "engine": "musubi",
@@ -224,6 +228,7 @@ MODELS = {
     },
     "qwen-image-edit": {
         "label": "Qwen Image Edit",
+        "base_model": "Comfy-Org/Qwen-Image-Edit_ComfyUI",
         "group": "imagem",
         "media": "image",
         "engine": "musubi",
@@ -257,6 +262,7 @@ MODELS = {
     },
     "ideogram": {
         "label": "Ideogram",
+        "base_model": "Comfy-Org/Ideogram-4",
         "group": "imagem",
         "media": "image",
         "engine": "musubi",
@@ -292,6 +298,7 @@ MODELS = {
     # ------------------------------------------------------------------- VÍDEO
     "ltx-23": {
         "label": "LTX 2.3",
+        "base_model": "Lightricks/LTX-2.3",
         "group": "video",
         "media": "video",
         "engine": "musubi-ltx",
@@ -326,6 +333,7 @@ MODELS = {
     },
     "wan-22": {
         "label": "Wan 2.2",
+        "base_model": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
         "group": "video",
         "media": "video",
         "engine": "musubi",

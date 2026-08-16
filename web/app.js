@@ -64,6 +64,68 @@ async function saveProject() {
   } catch (e) { toast(e.message, "error"); }
 }
 
+// ------------------------------------------------------- dataset de origem
+// A dataset costs captions, conversion pairs and curation; none of that
+// depends on the model. Training the same images on a second model is a copy
+// into a new project, not a second dataset built from scratch.
+function setSourceHelp(text, alert = false) {
+  const el = $("#source-help");
+  el.hidden = !text;
+  el.textContent = text;
+  el.className = `help${alert ? " alert" : ""}`;
+}
+
+$("#source-toggle").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button[data-source]");
+  if (!btn) return;
+  $$("#source-toggle button").forEach((b) => b.classList.toggle("active", b === btn));
+  const copying = btn.dataset.source === "copy";
+  $("#source-copy").hidden = !copying;
+  setSourceHelp("");
+  if (copying) loadProjects();
+});
+
+async function loadProjects() {
+  let data;
+  try { data = await api("/api/projects"); }
+  catch (e) { return setSourceHelp(e.message, true); }
+  const sel = $("#source-project");
+  const usable = (data.projects || [])
+    .filter((p) => p.items > 0 && p.slug !== data.current);
+  const previous = sel.value;
+  sel.textContent = "";
+  if (!usable.length) {
+    sel.appendChild(new Option("nenhum outro projeto com imagens", ""));
+    return;
+  }
+  for (const p of usable) {
+    const bits = [`${p.items} imgs`];
+    if (p.trigger) bits.push(`"${p.trigger}"`);
+    const pairs = p.convert + p.restore;
+    if (pairs) bits.push(`${pairs} pares`);
+    sel.appendChild(new Option(`${p.name} · ${bits.join(" · ")}`, p.slug));
+  }
+  if (usable.some((p) => p.slug === previous)) sel.value = previous;
+}
+
+$("#btn-fork").addEventListener("click", async () => {
+  const source = $("#source-project").value;
+  if (!$("#project-name").value.trim()) return setSourceHelp("dê um nome ao projeto antes", true);
+  if (!source) return setSourceHelp("escolha o projeto de origem", true);
+  const btn = $("#btn-fork");
+  btn.disabled = true;
+  setSourceHelp("copiando...");
+  try {
+    await saveProject();  // the fork fills the project that is selected server-side
+    const r = await post("/api/project/fork", { source });
+    setSourceHelp(`${r.stats?.items || 0} imagens copiadas de ${source}`);
+    // the trigger now comes from the source project, so let the poll read it
+    state.triggerHydrated = false;
+    await poll();
+  } catch (e) { setSourceHelp(e.message, true); }
+  finally { btn.disabled = false; }
+});
+
 // ---------------------------------------------------------------- mode
 $("#mode-toggle").addEventListener("click", (ev) => {
   const btn = ev.target.closest("button[data-mode]");
@@ -560,6 +622,13 @@ async function poll() {
     $("#trigger-word").value = s.trigger || "";
     state.triggerHydrated = true;
   }
+  // a copied dataset arrives with the trigger already inside every .txt on
+  // disk: accepting another word here trains one thing and samples another
+  const locked = !!s.trigger_locked;
+  $("#trigger-word").readOnly = locked;
+  $("#trigger-help").textContent = locked
+    ? `herdada de ${s.origin} — as captions já têm essa palavra escrita dentro`
+    : MODES[state.mode].triggerHelp;
   // chips
   const gpu = s.gpu || {};
   const gc = $("#gpu-chip");

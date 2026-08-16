@@ -65,6 +65,11 @@ class LiveServer(unittest.TestCase):
 
     post = _call
 
+    def _get(self, path):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        with urllib.request.urlopen(url, timeout=10) as res:
+            return res.read().decode()
+
     def start_fake_job(self):
         """Occupy the job slot with something that just waits."""
         gate = threading.Event()
