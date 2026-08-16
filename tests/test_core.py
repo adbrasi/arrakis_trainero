@@ -294,24 +294,17 @@ class TestComfyConvert(unittest.TestCase):
                 comfy_convert_command(key, Path("/o/a.safetensors"),
                                       Path("/o/a_comfy.safetensors")), key)
 
-    def test_forced_uses_convert_lora_on_musubi(self):
-        from trainero.training import comfy_convert_command
+    def test_conversion_is_decided_by_the_preset_alone(self):
+        """No UI switch, no override key: the preset is the single source of
+        truth for whether a model needs converting."""
+        import inspect
 
-        cmd = [str(c) for c in comfy_convert_command(
-            "flux-klein", Path("/o/a.safetensors"), Path("/o/a_comfy.safetensors"),
-            forced=True)]
-        self.assertTrue(any(c.endswith("convert_lora.py") for c in cmd))
-        self.assertIn("--target", cmd)
-        self.assertIn("other", cmd)
-        self.assertIn("--input", cmd)
-        self.assertIn("--output", cmd)
+        from trainero import training
 
-    def test_forced_on_sdscripts_still_uses_the_script(self):
-        from trainero.training import comfy_convert_command
-
-        cmd = comfy_convert_command("anima", Path("/o/a.safetensors"),
-                                    Path("/o/a_comfy.safetensors"), forced=True)
-        self.assertTrue(any("convert_anima_lora_to_comfy.py" in str(c) for c in cmd))
+        self.assertNotIn("forced", inspect.signature(training.comfy_convert_command).parameters)
+        self.assertNotIn("forced", inspect.signature(training.comfy_converter).parameters)
+        src = Path(training.__file__).read_text()
+        self.assertNotIn('overrides.get("comfy_convert")', src)
 
 
 class TestDetectSource(unittest.TestCase):

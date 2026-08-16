@@ -1,21 +1,35 @@
-"""Base-model downloads: aria2c when available, hf_hub_download fallback.
+"""Base-model downloads. Xet first, aria2c as fallback.
+
+Xet (hf_xet) reconstructs a file from deduplicated chunks over many parallel
+connections and skips whatever the pod already has, so it is the fastest path
+by a wide margin — it is the default here whenever the file is Xet-backed. A
+file that is not Xet-backed would go over huggingface_hub's single HTTP stream,
+which aria2c beats with 8 connections, so that case flips the order.
 
 Files land in MODELS_DIR/<model_key>/<local_subpath>. A download entry whose
 repo file ends with "/" (or is "/") means snapshot of that directory/repo.
-Token is never put on argv — aria2c gets URL+header via a 0600 input file
-(same rationale as arrakis_start: /proc/<pid>/cmdline is world-readable).
+
+Nothing partial is ever visible at the destination: every transfer lands in a
+sibling ".part"/".hfpart" and is moved into place only once it completed, so
+"the path exists" is the whole readiness test.
+
+Token is never put on argv — aria2c gets URL+header via a 0600 input file and
+the huggingface_hub child reads HF_TOKEN from its environment (same rationale
+as arrakis_start: /proc/<pid>/cmdline is world-readable).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 from .config import MODELS_DIR, hf_token
-from .jobs import Job, JobFailed
+from .jobs import Cancelled, Job, JobFailed
 from .presets import MODELS
 
 
@@ -28,9 +42,39 @@ def resolve(model_key: str, rel: str) -> Path:
 
 
 def _present(path: Path) -> bool:
+    """A transfer is moved into place only when it finished, so existence is
+    the test. Anything half-downloaded is sitting in a .part sibling."""
     if path.is_dir():
-        return any(path.rglob("*.safetensors")) or any(path.rglob("*.pth"))
+        return True
     return path.is_file() and path.stat().st_size > 1024
+
+
+# ---------------------------------------------------------------------------
+# Transport choice
+# ---------------------------------------------------------------------------
+
+
+def xet_ready() -> bool:
+    """hf_xet installed and not disabled by the environment."""
+    try:
+        import hf_xet  # noqa: F401
+    except ImportError:
+        return False
+    return os.environ.get("HF_HUB_DISABLE_XET", "").strip().lower() not in ("1", "true", "yes")
+
+
+def xet_backed(repo: str, remote: str, token: str | None) -> bool:
+    """Ask the Hub whether this exact file is stored on Xet (one HEAD)."""
+    from huggingface_hub import get_hf_file_metadata, hf_hub_url
+
+    try:
+        meta = get_hf_file_metadata(hf_hub_url(repo, remote), token=token)
+    except Exception:  # noqa: BLE001 — offline/rate-limited: just use the fallback
+        return False
+    return getattr(meta, "xet_file_data", None) is not None
+
+
+# ---------------------------------------------------------------------------
 
 
 def ensure_models(model_key: str, job: Job) -> None:
@@ -38,6 +82,8 @@ def ensure_models(model_key: str, job: Job) -> None:
     root = model_root(model_key)
     root.mkdir(parents=True, exist_ok=True)
     token = hf_token()
+    job.log("Transferência: Xet ativo." if xet_ready() else
+            "Transferência: hf_xet indisponível — caindo para aria2c/HTTP.")
     for repo, remote, local in MODELS[model_key]["downloads"]:
         dest = root / local
         if _present(dest):
@@ -53,39 +99,82 @@ def ensure_models(model_key: str, job: Job) -> None:
 
 
 def _snapshot(repo: str, subdir: str, dest: Path, token: str | None, job: Job) -> None:
-    from huggingface_hub import snapshot_download
-
-    job.log(f"Baixando snapshot {repo}" + (f" ({subdir}/)" if subdir else "") + "...")
-    kwargs = {"local_dir": str(dest), "token": token}
-    if subdir:
-        kwargs["allow_patterns"] = [f"{subdir}/*"]
-    snapshot_download(repo, **kwargs)
-    # flatten "<dest>/<subdir>/*" -> "<dest>/*" so presets reference dest directly
-    inner = dest / subdir if subdir else dest
-    if subdir and inner.exists():
-        for item in inner.iterdir():
-            target = dest / item.name
-            if not target.exists():
-                shutil.move(str(item), str(target))
-        shutil.rmtree(inner, ignore_errors=True)
+    job.log(f"Baixando snapshot {repo}" + (f" ({subdir}/)" if subdir else "") + " via Xet/hub…")
+    _hf_fetch(repo, "", subdir, dest, token, job)
 
 
 def _single_file(repo: str, remote: str, dest: Path, token: str | None, job: Job) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    size_hint = ""
-    job.log(f"Baixando {repo}/{remote}{size_hint}...")
-    if shutil.which("aria2c"):
-        url = f"https://huggingface.co/{repo}/resolve/main/{remote}"
-        if _aria2(url, dest, token, job):
-            return
-        job.log("aria2c falhou, tentando huggingface_hub...")
-    from huggingface_hub import hf_hub_download
+    url = f"https://huggingface.co/{repo}/resolve/main/{remote}"
+    have_aria2 = bool(shutil.which("aria2c"))
+    use_xet = xet_ready() and xet_backed(repo, remote, token)
+    job.log(f"Baixando {repo}/{remote} via " +
+            ("Xet." if use_xet else "aria2c." if have_aria2 else "huggingface_hub (HTTP)."))
 
-    tmp_dir = dest.parent / ".hf_dl"
-    tmp_dir.mkdir(exist_ok=True)
-    path = hf_hub_download(repo, filename=remote, token=token, local_dir=str(tmp_dir))
-    shutil.move(path, dest)
-    shutil.rmtree(tmp_dir, ignore_errors=True)
+    def by_xet() -> bool:
+        try:
+            _hf_fetch(repo, remote, "", dest, token, job)
+            return True
+        except JobFailed as exc:
+            job.log(f"⚠ Xet/hub falhou: {exc}")
+            return False
+
+    def by_aria2() -> bool:
+        if not have_aria2:
+            return False
+        if _aria2(url, dest, token, job):
+            return True
+        job.log("⚠ aria2c falhou.")
+        return False
+
+    order = (by_xet, by_aria2) if use_xet else (by_aria2, by_xet)
+    for attempt in order:
+        if attempt():
+            return
+    raise JobFailed(f"não consegui baixar {repo}/{remote} por nenhum transporte")
+
+
+# The huggingface_hub transfer runs as a child process for two reasons: cancel
+# has to kill it (job.cancel kills the process group), and its progress bars
+# then stream into the job log like every other phase.
+_FETCH_CHILD = r'''
+import json, os, shutil, sys
+from pathlib import Path
+from huggingface_hub import hf_hub_download, snapshot_download
+
+spec = json.loads(sys.argv[1])
+dest, stage = Path(spec["dest"]), Path(spec["stage"])
+try:
+    import hf_xet  # noqa: F401
+except ImportError:
+    print("[hf] hf_xet ausente — transferencia HTTP simples", flush=True)
+
+stage.mkdir(parents=True, exist_ok=True)
+if spec["remote"]:
+    got = hf_hub_download(spec["repo"], filename=spec["remote"], local_dir=str(stage))
+    os.replace(got, dest)
+else:
+    sub = spec["subdir"]
+    snapshot_download(spec["repo"], local_dir=str(stage),
+                      **({"allow_patterns": [sub + "/*"]} if sub else {}))
+    shutil.rmtree(stage / ".cache", ignore_errors=True)
+    inner = stage / sub if sub else stage
+    # dest only ever appears complete: an interrupted snapshot stays in stage
+    os.replace(inner, dest)
+shutil.rmtree(stage, ignore_errors=True)
+print("[hf] ok", flush=True)
+'''
+
+
+def _hf_fetch(repo: str, remote: str, subdir: str, dest: Path,
+              token: str | None, job: Job) -> None:
+    stage = dest.parent / (dest.name + ".hfpart")
+    spec = {"repo": repo, "remote": remote, "subdir": subdir,
+            "dest": str(dest), "stage": str(stage)}
+    env = {"HF_XET_HIGH_PERFORMANCE": "1"}
+    if token:
+        env["HF_TOKEN"] = token  # env, never argv
+    job.run([sys.executable, "-c", _FETCH_CHILD, json.dumps(spec)], env=env)
 
 
 def _aria2(url: str, dest: Path, token: str | None, job: Job) -> bool:
@@ -107,7 +196,9 @@ def _aria2(url: str, dest: Path, token: str | None, job: Job) -> bool:
         ])
         os.replace(part, dest)
         return True
-    except Exception:
+    except Cancelled:
+        raise  # cancelling must stop the job, not silently try the next transport
+    except (JobFailed, OSError, subprocess.SubprocessError):
         return False
     finally:
         if argfile and os.path.exists(argfile):

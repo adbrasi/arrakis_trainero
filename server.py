@@ -33,6 +33,31 @@ from trainero.training import project_dir, run_training, slugify
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 
+# A job reads the dataset from the first phase to the last; anything that writes
+# to it meanwhile changes the run under its feet. jobs.start() is the mutex for
+# job-vs-job, and these two cover the writes that are plain HTTP requests:
+# uploads/clears wait for the job slot, and a train waits for the uploads.
+_uploads = 0
+_uploads_lock = threading.Lock()
+
+
+class _UploadInFlight:
+    def __enter__(self):
+        global _uploads
+        with _uploads_lock:
+            _uploads += 1
+
+    def __exit__(self, *_exc):
+        global _uploads
+        with _uploads_lock:
+            _uploads -= 1
+        return False
+
+
+def uploads_in_flight() -> int:
+    with _uploads_lock:
+        return _uploads
+
 # musubi writes samples as <output_name>_e{epoch:06d}_{idx:02d}_{ts}[_{seed}].png
 # and falls back to a bare step counter when the run is step-based.
 _SAMPLE_RE = re.compile(r"_(e?)(\d{6})_(\d{2})_")
@@ -304,6 +329,14 @@ class Handler(SimpleHTTPRequestHandler):
             return None
         return project
 
+    def _require_idle(self) -> bool:
+        """Refuse to touch the dataset while a job is reading it."""
+        job = jobs.current()
+        if job and job.status == "running":
+            self._error(f"{job.title} está rodando — cancele antes de mexer no dataset", 409)
+            return False
+        return True
+
     def _import(self, query):
         project = self._require_project()
         if not project:
@@ -320,6 +353,8 @@ class Handler(SimpleHTTPRequestHandler):
         project = self._require_project()
         if not project:
             return
+        if not self._require_idle():
+            return
         name = Path(query.get("name", "")).name  # basename only — no traversal
         if not name:
             return self._error("nome do arquivo ausente")
@@ -333,41 +368,44 @@ class Handler(SimpleHTTPRequestHandler):
         if length <= 0:
             return self._error("corpo vazio")
         dest = target_root / name
-        with open(dest, "wb") as f:
-            remaining = length
-            while remaining > 0:
-                chunk = self.rfile.read(min(1 << 20, remaining))
-                if not chunk:
-                    break
-                f.write(chunk)
-                remaining -= len(chunk)
-        ext = ds.archive_ext(name)
-        if ext:
-            import subprocess
-            import uuid
+        with _UploadInFlight():
+            with open(dest, "wb") as f:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1 << 20, remaining))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+            ext = ds.archive_ext(name)
+            if ext:
+                import subprocess
+                import uuid
 
-            class _SyncJob:  # tiny shim: extraction logging goes nowhere useful here
-                def log(self, *_): pass
+                class _SyncJob:  # tiny shim: extraction logging goes nowhere useful here
+                    def log(self, *_): pass
 
-                def run(self, cmd, **kw):
-                    subprocess.run([str(c) for c in cmd], check=True,
-                                   cwd=kw.get("cwd"), capture_output=True)
+                    def run(self, cmd, **kw):
+                        subprocess.run([str(c) for c in cmd], check=True,
+                                       cwd=kw.get("cwd"), capture_output=True)
 
-            # unique per request: parallel uploads of two zips must not share staging
-            staging = target_root.parent / f"_upload_staging_{uuid.uuid4().hex}"
-            try:
-                ds.extract_archive(dest, staging / "src", _SyncJob())
-                ds.normalize_into(staging, target_root, _SyncJob())
-            except (JobFailed, subprocess.CalledProcessError, OSError) as exc:
-                return self._error(f"extração de {name} falhou: {exc}")
-            finally:
-                dest.unlink(missing_ok=True)
-                shutil.rmtree(staging, ignore_errors=True)
+                # unique per request: parallel uploads of two zips must not share staging
+                staging = target_root.parent / f"_upload_staging_{uuid.uuid4().hex}"
+                try:
+                    ds.extract_archive(dest, staging / "src", _SyncJob())
+                    ds.normalize_into(staging, target_root, _SyncJob())
+                except (JobFailed, subprocess.CalledProcessError, OSError) as exc:
+                    return self._error(f"extração de {name} falhou: {exc}")
+                finally:
+                    dest.unlink(missing_ok=True)
+                    shutil.rmtree(staging, ignore_errors=True)
         self._json({"ok": True, "stats": ds.inspect(dataset_dir(side))})
 
     def _clear_dataset(self, query):
         project = self._require_project()
         if not project:
+            return
+        if not self._require_idle():
             return
         side = query.get("side", "pos")
         shutil.rmtree(dataset_dir(side), ignore_errors=True)
@@ -400,6 +438,9 @@ class Handler(SimpleHTTPRequestHandler):
         model_key = body.get("model")
         if model_key not in MODELS:
             return self._error(f"modelo inválido: {model_key}")
+        pending = uploads_in_flight()
+        if pending:
+            return self._error(f"{pending} upload(s) ainda em andamento — espere terminar", 409)
         params = {
             "project": project,
             "model": model_key,

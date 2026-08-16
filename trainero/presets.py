@@ -91,7 +91,9 @@ MODELS = {
         "arch": "krea2",
         "downloads": [
             ("krea/Krea-2-Raw", "raw.safetensors", "raw.safetensors"),
-            ("Comfy-Org/Qwen-Image-Edit_ComfyUI", "split_files/vae/qwen_image_vae.safetensors", "qwen_image_vae.safetensors"),
+            # Qwen-Image-Edit_ComfyUI ships no vae/ at all — the VAE lives in the
+            # base Qwen-Image repo (same file the qwen-image presets pull).
+            ("Comfy-Org/Qwen-Image_ComfyUI", "split_files/vae/qwen_image_vae.safetensors", "qwen_image_vae.safetensors"),
             ("Comfy-Org/Qwen3-VL", "text_encoders/qwen3vl_4b_bf16.safetensors", "qwen3vl_4b_bf16.safetensors"),
         ],
         "model_args": {"dit": "raw.safetensors", "vae": "qwen_image_vae.safetensors", "text_encoder": "qwen3vl_4b_bf16.safetensors"},

@@ -99,9 +99,19 @@ const MODES = {
   },
 };
 
+// An override means "this number instead of the one this preset suggests", so
+// it only has meaning while that preset is on screen. Changing model or mode
+// changes the preset, and a leftover override would silently describe a run
+// nobody asked for (a rank typed on Krea reaching Anima, repeats reaching a
+// Style Rush that has none).
+function resetOverrides() {
+  state.advTouched.clear();
+}
+
 function applyMode() {
   const root = document.documentElement;
   const native = sliderIsNative();
+  if (root.dataset.mode !== state.mode) resetOverrides();
   root.dataset.mode = state.mode;
   root.dataset.native = native ? "1" : "0";
   const m = MODES[state.mode];
@@ -166,6 +176,9 @@ function setupPanel(panel) {
     const src = panel.querySelector(".link-input").value.trim();
     if (!src) return toast("cole um link ou caminho primeiro", "error");
     if (!requireProject()) return;
+    // the project name is saved on a 600ms debounce: importing right after
+    // typing it would land the dataset in whatever project was current before
+    await saveProject();
     try {
       await post(`/api/dataset/import?side=${side}`, { source: src });
       toast("Import iniciado — acompanhe no progresso.");
@@ -187,7 +200,8 @@ async function uploadFiles(files, side) {
   if (!files.length || !requireProject()) return;
   await saveProject();
   state.uploading = true;
-  let done = 0;
+  refreshTrainButton();
+  let done = 0, ok = 0;
   const queue = [...files];
   const workers = Array.from({ length: 4 }, async () => {
     while (queue.length) {
@@ -197,6 +211,7 @@ async function uploadFiles(files, side) {
       try {
         await api(`/api/dataset/file?side=${side}&name=${encodeURIComponent(f.name)}&dir=${dir}`,
           { method: "POST", body: f });
+        ok += 1;
       } catch (e) { toast(`${f.name}: ${e.message}`, "error"); }
       done += 1;
       $("#status-text").textContent = `enviando ${done}/${files.length}…`;
@@ -204,7 +219,11 @@ async function uploadFiles(files, side) {
   });
   await Promise.all(workers);
   state.uploading = false;
-  toast(`${done} arquivos enviados`, "success");
+  // "N enviados" after half of them failed is the report that lets someone
+  // train on an incomplete dataset without ever knowing
+  const failed = done - ok;
+  if (failed) toast(`${ok} de ${done} enviados — ${failed} falharam`, "error");
+  else toast(`${ok} arquivo${ok === 1 ? "" : "s"} enviado${ok === 1 ? "" : "s"}`, "success");
   poll();
 }
 
@@ -320,11 +339,32 @@ function renderCaptionCard() {
     sel.dataset.kind = isVideo ? "video" : "image";
     sel.innerHTML = profiles.map((p) => `<option value="${p.key}" data-var="${p.var || ""}">${p.label}</option>`).join("");
   }
+  renderCaptionTriggerNote();
 }
+
+// The trigger word is one thing and it lives in step 01. A second field here
+// meant the captions could be written with a word the training never uses.
+function renderCaptionTriggerNote() {
+  const needsVar = !!$("#caption-profile").selectedOptions[0]?.dataset.var;
+  const trig = $("#trigger-word").value.trim();
+  const note = $("#caption-trigger-note");
+  if (!needsVar) note.textContent = "este perfil não usa trigger word";
+  else if (trig) note.textContent = `usa a trigger word do passo 01: ${trig}`;
+  else note.textContent = "este perfil usa a trigger word — preencha-a no passo 01";
+  note.classList.toggle("alert", needsVar && !trig);
+}
+$("#caption-profile").addEventListener("change", renderCaptionTriggerNote);
+$("#trigger-word").addEventListener("input", renderCaptionTriggerNote);
 
 $("#btn-captions").addEventListener("click", async () => {
   const sel = $("#caption-profile");
   const opt = sel.selectedOptions[0];
+  const trigger = $("#trigger-word").value.trim();
+  if (opt?.dataset.var && !trigger) {
+    toast("este perfil precisa da trigger word — preencha no passo 01", "error");
+    $("#trigger-word").focus();
+    return;
+  }
   try {
     const sides = [];
     if (state.status?.dataset?.missing_captions) sides.push("pos");
@@ -332,7 +372,7 @@ $("#btn-captions").addEventListener("click", async () => {
     await post("/api/captions", {
       profile: sel.value,
       var_name: opt?.dataset.var || null,
-      trigger: $("#caption-trigger").value.trim(),
+      trigger,
       side: sides[0] || "pos",
     });
     toast("Geração de captions iniciada.");
@@ -354,6 +394,7 @@ function renderModels() {
 }
 
 function selectModel(key) {
+  if (state.model !== key) resetOverrides();
   state.model = key;
   $$(".model-btn").forEach((b) => b.classList.toggle("selected", b.dataset.key === key));
   const m = state.presets.models[key];
@@ -361,7 +402,7 @@ function selectModel(key) {
   $("#preset-line").hidden = false;
   $("#preset-line").textContent =
     `${m.label} · ${m.engine} · dim ${t.network_dim}/${t.network_alpha ?? "auto"} · lr ${t.learning_rate}`
-    + (styleRush() ? " · 5 epochs fixos" : " · epochs automáticos");
+    + (styleRush() ? " · 5 epochs" : " · epochs automáticos");
   fillAdvanced();
   applyMode();
 }
@@ -490,6 +531,8 @@ function refreshTrainButton() {
   }
   if (!state.model) blockers.push("escolha um modelo");
   if (styleRush() && !s.openrouter) blockers.push("defina OPENROUTER_API_KEY no pod");
+  // the server refuses a train mid-upload; say so before the click, not after
+  if (state.uploading) blockers.unshift("espere o upload terminar");
 
   $("#btn-train").disabled = !!busy || blockers.length > 0;
   $("#btn-cancel").hidden = !busy;
@@ -569,7 +612,7 @@ function renderJob(job) {
   if (pr.loss != null) metrics.push(`loss <b>${pr.loss.toFixed(4)}</b>`);
   const cs = job.extra?.config_summary;
   if (cs) metrics.push(`<span class="hint">${JSON.stringify(cs).slice(1, -1).replaceAll('"', "")}</span>`);
-  if (job.error) metrics.push(`<b style="color:var(--error)">${job.error}</b>`);
+  if (job.error) metrics.push(`<b style="color:var(--signal)">${job.error}</b>`);
   $("#metrics").innerHTML = metrics.join(" · ");
   const hfRow = $("#hf-link-row");
   if (job.extra?.hf_repo) {
