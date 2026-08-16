@@ -94,7 +94,10 @@ Confirmado no catálogo `/api/v1/images/models`: `openai/gpt-image-2` aceita `in
 Não aceita `size`/`resolution` — a saída de `quality: low` já é 1K nativo, que é o pedido.
 
 Custo (pricing do endpoint OpenAI no OpenRouter): `output_image` $3e-5/token,
-`input_image` $8e-6/token → ~$0.011 por imagem, **~$0.55 pelos 50 slots**.
+`input_image` $8e-6/token. Medido numa chamada real (referência 1024x1024, quality low):
+1024 tokens de entrada + 23 do prompt + 196 de saída = **$0.0142 por imagem, ~$0.71 pelos 50
+slots**. A referência é reduzida para 1024px antes do envio — acima disso o custo escala
+com a área e a saída continua 1K.
 
 **Recusa da moderação:** o slot tenta uma segunda vez com **outra imagem** do pool, mesmo
 prompt e mesmo modelo. Duas tentativas por slot, no máximo. Falhou nas duas → o slot é

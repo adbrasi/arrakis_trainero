@@ -20,11 +20,23 @@ from pathlib import Path
 MODEL = "openai/gpt-image-2"
 API_URL = "https://openrouter.ai/api/v1/images"
 
-# The ratios gpt-image-2 accepts, as (label, width/height).
+# The ratios gpt-image-2 accepts, as (label, width/height). "auto" is left out
+# on purpose: the framing has to follow the owner's image, not the model's guess.
 SUPPORTED_RATIOS = [
     ("1:1", 1 / 1), ("3:2", 3 / 2), ("2:3", 2 / 3), ("4:3", 4 / 3),
-    ("3:4", 3 / 4), ("16:9", 16 / 9), ("9:16", 9 / 16),
+    ("3:4", 3 / 4), ("16:9", 16 / 9), ("9:16", 9 / 16), ("21:9", 21 / 9),
 ]
+
+# The reference image is tokenised in 32x32 patches and billed at 8e-6/token, so
+# a 1024x1024 reference is 1024 tokens ($0.0082) and a 2048x2048 one costs four
+# times that. quality "low" renders at 1K regardless, so a bigger reference buys
+# nothing — it only inflates the bill and the upload.
+REFERENCE_MAX_EDGE = 1024
+
+# Measured, not derived: one 1024x1024 reference at quality "low" returned
+# usage.cost = 0.014187 (1024 input-image + 23 prompt + 196 output-image tokens).
+# The published gpt-image-1 table would have said 0.011 — it does not apply here.
+COST_PER_IMAGE = 0.0142
 
 _REFUSAL_MARKERS = (
     "safety", "moderation", "content_policy", "content policy", "flagged", "rejected",
@@ -52,15 +64,31 @@ def aspect_ratio_for(width: int, height: int) -> str:
 
 
 def to_data_url(path: Path) -> tuple[str, int, int]:
-    """Read an image as a data URI, plus its pixel dimensions."""
+    """Read an image as a data URI, plus the dimensions actually sent.
+
+    Anything above REFERENCE_MAX_EDGE is downscaled first: the token bill scales
+    with the reference's pixel area, and the model renders at 1K anyway. Images
+    already within budget are passed through byte for byte.
+    """
+    import io
+
     from PIL import Image
 
     with Image.open(path) as im:
+        if max(im.size) <= REFERENCE_MAX_EDGE:
+            fmt = (im.format or "PNG").lower()
+            mime = "image/jpeg" if fmt in ("jpg", "jpeg") else f"image/{fmt}"
+            encoded = base64.b64encode(path.read_bytes()).decode()
+            return f"data:{mime};base64,{encoded}", im.size[0], im.size[1]
+
+        if im.mode not in ("RGB", "RGBA", "L", "P"):
+            im = im.convert("RGB")  # CMYK and friends cannot be written as PNG
+        im.thumbnail((REFERENCE_MAX_EDGE, REFERENCE_MAX_EDGE), Image.LANCZOS)
         width, height = im.size
-        fmt = (im.format or "PNG").lower()
-    mime = "image/jpeg" if fmt in ("jpg", "jpeg") else f"image/{fmt}"
-    encoded = base64.b64encode(path.read_bytes()).decode()
-    return f"data:{mime};base64,{encoded}", width, height
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+    encoded = base64.b64encode(buf.getvalue()).decode()
+    return f"data:image/png;base64,{encoded}", width, height
 
 
 def build_payload(prompt: str, data_url: str, aspect_ratio: str) -> dict:

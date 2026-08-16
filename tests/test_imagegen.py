@@ -24,12 +24,63 @@ class TestAspectRatio(unittest.TestCase):
         self.assertEqual(aspect_ratio_for(1024, 768), "4:3")
         self.assertEqual(aspect_ratio_for(768, 1024), "3:4")
 
-    def test_extreme_ratio_clamps_to_nearest_supported(self):
-        # 21:9 is not in our list; nearest supported is 16:9
-        self.assertEqual(aspect_ratio_for(2560, 1080), "16:9")
+    def test_ultrawide_uses_the_ratio_the_model_supports(self):
+        # 21:9 is accepted by gpt-image-2 — snapping these to 16:9 would crop
+        self.assertEqual(aspect_ratio_for(2560, 1080), "21:9")
+        self.assertEqual(aspect_ratio_for(3440, 1440), "21:9")
+
+    def test_beyond_the_widest_ratio_clamps_to_it(self):
+        self.assertEqual(aspect_ratio_for(5000, 1000), "21:9")
 
     def test_zero_dimension_is_square(self):
         self.assertEqual(aspect_ratio_for(0, 0), "1:1")
+
+
+class TestReferenceDownscale(unittest.TestCase):
+    """The reference image is billed by pixel area, so its size is our lever."""
+
+    def _img(self, td, size, name="a.png", fmt=None):
+        from PIL import Image
+
+        p = Path(td) / name
+        Image.new("RGB", size).save(p, format=fmt)
+        return p
+
+    def test_oversized_reference_is_downscaled(self):
+        import tempfile
+
+        from trainero.imagegen import REFERENCE_MAX_EDGE, to_data_url
+
+        with tempfile.TemporaryDirectory() as td:
+            _url, w, h = to_data_url(self._img(td, (4096, 3072)))
+            self.assertEqual(max(w, h), REFERENCE_MAX_EDGE)
+            self.assertAlmostEqual(w / h, 4096 / 3072, places=2)  # ratio kept
+
+    def test_small_reference_is_passed_through_untouched(self):
+        import tempfile
+
+        from trainero.imagegen import to_data_url
+
+        with tempfile.TemporaryDirectory() as td:
+            src = self._img(td, (640, 480), "a.jpg", fmt="JPEG")
+            url, w, h = to_data_url(src)
+            self.assertEqual((w, h), (640, 480))
+            self.assertTrue(url.startswith("data:image/jpeg;base64,"))
+            self.assertEqual(base64.b64decode(url.split(",", 1)[1]), src.read_bytes())
+
+    def test_downscaled_payload_is_smaller_than_the_original(self):
+        import tempfile
+
+        from PIL import Image
+
+        from trainero.imagegen import to_data_url
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "noise.png"
+            Image.effect_noise((3000, 3000), 96).convert("RGB").save(p)
+            url, _w, _h = to_data_url(p)
+            sent = len(base64.b64decode(url.split(",", 1)[1]))
+            self.assertLess(sent, p.stat().st_size)
 
 
 class TestPayload(unittest.TestCase):

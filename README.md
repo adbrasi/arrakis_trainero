@@ -66,7 +66,7 @@ Toggle "Style Rush" no topo, para **Flux Klein** ou **Qwen Image Edit**. Você m
 dataset de estilo e preenche a trigger word; o trainer faz o resto:
 
 1. captions do dataset via OpenRouter (profile `generic-style`, trigger na primeira palavra);
-2. **50 pares de conversão** gerados com `openai/gpt-image-2` (quality low, ~$0.55): a saída
+2. **50 pares de conversão** gerados com `openai/gpt-image-2` (quality low, ~$0.71): a saída
    vira a control image, a sua imagem original vira o target, e a caption é a mesma nos 50 —
    `convert the style of this image to the <trigger> style`;
 3. treino com os **dois datasets no mesmo `dataset.toml`** (só o de conversão tem

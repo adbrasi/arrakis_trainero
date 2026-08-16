@@ -148,7 +148,7 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
 
     if pending:
         job.log(f"Gerando {len(pending)} imagens de conversão com {imagegen.MODEL} "
-                f"(quality low) — ~${0.011 * len(pending):.2f}")
+                f"(quality low) — ~${imagegen.COST_PER_IMAGE * len(pending):.2f}")
     else:
         job.log(f"Dataset de conversão já completo ({len(slots)} pares).")
 
