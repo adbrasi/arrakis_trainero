@@ -307,6 +307,52 @@ class TestComfyConvert(unittest.TestCase):
         self.assertNotIn('overrides.get("comfy_convert")', src)
 
 
+class TestCaptionModel(unittest.TestCase):
+    """The captioner's CLI flags are named --grok_* for historical reasons; the
+    model behind them is a choice, and it is Gemini."""
+
+    def test_default_is_gemini(self):
+        from trainero.captioner import DEFAULT_CAPTION_MODEL
+
+        self.assertEqual(DEFAULT_CAPTION_MODEL, "google/gemini-3.7-flash")
+
+    def test_the_command_passes_that_model_to_openrouter(self):
+        import os
+        from pathlib import Path as P
+
+        from trainero import captioner
+
+        cmds = []
+
+        class FakeJob:
+            def log(self, *_): pass
+
+            def run(self, cmd, cwd=None, **_kw):
+                cmds.append([str(c) for c in cmd])
+
+        saved = (captioner.ensure_engine, captioner.venv_python, captioner.engine_dir,
+                 os.environ.get("OPENROUTER_API_KEY"))
+        captioner.ensure_engine = lambda *_a: None
+        captioner.venv_python = lambda _e: P("/v/python")
+        captioner.engine_dir = lambda _e: P("/e/captioner")
+        os.environ["OPENROUTER_API_KEY"] = "sk-test"
+        try:
+            captioner.generate_captions(P("/ds"), "image", "generic-style",
+                                        {"style_name": "makima"}, FakeJob())
+        finally:
+            captioner.ensure_engine, captioner.venv_python, captioner.engine_dir = saved[:3]
+            if saved[3] is None:
+                os.environ.pop("OPENROUTER_API_KEY", None)
+            else:
+                os.environ["OPENROUTER_API_KEY"] = saved[3]
+
+        cmd = cmds[0]
+        self.assertIn("--grok_model", cmd)
+        self.assertEqual(cmd[cmd.index("--grok_model") + 1], "google/gemini-3.7-flash")
+        self.assertEqual(cmd[cmd.index("--grok_provider") + 1], "openrouter")
+        self.assertIn("style_name=makima", cmd)
+
+
 class TestDetectSource(unittest.TestCase):
     def test_kinds(self):
         self.assertEqual(detect_source("https://mega.nz/folder/abc#key"), "mega")

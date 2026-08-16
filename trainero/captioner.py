@@ -11,7 +11,9 @@ import os
 from .engines import engine_dir, ensure_engine, venv_python
 from .jobs import Job, JobFailed
 
-DEFAULT_CAPTION_MODEL = os.environ.get("CAPTION_MODEL", "x-ai/grok-4.1-fast")
+# The captioner's CLI names this stage "grok" for historical reasons; the flag
+# takes any OpenRouter model id with vision. Override with CAPTION_MODEL.
+DEFAULT_CAPTION_MODEL = os.environ.get("CAPTION_MODEL", "google/gemini-3.7-flash")
 
 
 def generate_captions(dataset_dir, media: str, profile: str, prompt_vars: dict[str, str],
