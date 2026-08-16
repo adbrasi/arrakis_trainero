@@ -167,7 +167,6 @@
     <div class="content">
       <div class="launch-row">
         <button class="btn-train" id="btn-train" disabled>Treinar</button>
-        <button class="btn danger" id="btn-cancel" hidden>Cancelar</button>
         <p class="next-action" id="next-action"></p>
       </div>
       <details class="advanced" id="advanced">
@@ -199,6 +198,10 @@
     <div class="margin">
       <span class="marker">04</span>
       <h2 id="progress-title">Progresso</h2>
+      <!-- stop lives with the thing it stops: this card is what is on screen
+           while a job runs, and a cancel button parked up in the launch row is
+           a button nobody finds -->
+      <button class="btn danger" id="btn-cancel" hidden>Parar treino</button>
     </div>
     <div class="content">
       <div class="phase-chips" id="phase-chips"></div>

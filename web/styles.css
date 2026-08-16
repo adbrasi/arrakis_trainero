@@ -149,6 +149,9 @@ input:focus, select:focus, .dropzone:focus-visible, button:focus-visible {
 .btn.quiet { background: var(--sheet); color: var(--ink); border-color: var(--rule); }
 .btn.quiet:hover { background: var(--sunk); }
 .btn.danger { background: transparent; color: var(--signal); border-color: var(--signal); }
+/* the stop control sits under the progress card title, full width of the
+   200px margin column so it reads as part of that card and not as a stray */
+#card-progress #btn-cancel { display: block; width: 100%; margin-top: 14px; }
 .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .launch { border-top: 1px solid var(--rule-soft); }
