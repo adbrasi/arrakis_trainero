@@ -72,7 +72,7 @@ class TestTransportOrder(unittest.TestCase):
         md.prefers_xet = lambda *a: True
         job = FakeJob()
         md._single_file("some/repo", "f.safetensors", self.dest, None, job)
-        self.assertIn("huggingface_hub", job.cmds[0])
+        self.assertIn("trainero.hf_fetch", job.cmds[0])
         self.assertNotIn("aria2c", job.cmds[0])
 
     def test_non_xet_file_prefers_aria2_over_single_stream_http(self):
@@ -83,7 +83,7 @@ class TestTransportOrder(unittest.TestCase):
 
     def test_xet_failure_falls_back_to_aria2(self):
         md.prefers_xet = lambda *a: True
-        job = FakeJob(fail=("huggingface_hub",))
+        job = FakeJob(fail=("trainero.hf_fetch",))
         md._single_file("some/repo", "f.safetensors", self.dest, None, job)
         self.assertTrue(job.used("aria2c"))
 
@@ -152,11 +152,11 @@ class TestCancellation(unittest.TestCase):
         job = FakeJob(cancel_on="aria2c")
         with self.assertRaises(Cancelled):
             md._single_file("some/repo", "f.safetensors", self.dest, None, job)
-        self.assertFalse(job.used("huggingface_hub"))
+        self.assertFalse(job.used("trainero.hf_fetch"))
 
     def test_cancel_during_hub_does_not_start_the_aria2_fallback(self):
         md.prefers_xet = lambda *a: True
-        job = FakeJob(cancel_on="huggingface_hub")
+        job = FakeJob(cancel_on="trainero.hf_fetch")
         with self.assertRaises(Cancelled):
             md._single_file("some/repo", "f.safetensors", self.dest, None, job)
         self.assertFalse(job.used("aria2c"))
@@ -189,7 +189,9 @@ class TestCompleteness(unittest.TestCase):
             self.assertNotEqual(spec["stage"], str(dest))
 
     def test_the_child_only_moves_after_the_download_returns(self):
-        src = md._FETCH_CHILD
+        from trainero import hf_fetch
+
+        src = Path(hf_fetch.__file__).read_text()
         self.assertLess(src.index("snapshot_download("), src.index("os.replace(inner, dest)"))
         self.assertLess(src.index("hf_hub_download("), src.index("os.replace(got, dest)"))
 

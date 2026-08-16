@@ -28,7 +28,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from .config import MODELS_DIR, hf_token
+from .config import MODELS_DIR, REPO_DIR, hf_token
 from .jobs import Cancelled, Job, JobFailed
 from .presets import MODELS
 
@@ -142,49 +142,18 @@ def _single_file(repo: str, remote: str, dest: Path, token: str | None, job: Job
     raise JobFailed(f"não consegui baixar {repo}/{remote} por nenhum transporte")
 
 
-# The huggingface_hub transfer runs as a child process for two reasons: cancel
-# has to kill it (job.cancel kills the process group), and its progress bars
-# then stream into the job log like every other phase.
-_FETCH_CHILD = r'''
-import json, os, shutil, sys
-from pathlib import Path
-from huggingface_hub import hf_hub_download, snapshot_download
-
-spec = json.loads(sys.argv[1])
-dest, stage = Path(spec["dest"]), Path(spec["stage"])
-try:
-    import hf_xet  # noqa: F401
-except ImportError:
-    print("[hf] hf_xet ausente — transferencia HTTP simples", flush=True)
-
-stage.mkdir(parents=True, exist_ok=True)
-if spec["remote"]:
-    got = hf_hub_download(spec["repo"], filename=spec["remote"], local_dir=str(stage))
-    os.replace(got, dest)
-else:
-    sub = spec["subdir"]
-    snapshot_download(spec["repo"], local_dir=str(stage),
-                      **({"allow_patterns": [sub + "/*"]} if sub else {}))
-    shutil.rmtree(stage / ".cache", ignore_errors=True)
-    inner = stage / sub if sub else stage
-    if not inner.is_dir() or not any(inner.iterdir()):
-        raise SystemExit(f"[hf] {spec['repo']} nao tem nada em {sub or '/'}")
-    # dest only ever appears complete: an interrupted snapshot stays in stage
-    os.replace(inner, dest)
-shutil.rmtree(stage, ignore_errors=True)
-print("[hf] ok", flush=True)
-'''
-
-
 def _hf_fetch(repo: str, remote: str, subdir: str, dest: Path,
               token: str | None, job: Job) -> None:
+    """Hand one transfer to trainero.hf_fetch in a child process (see its
+    docstring for why it is a child and not an in-process call)."""
     stage = dest.parent / (dest.name + ".hfpart")
     spec = {"repo": repo, "remote": remote, "subdir": subdir,
             "dest": str(dest), "stage": str(stage)}
     env = {"HF_XET_HIGH_PERFORMANCE": "1"}
     if token:
         env["HF_TOKEN"] = token  # env, never argv
-    job.run([sys.executable, "-c", _FETCH_CHILD, json.dumps(spec)], env=env)
+    job.run([sys.executable, "-m", "trainero.hf_fetch", json.dumps(spec)],
+            cwd=REPO_DIR, env=env)
 
 
 def _aria2(url: str, dest: Path, token: str | None, job: Job) -> bool:

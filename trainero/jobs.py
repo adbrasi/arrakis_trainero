@@ -23,6 +23,8 @@ _current: "Job | None" = None
 _STEP_RE = re.compile(r"steps?:\s*\d+%.*?\|\s*(\d+)/(\d+)")
 _LOSS_RE = re.compile(r"(?:avr_loss|loss)[=:]\s*([0-9.]+(?:e-?\d+)?)")
 _EPOCH_RE = re.compile(r"epoch (\d+)/(\d+)", re.IGNORECASE)
+# keeps the terminator so the reader knows a \r frame from a finished line
+_EOL_RE = re.compile(rb"([\r\n])")
 
 
 class Cancelled(Exception):
@@ -49,15 +51,35 @@ class Job:
         self._cancel = threading.Event()
         self._proc: subprocess.Popen | None = None
         self._log_lock = threading.Lock()
+        self._transient_at: int | None = None  # offset of the live progress line
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("")
 
     # -- logging -----------------------------------------------------------
-    def log(self, msg: str) -> None:
-        line = msg if msg.endswith("\n") else msg + "\n"
+    def log(self, msg: str, transient: bool = False) -> None:
+        """Append a line to the job log.
+
+        A transient line is one frame of a progress bar (a child redrawing with
+        \\r). It overwrites the previous transient line instead of adding one:
+        a 20 GB download redraws thousands of times and would otherwise bury
+        the run in near-identical lines.
+        """
+        data = (msg if msg.endswith("\n") else msg + "\n").encode("utf-8", errors="replace")
         with self._log_lock:
-            with open(self.log_path, "a", encoding="utf-8", errors="replace") as f:
-                f.write(line)
+            with open(self.log_path, "r+b") as f:
+                if self._transient_at is None:
+                    f.seek(0, os.SEEK_END)
+                else:
+                    f.seek(self._transient_at)
+                    f.truncate()
+                start = f.tell()
+                f.write(data)
+            self._transient_at = start if transient else None
+
+    def _end_transient(self) -> None:
+        """Freeze the live progress line where it is; the next write appends."""
+        with self._log_lock:
+            self._transient_at = None
 
     def log_tail(self, max_bytes: int = 16384) -> str:
         try:
@@ -130,14 +152,7 @@ class Job:
         self._proc = proc
         assert proc.stdout is not None
         try:
-            for raw in iter(proc.stdout.readline, b""):
-                line = raw.decode("utf-8", errors="replace")
-                # tqdm redraws with \r: keep only the last frame of the line
-                line = line.replace("\x1b[A", "").split("\r")[-1].rstrip("\n")
-                if line.strip():
-                    self.log(line)
-                if parse_progress:
-                    self._parse_progress(line)
+            self._stream(proc.stdout, parse_progress)
             proc.wait()
         finally:
             self._proc = None
@@ -150,6 +165,40 @@ class Job:
         if proc.returncode != 0:
             raise JobFailed(f"comando saiu com código {proc.returncode}")
         return proc.returncode
+
+    def _stream(self, stdout, parse_progress: bool) -> None:
+        """Turn the child's output into log lines as it arrives.
+
+        Splitting on \\r as well as \\n is the whole point: tqdm — and every
+        download and training bar underneath it — redraws with a bare carriage
+        return and emits no newline until it finishes. readline() would hold
+        every frame hostage until then, which reads as a job that hung. read1()
+        returns whatever is already buffered instead of waiting for a block.
+        """
+        buf = b""
+        while True:
+            chunk = stdout.read1(65536)
+            if not chunk:
+                break
+            pieces = _EOL_RE.split(buf + chunk)
+            buf = pieces.pop()  # trailing text, no terminator yet
+            for i in range(0, len(pieces), 2):
+                line = pieces[i].decode("utf-8", errors="replace")
+                line = line.replace("\x1b[A", "").rstrip()
+                transient = pieces[i + 1] == b"\r"
+                if parse_progress:
+                    self._parse_progress(line)
+                if line.strip():
+                    self.log(line, transient=transient)
+                elif not transient:
+                    # a bare newline closes the bar: the last frame it drew is
+                    # the finished one and has to survive the next line
+                    self._end_transient()
+        tail = buf.decode("utf-8", errors="replace").replace("\x1b[A", "").rstrip()
+        if tail.strip():
+            if parse_progress:
+                self._parse_progress(tail)
+            self.log(tail)
 
     def _parse_progress(self, line: str) -> None:
         m = _STEP_RE.search(line)
