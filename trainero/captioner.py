@@ -2,6 +2,12 @@
 
 Same invocation character_animatrem uses; the prompt profiles live in the
 captioner clone (prompts/<image|video>/<profile>/). Needs OPENROUTER_API_KEY.
+
+Three passes, because a caption is not optional: a single item without one
+blocks the whole training. The cheap model runs first; whatever it refuses on
+content grounds goes to a second model with different policies; whatever both
+refuse leaves the dataset. Refusal is a property of the image, not a transient
+error, so retrying the same model would only cost time.
 """
 
 from __future__ import annotations
@@ -10,7 +16,7 @@ import json
 import os
 from pathlib import Path
 
-from .config import IMAGE_EXTS, VIDEO_EXTS
+from . import dataset as ds
 from .engines import engine_dir, ensure_engine, venv_python
 from .jobs import Job, JobFailed
 
@@ -19,6 +25,9 @@ TAGGER_LOG = ".tagger_log.json"
 # The captioner's CLI names this stage "grok" for historical reasons; the flag
 # takes any OpenRouter model id with vision. Override with CAPTION_MODEL.
 DEFAULT_CAPTION_MODEL = os.environ.get("CAPTION_MODEL", "google/gemini-3.7-flash")
+# Gemini blocks with PROHIBITED_CONTENT on material Grok captions without
+# complaint, which is the entire reason there is a second pass.
+FALLBACK_CAPTION_MODEL = os.environ.get("CAPTION_FALLBACK_MODEL", "x-ai/grok-4.20")
 
 
 def prune_stale_log(dataset_dir: Path, job: Job | None = None) -> int:
@@ -49,12 +58,8 @@ def prune_stale_log(dataset_dir: Path, job: Job | None = None) -> int:
     return len(stale)
 
 
-def generate_captions(dataset_dir, media: str, profile: str, prompt_vars: dict[str, str],
-                      job: Job) -> None:
-    if not os.environ.get("OPENROUTER_API_KEY"):
-        raise JobFailed("defina OPENROUTER_API_KEY para gerar captions com LLM")
-    prune_stale_log(Path(dataset_dir), job)
-    ensure_engine("captioner", job)
+def _tagger_cmd(dataset_dir: Path, media: str, profile: str,
+                prompt_vars: dict[str, str], model: str) -> list[str]:
     cap_dir = engine_dir("captioner")
     cmd = [
         str(venv_python("captioner")),
@@ -62,7 +67,7 @@ def generate_captions(dataset_dir, media: str, profile: str, prompt_vars: dict[s
         str(dataset_dir),
         "--taggers", "pixai,grok",
         "--grok_provider", "openrouter",
-        "--grok_model", DEFAULT_CAPTION_MODEL,
+        "--grok_model", model,
         "--prompt_profile", profile,
         "--remove_underscore",
         "--thresh", "0.30",
@@ -78,5 +83,64 @@ def generate_captions(dataset_dir, media: str, profile: str, prompt_vars: dict[s
     for key, value in prompt_vars.items():
         if value:
             cmd += ["--prompt_var", f"{key}={value}"]
-    job.run(cmd, cwd=cap_dir)
+    return cmd
+
+
+def _pass(dataset_dir: Path, media: str, profile: str, prompt_vars: dict[str, str],
+          job: Job, model: str) -> list[Path]:
+    """One tagger run with one model. Returns what is still uncaptioned.
+
+    The stale-log prune has to happen before every run, not once: a refusal can
+    leave the item in the tagger's log without a caption beside it, and the next
+    run would then skip the very file it is here to rescue.
+    """
+    prune_stale_log(dataset_dir, job)
+    job.run(_tagger_cmd(dataset_dir, media, profile, prompt_vars, model),
+            cwd=engine_dir("captioner"))
+    return ds.uncaptioned(dataset_dir)
+
+
+def discard_uncaptionable(dataset_dir: Path, items: list[Path], job: Job) -> None:
+    """Remove items no model would caption, so the run can go on.
+
+    An uncaptioned item stops the training outright, and these have already been
+    refused by two models with different content policies. Every name is logged
+    because this deletes the owner's data.
+    """
+    log = dataset_dir / TAGGER_LOG
+    for item in items:
+        job.log(f"✗ removida (nenhum modelo aceitou): {item.name}")
+        item.with_suffix(".txt").unlink(missing_ok=True)
+        item.unlink(missing_ok=True)
+    try:
+        data = json.loads(log.read_text())
+        gone = {str(i) for i in items}
+        data["processed"] = {k: v for k, v in data.get("processed", {}).items()
+                             if k not in gone}
+        log.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+    job.log(f"⚠ {len(items)} itens descartados do dataset.")
+
+
+def generate_captions(dataset_dir, media: str, profile: str, prompt_vars: dict[str, str],
+                      job: Job) -> None:
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        raise JobFailed("defina OPENROUTER_API_KEY para gerar captions com LLM")
+    dataset_dir = Path(dataset_dir)
+    ensure_engine("captioner", job)
+
+    missing = _pass(dataset_dir, media, profile, prompt_vars, job, DEFAULT_CAPTION_MODEL)
+
+    if missing and FALLBACK_CAPTION_MODEL != DEFAULT_CAPTION_MODEL:
+        job.log(f"{len(missing)} recusadas por {DEFAULT_CAPTION_MODEL} — "
+                f"tentando {FALLBACK_CAPTION_MODEL}: "
+                f"{', '.join(p.name for p in missing[:5])}"
+                f"{'…' if len(missing) > 5 else ''}")
+        missing = _pass(dataset_dir, media, profile, prompt_vars, job,
+                        FALLBACK_CAPTION_MODEL)
+
+    if missing:
+        discard_uncaptionable(dataset_dir, missing, job)
+
     job.log("✔ Captions geradas.")

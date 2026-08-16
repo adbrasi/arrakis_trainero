@@ -303,6 +303,25 @@ def captions_map(dataset_dir: Path) -> dict[str, str]:
     return out
 
 
+def has_caption(item: Path) -> bool:
+    """One rule for "this item is captioned", used by inspect and by the
+    captioner's retry loop — two copies of it would drift."""
+    txt = item.with_suffix(".txt")
+    try:
+        return txt.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def uncaptioned(dataset_dir: Path) -> list[Path]:
+    """Every media item still without a caption, as paths."""
+    if not dataset_dir.exists():
+        return []
+    return [f for f in sorted(dataset_dir.iterdir())
+            if f.is_file() and f.suffix.lower() in (IMAGE_EXTS | VIDEO_EXTS)
+            and not has_caption(f)]
+
+
 def inspect(dataset_dir: Path) -> dict:
     images, videos, captions, missing = 0, 0, 0, []
     control = 0
@@ -316,8 +335,7 @@ def inspect(dataset_dir: Path) -> dict:
                     images += 1
                 else:
                     videos += 1
-                txt = f.with_suffix(".txt")
-                if txt.exists() and txt.stat().st_size > 0:
+                if has_caption(f):
                     captions += 1
                 else:
                     missing.append(f.name)
