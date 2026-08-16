@@ -494,6 +494,7 @@ def run_style_rush_training(job: Job, params: dict) -> None:
     slug = slugify(project)
     dataset_dir = pdir / "dataset"
     convert_dir = pdir / "dataset_convert"
+    restore_dir = pdir / "dataset_restore"
     output_dir = pdir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -504,8 +505,8 @@ def run_style_rush_training(job: Job, params: dict) -> None:
         raise JobFailed("Style Rush é só para datasets de imagem")
 
     job.set_phases(["Engine", "Modelos base", "Captions", "Dataset de conversão",
-                    "Configuração", "Cache de latents", "Cache do text encoder",
-                    "Treino", "Finalização"])
+                    "Dataset de restauração", "Configuração", "Cache de latents",
+                    "Cache do text encoder", "Treino", "Finalização"])
 
     gpu = gpu_info()
     vram_gb = gpu.get("vram_mb", 24576) / 1024
@@ -537,6 +538,12 @@ def run_style_rush_training(job: Job, params: dict) -> None:
     job.extra["style_rush"] = convert_stats
     job.end_phase("Dataset de conversão")
 
+    job.start_phase("Dataset de restauração")
+    restore_stats = sr.build_restore_dataset(
+        dataset_dir, restore_dir, job, used=sr.convert_sources(convert_dir))
+    job.extra["restore"] = restore_stats
+    job.end_phase("Dataset de restauração")
+
     job.start_phase("Configuração")
     schedule = dict(STYLE_RUSH_SCHEDULE)
     for key in ("epochs", "num_repeats", "save_every_n_epochs"):
@@ -550,6 +557,9 @@ def run_style_rush_training(job: Job, params: dict) -> None:
         image_subset(convert_dir, pdir / "cache" / "convert", schedule["num_repeats"],
                      control_dir=convert_dir / "control",
                      control_resolution=CONTROL_RESOLUTION),
+        image_subset(restore_dir, pdir / "cache" / "restore", schedule["num_repeats"],
+                     control_dir=restore_dir / "control",
+                     control_resolution=CONTROL_RESOLUTION),
     ]
     dataset_toml = write_dataset_toml(model_key, pdir / "dataset.toml", subsets,
                                       resolution, batch_size)
@@ -560,7 +570,7 @@ def run_style_rush_training(job: Job, params: dict) -> None:
             pdir / "sample_prompts.txt",
             overrides.get("sample_prompt") or SAMPLE_PROMPT, trigger, resolution)
 
-    total_items = stats["items"] + convert_stats["pairs"]
+    total_items = stats["items"] + convert_stats["pairs"] + restore_stats["pairs"]
     cfg = build_train_config(model_key, overrides, schedule, {"items": total_items},
                              vram_gb, dataset_toml, output_dir, slug, batch_size,
                              sample_prompts=sample_path)
@@ -571,6 +581,7 @@ def run_style_rush_training(job: Job, params: dict) -> None:
         "learning_rate": cfg.get("learning_rate"),
         "epochs": schedule["epochs"], "batch_size": batch_size,
         "base": stats["items"], "convert": convert_stats["pairs"],
+        "restore": restore_stats["pairs"],
         "fp8": bool(cfg.get("fp8_base")), "blocks_to_swap": cfg.get("blocks_to_swap", 0),
     }
     job.log(f"Config: {json.dumps(job.extra['config_summary'], ensure_ascii=False)}")
@@ -592,7 +603,7 @@ def run_style_rush_training(job: Job, params: dict) -> None:
         upload_run_files(repo_id, job, info={
             "project": project, "model": model_key, "model_label": model["label"],
             "mode": "style-rush", "trigger": trigger, "schedule": schedule,
-            "dataset": stats, "style_rush": convert_stats,
+            "dataset": stats, "style_rush": convert_stats, "restore": restore_stats,
             "config": {k: v for k, v in cfg.items() if isinstance(v, (str, int, float, bool))},
         }, captions=ds.captions_map(dataset_dir))
         convert = comfy_converter(model_key, job)

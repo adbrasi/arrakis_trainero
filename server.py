@@ -139,7 +139,8 @@ def current_project() -> str:
 
 def dataset_dir(side: str = "pos") -> Path:
     pdir = project_dir(current_project() or "projeto")
-    return pdir / {"neg": "dataset_neg", "convert": "dataset_convert"}.get(side, "dataset")
+    return pdir / {"neg": "dataset_neg", "convert": "dataset_convert",
+                   "restore": "dataset_restore"}.get(side, "dataset")
 
 
 def sample_dir() -> Path:
@@ -248,6 +249,7 @@ class Handler(SimpleHTTPRequestHandler):
             "openrouter": bool(os.environ.get("OPENROUTER_API_KEY")),
             "trigger": load_state().get("trigger", ""),
             "dataset_convert": ds.inspect(dataset_dir("convert")) if project else {},
+            "dataset_restore": ds.inspect(dataset_dir("restore")) if project else {},
             "style_rush_models": style_rush_models(),
             "engines": {name: is_installed(name) for name in ("musubi", "musubi-ltx", "sd-scripts", "captioner")},
         }

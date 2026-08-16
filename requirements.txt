@@ -1,3 +1,8 @@
 # Server venv only — training engines get their own venvs (see trainero/engines.py)
 huggingface_hub[hf_xet]>=0.31.4,<2.0
 pillow>=10.0
+# Style Rush restoration half: the grit degradation runs in this process.
+# headless, not opencv-python: the GUI build pulls libGL, which a pod without
+# the display driver libs does not have (see the base image notes on rendering).
+numpy>=1.26
+opencv-python-headless>=4.9
