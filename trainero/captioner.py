@@ -21,6 +21,7 @@ from .engines import engine_dir, ensure_engine, venv_python
 from .jobs import Job, JobFailed
 
 TAGGER_LOG = ".tagger_log.json"
+FLAGGED_FILE = ".caption_refused.json"
 
 # The captioner's CLI names this stage "grok" for historical reasons; the flag
 # takes any OpenRouter model id with vision. Override with CAPTION_MODEL.
@@ -100,6 +101,59 @@ def _pass(dataset_dir: Path, media: str, profile: str, prompt_vars: dict[str, st
     return ds.uncaptioned(dataset_dir)
 
 
+def openrouter_problem() -> str:
+    """Empty string when the account can actually serve requests, else why not.
+
+    Guards the discard: a dead key or an empty balance leaves every item
+    uncaptioned, which looks exactly like every model refusing them. Deleting
+    the owner's images because his card expired is not a recovery.
+    """
+    import urllib.error
+    import urllib.request
+
+    key = os.environ.get("OPENROUTER_API_KEY", "")
+    req = urllib.request.Request("https://openrouter.ai/api/v1/key",
+                                 headers={"Authorization": f"Bearer {key}"})
+    try:
+        data = json.load(urllib.request.urlopen(req, timeout=30)).get("data", {})
+    except urllib.error.HTTPError as exc:
+        return f"OpenRouter recusou a chave (HTTP {exc.code})"
+    except Exception as exc:  # offline, DNS, timeout — anything but a refusal
+        return f"não consegui falar com o OpenRouter ({type(exc).__name__})"
+    remaining = data.get("limit_remaining")
+    if remaining is not None and remaining <= 0:
+        return "OpenRouter sem crédito"
+    return ""
+
+
+def record_flagged(dataset_dir: Path, items: list[Path]) -> None:
+    """Remember which items the strict model would not caption.
+
+    They are the ones a content filter objects to, which is the same objection
+    gpt-image-2 raises in the Style Rush conversion phase — and there a refusal
+    costs a paid slot. Written next to the dataset so that phase can read it
+    without re-running any model.
+    """
+    path = dataset_dir / FLAGGED_FILE
+    try:
+        known = set(json.loads(path.read_text()).get("refused_by_primary", []))
+    except (OSError, json.JSONDecodeError, AttributeError):
+        known = set()
+    known |= {i.name for i in items}
+    path.write_text(json.dumps(
+        {"model": DEFAULT_CAPTION_MODEL, "refused_by_primary": sorted(known)},
+        indent=2, ensure_ascii=False))
+
+
+def flagged_names(dataset_dir: Path) -> set[str]:
+    """File names the strict caption model refused, as recorded by record_flagged."""
+    try:
+        return set(json.loads((Path(dataset_dir) / FLAGGED_FILE).read_text())
+                   .get("refused_by_primary", []))
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return set()
+
+
 def discard_uncaptionable(dataset_dir: Path, items: list[Path], job: Job) -> None:
     """Remove items no model would caption, so the run can go on.
 
@@ -130,7 +184,9 @@ def generate_captions(dataset_dir, media: str, profile: str, prompt_vars: dict[s
     dataset_dir = Path(dataset_dir)
     ensure_engine("captioner", job)
 
-    missing = _pass(dataset_dir, media, profile, prompt_vars, job, DEFAULT_CAPTION_MODEL)
+    refused_by_primary = _pass(dataset_dir, media, profile, prompt_vars, job,
+                               DEFAULT_CAPTION_MODEL)
+    missing = refused_by_primary
 
     if missing and FALLBACK_CAPTION_MODEL != DEFAULT_CAPTION_MODEL:
         job.log(f"{len(missing)} recusadas por {DEFAULT_CAPTION_MODEL} — "
@@ -140,7 +196,18 @@ def generate_captions(dataset_dir, media: str, profile: str, prompt_vars: dict[s
         missing = _pass(dataset_dir, media, profile, prompt_vars, job,
                         FALLBACK_CAPTION_MODEL)
 
+    if refused_by_primary:
+        record_flagged(dataset_dir, refused_by_primary)
+
     if missing:
+        # Never delete on an infrastructure failure: out of credit looks
+        # identical to every model refusing, and one is recoverable.
+        problem = openrouter_problem()
+        if problem:
+            raise JobFailed(
+                f"{problem} — {len(missing)} itens ficaram sem caption. "
+                f"Resolva e rode de novo; nada foi apagado e o que já tem "
+                f"caption não é refeito.")
         discard_uncaptionable(dataset_dir, missing, job)
 
     job.log("✔ Captions geradas.")

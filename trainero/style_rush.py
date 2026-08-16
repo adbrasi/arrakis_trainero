@@ -28,7 +28,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import degrade, imagegen
+from . import captioner, degrade, imagegen
 from .config import IMAGE_EXTS, REPO_DIR
 from .jobs import Cancelled, JobFailed
 
@@ -65,16 +65,28 @@ def load_style_prompts(path: Path | None = None) -> list[str]:
     return prompts[:SLOT_COUNT]
 
 
-def plan_slots(images: list[Path], prompts: list[str]) -> list[dict]:
+def plan_slots(images: list[Path], prompts: list[str],
+               avoid: set[str] | None = None) -> list[dict]:
     """One slot per prompt, each pointing at a primary image and a fallback.
 
     The fallback is what the slot retries with when the primary is refused by
     moderation; it is always a different image when the dataset has more than
     one. Selection is deterministic so a resumed run rebuilds the same plan.
+
+    `avoid` holds file names a content filter has already objected to — the
+    strict caption model refused them, or gpt-image-2 itself did on an earlier
+    run. Feeding those back in buys another refusal at full price, so they are
+    excluded outright rather than merely deprioritised.
     """
     if not images:
         raise ValueError("dataset base vazio — nada para converter")
-    pool = sorted(str(p) for p in images)
+    avoid = avoid or set()
+    usable = [p for p in images if p.name not in avoid]
+    if not usable:
+        raise ValueError(
+            f"todas as {len(images)} imagens do dataset já foram recusadas por "
+            f"filtro de conteúdo — não há o que mandar para o gpt-image-2")
+    pool = sorted(str(p) for p in usable)
     rng = random.Random(PLAN_SEED)
     order = list(pool)
     rng.shuffle(order)
@@ -99,6 +111,20 @@ def base_images(base_dir: Path) -> list[Path]:
         return []
     return sorted(p for p in base_dir.iterdir()
                   if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
+
+
+def content_flagged(base_dir: Path, convert_dir: Path) -> set[str]:
+    """File names a content filter has already objected to, from both sources.
+
+    The caption phase records what the strict model refused; the conversion
+    manifest records what gpt-image-2 refused on an earlier run. Both are the
+    same fact about the image, and both cost money to rediscover.
+    """
+    flagged = captioner.flagged_names(base_dir)
+    for entry in _load_manifest(convert_dir).get("slots", {}).values():
+        if entry.get("status") == "refused" and entry.get("source"):
+            flagged.add(Path(entry["source"]).name)
+    return flagged
 
 
 def _load_manifest(convert_dir: Path) -> dict:
@@ -175,7 +201,14 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
     if not images:
         raise JobFailed("dataset base vazio — importe as imagens antes de treinar")
 
-    slots = plan_slots(images, load_style_prompts())
+    avoid = content_flagged(base_dir, convert_dir)
+    if avoid:
+        job.log(f"{len(avoid)} imagens fora da conversão por recusa de filtro de "
+                f"conteúdo (o gpt-image-2 recusaria de novo, cobrando o slot).")
+    try:
+        slots = plan_slots(images, load_style_prompts(), avoid=avoid)
+    except ValueError as exc:
+        raise JobFailed(str(exc))
     control_dir = convert_dir / "control"
     control_dir.mkdir(parents=True, exist_ok=True)
     manifest = _load_manifest(convert_dir)

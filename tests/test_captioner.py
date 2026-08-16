@@ -82,11 +82,14 @@ def _dataset(root: Path, captioned: int, uncaptioned: int) -> Path:
     return ds
 
 
-def _run(ds: Path, job: _FakeJob):
+def _run(ds: Path, job: _FakeJob, problem: str = ""):
+    """`problem` is what the OpenRouter health check reports — empty means the
+    account works, so an item still missing really was refused by both models."""
     with mock.patch.dict("os.environ", {"OPENROUTER_API_KEY": "k"}), \
          mock.patch.object(captioner, "ensure_engine"), \
          mock.patch.object(captioner, "venv_python", return_value=Path("py")), \
-         mock.patch.object(captioner, "engine_dir", return_value=Path("/eng")):
+         mock.patch.object(captioner, "engine_dir", return_value=Path("/eng")), \
+         mock.patch.object(captioner, "openrouter_problem", return_value=problem):
         generate_captions(ds, "image", "generic-style", {"style_name": "t"}, job)
 
 
@@ -183,6 +186,57 @@ class TestDiscard(unittest.TestCase):
             _run(ds, job)
             self.assertEqual(inspect(ds)["missing_captions"], 0,
                              "o treino é bloqueado enquanto sobrar um sem caption")
+
+
+class TestInfraFailureIsNotARefusal(unittest.TestCase):
+    """Out of credit leaves every item uncaptioned, which on disk is identical
+    to every model refusing them. One is recoverable and the other is not."""
+
+    def test_no_credit_does_not_delete_the_owners_images(self):
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=190, uncaptioned=92)
+            job = _FakeJob()  # nenhum modelo escreve nada: OpenRouter fora do ar
+
+            with self.assertRaises(Exception) as ctx:
+                _run(ds, job, problem="OpenRouter sem crédito")
+
+            self.assertIn("crédito", str(ctx.exception))
+            self.assertEqual(len(list(ds.glob("falta_*.jpg"))), 92,
+                             "apagou o dataset por causa de um problema de billing")
+            self.assertEqual(len(list(ds.glob("ok_*.jpg"))), 190)
+
+    def test_a_healthy_account_still_discards_what_was_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=2, uncaptioned=1)
+            _run(ds, _FakeJob(), problem="")
+            self.assertFalse((ds / "falta_000.jpg").exists())
+
+
+class TestFlagged(unittest.TestCase):
+    def test_what_the_strict_model_refused_is_recorded_for_the_conversion(self):
+        """gpt-image-2 objects to the same images Gemini does, and there a
+        refusal costs a paid slot."""
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=2, uncaptioned=2)
+            job = _FakeJob({FALLBACK_CAPTION_MODEL: {"falta_000.jpg", "falta_001.jpg"}})
+            _run(ds, job)
+
+            self.assertEqual(captioner.flagged_names(ds),
+                             {"falta_000.jpg", "falta_001.jpg"})
+
+    def test_nothing_is_flagged_when_the_first_model_takes_everything(self):
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=2, uncaptioned=2)
+            job = _FakeJob({DEFAULT_CAPTION_MODEL: {"falta_000.jpg", "falta_001.jpg"}})
+            _run(ds, job)
+            self.assertEqual(captioner.flagged_names(ds), set())
+
+    def test_the_flag_survives_a_second_caption_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=1, uncaptioned=1)
+            _run(ds, _FakeJob({FALLBACK_CAPTION_MODEL: {"falta_000.jpg"}}))
+            _run(ds, _FakeJob())  # nada a fazer, tudo já tem caption
+            self.assertEqual(captioner.flagged_names(ds), {"falta_000.jpg"})
 
 
 class TestPruneStaleLog(unittest.TestCase):

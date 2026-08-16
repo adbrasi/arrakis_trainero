@@ -134,6 +134,67 @@ class TestPlanRestore(unittest.TestCase):
             plan_restore([], set())
 
 
+class TestContentFlagged(unittest.TestCase):
+    """A content filter's objection is a fact about the image, and it costs
+    money to rediscover: gpt-image-2 charges for the slot it then refuses."""
+
+    def _flag(self, ds: Path, names):
+        (ds / ".caption_refused.json").write_text(json.dumps(
+            {"model": "google/gemini-3.7-flash", "refused_by_primary": list(names)}))
+
+    def test_images_the_caption_model_refused_stay_out_of_the_conversion(self):
+        from trainero.style_rush import content_flagged, load_style_prompts, plan_slots
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = _make_dataset(root, 120)
+            convert = root / "dataset_convert"
+            convert.mkdir()
+            banned = {p.name for p in _paths(base)[:10]}
+            self._flag(base, banned)
+
+            avoid = content_flagged(base, convert)
+            self.assertEqual(avoid, banned)
+
+            slots = plan_slots(_paths(base), load_style_prompts(), avoid=avoid)
+            used = {Path(s).name for slot in slots for s in slot["sources"]}
+            self.assertEqual(used & banned, set(),
+                             "mandou para o gpt-image-2 uma imagem já barrada")
+
+    def test_a_gpt_refusal_from_an_earlier_run_also_counts(self):
+        from trainero.style_rush import content_flagged
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = _make_dataset(root, 10)
+            convert = root / "dataset_convert"
+            convert.mkdir()
+            img = _paths(base)[0]
+            (convert / ".style_rush.json").write_text(json.dumps({"slots": {
+                "slot_00": {"status": "refused", "source": str(img)},
+                "slot_01": {"status": "ok", "source": str(_paths(base)[1])},
+            }}))
+            self.assertEqual(content_flagged(base, convert), {img.name})
+
+    def test_a_dataset_that_is_entirely_flagged_fails_instead_of_paying(self):
+        from trainero.style_rush import load_style_prompts, plan_slots
+
+        with tempfile.TemporaryDirectory() as td:
+            base = _make_dataset(Path(td), 6)
+            images = _paths(base)
+            with self.assertRaises(ValueError):
+                plan_slots(images, load_style_prompts(),
+                           avoid={p.name for p in images})
+
+    def test_no_flags_leaves_the_plan_untouched(self):
+        from trainero.style_rush import load_style_prompts, plan_slots
+
+        with tempfile.TemporaryDirectory() as td:
+            images = _paths(_make_dataset(Path(td), 60))
+            self.assertEqual(plan_slots(images, load_style_prompts()),
+                             plan_slots(images, load_style_prompts(), avoid=set()))
+
+
 class TestConvertSources(unittest.TestCase):
     def test_reads_only_the_slots_that_succeeded(self):
         with tempfile.TemporaryDirectory() as td:
