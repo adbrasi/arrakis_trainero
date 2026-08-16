@@ -192,8 +192,10 @@ class TestCompleteness(unittest.TestCase):
         from trainero import hf_fetch
 
         src = Path(hf_fetch.__file__).read_text()
-        self.assertLess(src.index("snapshot_download("), src.index("os.replace(inner, dest)"))
-        self.assertLess(src.index("hf_hub_download("), src.index("os.replace(got, dest)"))
+        self.assertLess(src.index("with_progress(snapshot_download"),
+                        src.index("os.replace(inner, dest)"))
+        self.assertLess(src.index("with_progress(hf_hub_download"),
+                        src.index("os.replace(got, dest)"))
 
     def test_staging_names_do_not_collide_between_transports(self):
         """aria2 stages a FILE at <name>.part; the hub child stages a DIRECTORY.

@@ -24,7 +24,7 @@ from .captioner import generate_captions
 from .config import PROJECTS_DIR, gpu_info
 from .engines import (engine_dir, ensure_engine, supports_sampling, venv_bin,
                       venv_python)
-from .hf_upload import UploadWatcher, create_repo, hf_username, model_card, upload_text
+from .hf_upload import UploadWatcher, create_repo, hf_username, upload_run_files
 from .jobs import Job, JobFailed
 from .models_download import ensure_models, resolve
 from .presets import (CONTROL_RESOLUTION, LORAPLUS_RATIO, MODELS, NETWORK_MODULES,
@@ -589,14 +589,12 @@ def run_style_rush_training(job: Job, params: dict) -> None:
             job.log("⚠ Sem token HF (defina HF_TOKEN) — upload desativado.")
     if repo_id:
         job.extra["hf_repo"] = repo_id
-        upload_text(repo_id, "README.md",
-                    model_card(project, model["label"], stats, schedule, cfg), job)
-        upload_text(repo_id, "trainero_config.json",
-                    json.dumps({"model": model_key, "mode": "style-rush", "trigger": trigger,
-                                "schedule": schedule, "style_rush": convert_stats,
-                                "config": {k: v for k, v in cfg.items()
-                                           if isinstance(v, (str, int, float, bool))}},
-                               indent=2, ensure_ascii=False), job)
+        upload_run_files(repo_id, job, info={
+            "project": project, "model": model_key, "model_label": model["label"],
+            "mode": "style-rush", "trigger": trigger, "schedule": schedule,
+            "dataset": stats, "style_rush": convert_stats,
+            "config": {k: v for k, v in cfg.items() if isinstance(v, (str, int, float, bool))},
+        }, captions=ds.captions_map(dataset_dir))
         convert = comfy_converter(model_key, job)
         watcher = UploadWatcher(repo_id, output_dir, job, convert=convert)
         watcher.start()
@@ -746,12 +744,11 @@ def run_training(job: Job, params: dict) -> None:
             job.log("⚠ Sem token HF (defina HF_TOKEN) — upload desativado.")
     if repo_id:
         job.extra["hf_repo"] = repo_id
-        upload_text(repo_id, "README.md",
-                    model_card(project, model["label"], stats, schedule, cfg), job)
-        upload_text(repo_id, "trainero_config.json",
-                    json.dumps({"model": model_key, "schedule": schedule,
-                                "config": {k: v for k, v in cfg.items() if isinstance(v, (str, int, float, bool))}},
-                               indent=2, ensure_ascii=False), job)
+        upload_run_files(repo_id, job, info={
+            "project": project, "model": model_key, "model_label": model["label"],
+            "mode": mode, "trigger": trigger, "schedule": schedule, "dataset": stats,
+            "config": {k: v for k, v in cfg.items() if isinstance(v, (str, int, float, bool))},
+        }, captions=ds.captions_map(dataset_dir))
         convert = comfy_converter(model_key, job)
         watcher = UploadWatcher(repo_id, output_dir, job, convert=convert)
         watcher.start()

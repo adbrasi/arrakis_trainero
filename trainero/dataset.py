@@ -285,6 +285,24 @@ def normalize_into(staging: Path, dataset_dir: Path, job: Job) -> None:
 # Inspection
 # ---------------------------------------------------------------------------
 
+def captions_map(dataset_dir: Path) -> dict[str, str]:
+    """{media filename: caption} for everything in the dataset that has one."""
+    out: dict[str, str] = {}
+    if not dataset_dir.exists():
+        return out
+    for f in sorted(dataset_dir.iterdir()):
+        if not f.is_file() or f.suffix.lower() not in (IMAGE_EXTS | VIDEO_EXTS):
+            continue
+        txt = f.with_suffix(".txt")
+        try:
+            caption = txt.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if caption:
+            out[f.name] = caption
+    return out
+
+
 def inspect(dataset_dir: Path) -> dict:
     images, videos, captions, missing = 0, 0, 0, []
     control = 0

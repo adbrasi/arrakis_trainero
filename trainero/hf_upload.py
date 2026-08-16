@@ -1,7 +1,8 @@
 """HuggingFace: repo creation + continuous checkpoint upload during training.
 
 Repo is created before training starts (animatrem pattern: the repo is born
-documented even if training dies). A daemon watcher uploads every *.safetensors
+documented even if training dies) and carries the run as data — trainero_config.json
+plus captions.json, never a generated model card. A daemon watcher uploads every *.safetensors
 that appears in output_dir once its size stabilizes; dedupe via
 .hf_uploaded.log. A quota/auth failure disables further attempts instead of
 retrying every checkpoint.
@@ -9,6 +10,7 @@ retrying every checkpoint.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -51,30 +53,18 @@ def upload_text(repo_id: str, path_in_repo: str, content: str, job: Job) -> None
         job.log(f"⚠ upload de {path_in_repo} falhou: {exc}")
 
 
-def model_card(project: str, model_label: str, dataset_stats: dict, schedule: dict,
-               train_cfg: dict) -> str:
-    lines = [
-        "---",
-        "tags:",
-        "- lora",
-        f"- {model_label.lower().replace(' ', '-')}",
-        "- arrakis-trainero",
-        "---",
-        f"# {project}",
-        "",
-        f"LoRA de **{model_label}** treinado com [Arrakis Trainero](https://github.com/adbrasi/arrakis_trainero).",
-        "",
-        "| | |",
-        "|---|---|",
-        f"| Dataset | {dataset_stats.get('images', 0)} imagens, {dataset_stats.get('videos', 0)} vídeos |",
-        f"| Epochs | {schedule.get('epochs')} (repeats {schedule.get('num_repeats')}) |",
-        f"| Rank / alpha | {train_cfg.get('network_dim')} / {train_cfg.get('network_alpha')} |",
-        f"| Learning rate | {train_cfg.get('learning_rate')} |",
-        f"| Optimizer | {train_cfg.get('optimizer_type')} |",
-        "",
-        "Checkpoints por epoch: `<nome>-NNNNNN.safetensors`. O arquivo sem sufixo é o final.",
-    ]
-    return "\n".join(lines) + "\n"
+def upload_run_files(repo_id: str, job: Job, *, info: dict, captions: dict) -> None:
+    """Put what the run actually was into the repo, as data.
+
+    No model card: a generated README is prose nobody wrote and nobody reads,
+    and it goes stale the moment anything is edited by hand. The facts belong
+    in files — the resolved config, and the captions the LoRA was trained on.
+    """
+    upload_text(repo_id, "trainero_config.json",
+                json.dumps(info, indent=2, ensure_ascii=False), job)
+    if captions:
+        upload_text(repo_id, "captions.json",
+                    json.dumps(captions, indent=2, ensure_ascii=False), job)
 
 
 class UploadWatcher:
