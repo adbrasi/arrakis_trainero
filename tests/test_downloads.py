@@ -61,41 +61,77 @@ class TestTransportOrder(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.dest = Path(self.tmp.name) / "model.safetensors"
-        self._ready, self._backed, self._which = md.xet_ready, md.xet_backed, md.shutil.which
+        self._ready, self._prefers, self._which = md.xet_ready, md.prefers_xet, md.shutil.which
         md.shutil.which = lambda _n: "/usr/bin/aria2c"
 
     def tearDown(self):
-        md.xet_ready, md.xet_backed, md.shutil.which = self._ready, self._backed, self._which
+        md.xet_ready, md.prefers_xet, md.shutil.which = self._ready, self._prefers, self._which
         self.tmp.cleanup()
 
     def test_xet_backed_file_goes_to_huggingface_hub_first(self):
-        md.xet_ready = lambda: True
-        md.xet_backed = lambda *a: True
+        md.prefers_xet = lambda *a: True
         job = FakeJob()
         md._single_file("some/repo", "f.safetensors", self.dest, None, job)
         self.assertIn("huggingface_hub", job.cmds[0])
         self.assertNotIn("aria2c", job.cmds[0])
 
     def test_non_xet_file_prefers_aria2_over_single_stream_http(self):
-        md.xet_ready = lambda: True
-        md.xet_backed = lambda *a: False
+        md.prefers_xet = lambda *a: False
         job = FakeJob()
         md._single_file("some/repo", "f.safetensors", self.dest, None, job)
         self.assertIn("aria2c", job.cmds[0])
 
     def test_xet_failure_falls_back_to_aria2(self):
-        md.xet_ready = lambda: True
-        md.xet_backed = lambda *a: True
+        md.prefers_xet = lambda *a: True
         job = FakeJob(fail=("huggingface_hub",))
         md._single_file("some/repo", "f.safetensors", self.dest, None, job)
         self.assertTrue(job.used("aria2c"))
 
     def test_token_never_reaches_argv(self):
-        md.xet_ready = lambda: True
-        md.xet_backed = lambda *a: True
+        md.prefers_xet = lambda *a: True
         job = FakeJob()
         md._single_file("some/repo", "f.safetensors", self.dest, "hf_SECRET", job)
         self.assertNotIn("hf_SECRET", " ".join(job.cmds))
+
+
+class TestXetPreference(unittest.TestCase):
+    """A failed probe is not evidence that a file is off Xet."""
+
+    def setUp(self):
+        self._ready = md.xet_ready
+
+    def tearDown(self):
+        md.xet_ready = self._ready
+
+    def _probe(self, raise_it=False, is_xet=True):
+        import huggingface_hub
+
+        class Meta:
+            xet_file_data = object() if is_xet else None
+
+        def fake(*_a, **_kw):
+            if raise_it:
+                raise RuntimeError("401 gated / rate limited / offline")
+            return Meta()
+
+        self._real = huggingface_hub.get_hf_file_metadata
+        huggingface_hub.get_hf_file_metadata = fake
+        self.addCleanup(setattr, huggingface_hub, "get_hf_file_metadata", self._real)
+
+    def test_gated_repo_whose_probe_fails_still_goes_over_xet(self):
+        md.xet_ready = lambda: True
+        self._probe(raise_it=True)
+        self.assertTrue(md.prefers_xet("black-forest-labs/FLUX.2-dev", "ae.safetensors", None))
+
+    def test_a_file_known_not_to_be_on_xet_does_not(self):
+        md.xet_ready = lambda: True
+        self._probe(is_xet=False)
+        self.assertFalse(md.prefers_xet("some/repo", "f.safetensors", None))
+
+    def test_without_hf_xet_nothing_goes_over_xet(self):
+        md.xet_ready = lambda: False
+        self._probe(is_xet=True)
+        self.assertFalse(md.prefers_xet("some/repo", "f.safetensors", None))
 
 
 class TestCancellation(unittest.TestCase):
@@ -104,24 +140,22 @@ class TestCancellation(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.dest = Path(self.tmp.name) / "model.safetensors"
-        self._ready, self._backed, self._which = md.xet_ready, md.xet_backed, md.shutil.which
+        self._ready, self._prefers, self._which = md.xet_ready, md.prefers_xet, md.shutil.which
         md.shutil.which = lambda _n: "/usr/bin/aria2c"
 
     def tearDown(self):
-        md.xet_ready, md.xet_backed, md.shutil.which = self._ready, self._backed, self._which
+        md.xet_ready, md.prefers_xet, md.shutil.which = self._ready, self._prefers, self._which
         self.tmp.cleanup()
 
     def test_cancel_during_aria2_does_not_start_the_hub_fallback(self):
-        md.xet_ready = lambda: True
-        md.xet_backed = lambda *a: False  # aria2 goes first
+        md.prefers_xet = lambda *a: False  # aria2 goes first
         job = FakeJob(cancel_on="aria2c")
         with self.assertRaises(Cancelled):
             md._single_file("some/repo", "f.safetensors", self.dest, None, job)
         self.assertFalse(job.used("huggingface_hub"))
 
     def test_cancel_during_hub_does_not_start_the_aria2_fallback(self):
-        md.xet_ready = lambda: True
-        md.xet_backed = lambda *a: True
+        md.prefers_xet = lambda *a: True
         job = FakeJob(cancel_on="huggingface_hub")
         with self.assertRaises(Cancelled):
             md._single_file("some/repo", "f.safetensors", self.dest, None, job)

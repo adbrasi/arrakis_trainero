@@ -63,14 +63,22 @@ def xet_ready() -> bool:
     return os.environ.get("HF_HUB_DISABLE_XET", "").strip().lower() not in ("1", "true", "yes")
 
 
-def xet_backed(repo: str, remote: str, token: str | None) -> bool:
-    """Ask the Hub whether this exact file is stored on Xet (one HEAD)."""
+def prefers_xet(repo: str, remote: str, token: str | None) -> bool:
+    """Should this file go over Xet?
+
+    Only a definite "this file is not stored on Xet" sends it to aria2c. A probe
+    that fails (rate limit, gated repo, no network yet) is not evidence of
+    anything — Xet is the path we want whenever it can work, and the child
+    process carries the token the probe may have lacked.
+    """
+    if not xet_ready():
+        return False
     from huggingface_hub import get_hf_file_metadata, hf_hub_url
 
     try:
         meta = get_hf_file_metadata(hf_hub_url(repo, remote), token=token)
-    except Exception:  # noqa: BLE001 — offline/rate-limited: just use the fallback
-        return False
+    except Exception:  # noqa: BLE001
+        return True
     return getattr(meta, "xet_file_data", None) is not None
 
 
@@ -107,7 +115,7 @@ def _single_file(repo: str, remote: str, dest: Path, token: str | None, job: Job
     dest.parent.mkdir(parents=True, exist_ok=True)
     url = f"https://huggingface.co/{repo}/resolve/main/{remote}"
     have_aria2 = bool(shutil.which("aria2c"))
-    use_xet = xet_ready() and xet_backed(repo, remote, token)
+    use_xet = prefers_xet(repo, remote, token)
     job.log(f"Baixando {repo}/{remote} via " +
             ("Xet." if use_xet else "aria2c." if have_aria2 else "huggingface_hub (HTTP)."))
 
@@ -159,6 +167,8 @@ else:
                       **({"allow_patterns": [sub + "/*"]} if sub else {}))
     shutil.rmtree(stage / ".cache", ignore_errors=True)
     inner = stage / sub if sub else stage
+    if not inner.is_dir() or not any(inner.iterdir()):
+        raise SystemExit(f"[hf] {spec['repo']} nao tem nada em {sub or '/'}")
     # dest only ever appears complete: an interrupted snapshot stays in stage
     os.replace(inner, dest)
 shutil.rmtree(stage, ignore_errors=True)
