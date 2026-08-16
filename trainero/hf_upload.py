@@ -82,6 +82,14 @@ class UploadWatcher:
         self._thread = threading.Thread(target=self._loop, daemon=True)
 
     def start(self):
+        # The log dedupes within one run. It must not survive into the next one:
+        # a retrain of the same project writes checkpoints with the same names,
+        # and a leftover log made the watcher skip every one of them — the run
+        # finished "ok" with nothing but the config file on HuggingFace.
+        try:
+            self._log.unlink()
+        except OSError:
+            pass
         self._thread.start()
 
     def stop_and_sweep(self):
