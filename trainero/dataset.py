@@ -303,6 +303,49 @@ def captions_map(dataset_dir: Path) -> dict[str, str]:
     return out
 
 
+#: built FROM the positive dataset, so they cannot outlive it
+DERIVED_DIRS = ("dataset_convert", "dataset_restore", "cache")
+
+
+def clear_dataset(project_dir: Path, side: str) -> None:
+    """Empty one side of the dataset, and everything derived from it.
+
+    The synthetic datasets and the latent/TE caches are functions of the images
+    in `dataset/`. Their manifests only ever verify that their own files exist,
+    never where they came from — so replacing the dataset and leaving them
+    behind makes the next Style Rush announce "já completo (50 pares)" and train
+    150 pairs built from images that are no longer on disk. Nothing fails, and
+    trainero_config.json records the wrong thing as fact.
+    """
+    import shutil
+
+    target = project_dir / {"neg": "dataset_neg", "convert": "dataset_convert",
+                            "restore": "dataset_restore"}.get(side, "dataset")
+    shutil.rmtree(target, ignore_errors=True)
+    target.mkdir(parents=True, exist_ok=True)
+    if side == "pos":
+        for derived in DERIVED_DIRS:
+            shutil.rmtree(project_dir / derived, ignore_errors=True)
+
+
+def captions_digest(dataset_dir: Path) -> str:
+    """Fingerprint of every caption in the directory, name included.
+
+    Cheap enough to take on each run and the only way to notice that a cached
+    text-encoder output no longer matches the text it was built from — the
+    cache file name carries nothing about the caption.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    for name, caption in sorted(captions_map(dataset_dir).items()):
+        h.update(name.encode("utf-8"))
+        h.update(b"\0")
+        h.update(caption.encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
 def has_caption(item: Path) -> bool:
     """One rule for "this item is captioned", used by inspect and by the
     captioner's retry loop — two copies of it would drift."""

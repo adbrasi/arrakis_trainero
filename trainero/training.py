@@ -29,8 +29,8 @@ from .jobs import Job, JobFailed
 from .models_download import ensure_models, resolve
 from .presets import (CONTROL_RESOLUTION, LORAPLUS_RATIO, MODELS, NETWORK_MODULES,
                       SAMPLE_GUIDANCE, SAMPLE_PROMPT, SAMPLE_SEED, SAMPLE_STEPS,
-                      STYLE_RUSH_SCHEDULE, net_types_for, style_rush_models,
-                      suggest_schedule, vram_tier)
+                      STYLE_RUSH_SCHEDULE, net_types_for, sample_resolution,
+                      style_rush_models, suggest_schedule, vram_tier)
 
 
 def slugify(name: str) -> str:
@@ -184,6 +184,10 @@ def sample_prompt_line(prompt_text: str, trigger: str, resolution: list[int],
 
 def write_sample_prompts(path: Path, prompt_text: str, trigger: str,
                          resolution: list[int], frames: int | None = None) -> Path:
+    """Still images get the wide sample frame; video keeps the shape it trains
+    on, where frame size is tied to what the model learned."""
+    if frames is None:
+        resolution = sample_resolution(resolution)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(sample_prompt_line(prompt_text, trigger, resolution, frames) + "\n",
                     encoding="utf-8")
@@ -355,8 +359,61 @@ def run_caches(model_key: str, dataset_toml: Path, vram_gb: float, job: Job) -> 
             te.append(f"--{flag}")
     te.append("--skip_existing")
     job.start_phase("Cache do text encoder")
+    drop_stale_te_cache(subset_dirs(dataset_toml), job)
     _run_cache_with_retry(job, te, cwd=edir)
     job.end_phase("Cache do text encoder")
+
+
+CAPTION_STAMP = ".captions.sha"
+
+
+def subset_dirs(dataset_toml: Path) -> list[tuple[Path, Path]]:
+    """(image dir, cache dir) for every [[datasets]] block, read back from the
+    TOML that was just written — the one place that already knows the pairing."""
+    pairs, image_dir = [], None
+    for line in dataset_toml.read_text(encoding="utf-8").splitlines():
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"')
+        if key in ("image_directory", "video_directory"):
+            image_dir = Path(value)
+        elif key == "cache_directory" and image_dir is not None:
+            pairs.append((image_dir, Path(value)))
+            image_dir = None
+    return pairs
+
+
+def drop_stale_te_cache(pairs: list[tuple[Path, Path]], job: Job) -> None:
+    """Delete text-encoder caches whose captions have changed since they were built.
+
+    musubi names a TE cache after the media file alone
+    (`<basename>_<arch>_te.safetensors`), so nothing about it changes when the
+    caption does — and `--skip_existing` then reuses embeddings of the old text.
+    Change the trigger word on a project that already trained and the run uses
+    the previous trigger end to end, while the samples the owner judges it by
+    use the new one. Silent, and it costs a whole training.
+    """
+    for media_dir, cache_dir in pairs:
+        if not cache_dir.exists():
+            continue
+        digest = ds.captions_digest(media_dir)
+        stamp = cache_dir / CAPTION_STAMP
+        try:
+            previous = stamp.read_text(encoding="utf-8").strip()
+        except OSError:
+            previous = ""
+        if previous == digest:
+            continue
+        if previous:
+            stale = list(cache_dir.glob("*_te.safetensors"))
+            for f in stale:
+                f.unlink(missing_ok=True)
+            if stale:
+                job.log(f"As captions de {media_dir.name} mudaram — {len(stale)} caches "
+                        f"de text encoder refeitos.")
+        # No stamp yet means a cache built before this check existed. Throwing it
+        # away would cost minutes of GPU on every upgrade to prove a staleness
+        # nobody has evidence of; stamping it makes every run after this one safe.
+        stamp.write_text(digest, encoding="utf-8")
 
 
 def _run_cache_with_retry(job: Job, cmd: list[str], cwd: Path) -> None:

@@ -409,9 +409,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if not self._require_idle():
             return
-        side = query.get("side", "pos")
-        shutil.rmtree(dataset_dir(side), ignore_errors=True)
-        dataset_dir(side).mkdir(parents=True, exist_ok=True)
+        ds.clear_dataset(project_dir(project), query.get("side", "pos"))
         self._json({"ok": True})
 
     def _captions(self):

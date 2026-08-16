@@ -395,22 +395,44 @@ CONTROL_RESOLUTION = [1024, 1024]
 # Sampling during training
 # ---------------------------------------------------------------------------
 # One prompt, the same for every image model. It is written to exercise, in a
-# single frame, everything that reveals a LoRA going wrong: face and gaze, hands
-# holding an object, fabric, an animal, warm directional light with shadow, and
+# single frame, everything that reveals a LoRA going wrong: face and eye contact,
+# hands holding an object, fabric, an animal, directional light with shadow, and
 # a background with depth.
 
 SAMPLE_PROMPT = (
-    "A young woman sits alone at a tall window in a quiet apartment at golden hour, "
-    "one knee drawn up onto the cushioned sill, both hands wrapped around a chipped "
-    "ceramic mug. Late sunlight falls across her in long amber bars, warm on her cheek "
-    "and throat, and fine dust turns slowly in the air. A grey cat lies curled asleep "
-    "against her hip, one paw over its face. Her hair spills loose over one shoulder, "
-    "her sweater slipping wide at the collar, and she looks out through the glass with "
-    "a soft, unhurried gaze while the city beyond dissolves into hazy blue rooftops."
+    "A young woman sits alone at a tall window in a quiet apartment, one knee drawn "
+    "up onto the cushioned sill, both hands wrapped around a chipped ceramic mug. "
+    "Daylight falls across her in long bars, bright on her cheek and throat, and fine "
+    "dust turns slowly in the air. A grey cat lies curled asleep against her hip, one "
+    "paw over its face. Her hair spills loose over one shoulder, her sweater slipping "
+    "wide at the collar, and she looks straight at the viewer with a soft, unhurried "
+    "gaze, eyes meeting the camera, while the city beyond dissolves into hazy blue "
+    "rooftops."
 )
 SAMPLE_STEPS = 28
 SAMPLE_GUIDANCE = 4.0
 SAMPLE_SEED = 42
+SAMPLE_ASPECT = (16, 9)
+
+
+def sample_resolution(resolution: list[int]) -> list[int]:
+    """The frame a sample is rendered at: SAMPLE_ASPECT, same pixel budget.
+
+    Only the sample. The training resolution is untouched — this sets --w/--h on
+    the prompt line and nothing else. A square sample crops away most of what a
+    style LoRA is actually judged on (full figure, room, background depth), so
+    the frame the owner stares at every epoch is the wide one.
+
+    Snapped to multiples of 16 because the VAE strides 8 and the DiT patches 2;
+    that snapping is why the ratio lands near 16:9 rather than exactly on it.
+    """
+    import math
+
+    w_ratio, h_ratio = SAMPLE_ASPECT
+    pixels = max(1, int(resolution[0]) * int(resolution[1]))
+    height = max(16, int(round(math.sqrt(pixels * h_ratio / w_ratio) / 16)) * 16)
+    width = max(16, int(round(height * w_ratio / h_ratio / 16)) * 16)
+    return [width, height]
 
 
 def style_rush_models() -> list[str]:
