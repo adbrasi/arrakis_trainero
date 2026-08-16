@@ -66,12 +66,19 @@ Toggle "Style Rush" no topo, para **Flux Klein** ou **Qwen Image Edit**. Você m
 dataset de estilo e preenche a trigger word; o trainer faz o resto:
 
 1. captions do dataset via OpenRouter (profile `generic-style`, trigger na primeira palavra);
-2. **50 pares de conversão** gerados com `openai/gpt-image-2` (quality low, ~$0.71): a saída
-   vira a control image, a sua imagem original vira o target, e a caption é a mesma nos 50 —
+2. **50 pares de conversão** gerados com `openai/gpt-image-2` (quality low, no máximo
+   ~$0.71 — medido; datasets não-quadrados saem mais baratos): a saída vira a control
+   image **recortada para a proporção exata da sua imagem**, a sua imagem original vira o
+   target, e a caption é a mesma nos 50 —
    `convert the style of this image to the <trigger> style`;
 3. treino com os **dois datasets no mesmo `dataset.toml`** (só o de conversão tem
    `control_directory`) — o musubi mantém os batches separados sozinho;
 4. 5 epochs, checkpoint e sample a cada época. Você olha as amostras e cancela quando quiser.
+
+O dataset pode ter qualquer mistura de tamanhos e proporções: a referência é reduzida para
+1024px antes do envio (o custo escala com a área) e a imagem gerada é recortada para a
+proporção do target, de modo que os dois caem no **mesmo bucket** do musubi e são cortados
+do mesmo jeito. Sem isso o modelo veria um control enquadrado diferente do target.
 
 Se o dataset tiver menos de 50 imagens, elas se repetem entre os slots, sempre com estilos
 diferentes. Imagem recusada pela moderação é tentada uma segunda vez com **outra** imagem;

@@ -33,9 +33,15 @@ SUPPORTED_RATIOS = [
 # nothing — it only inflates the bill and the upload.
 REFERENCE_MAX_EDGE = 1024
 
-# Measured, not derived: one 1024x1024 reference at quality "low" returned
-# usage.cost = 0.014187 (1024 input-image + 23 prompt + 196 output-image tokens).
-# The published gpt-image-1 table would have said 0.011 — it does not apply here.
+# Measured, not derived. Three real calls at quality "low", after the reference
+# was capped at REFERENCE_MAX_EDGE:
+#   1024x1024 ref -> $0.014187   (1024 input-image + 23 prompt + 196 output tok)
+#    796x1024 ref -> $0.011975
+#    1024x683 ref -> $0.010517
+# A square source is the ceiling: at a fixed longest edge it carries the most
+# pixels, and the input image is what dominates the bill. Estimating with the
+# ceiling keeps the number shown before TREINAR from ever being a surprise.
+# (The published gpt-image-1 table would have said 0.011 — it does not apply.)
 COST_PER_IMAGE = 0.0142
 
 _REFUSAL_MARKERS = (
