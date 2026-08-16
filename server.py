@@ -27,7 +27,8 @@ from trainero.config import (IMAGE_EXTS, VIDEO_EXTS, WEB_PORT, ensure_dirs,
                              gpu_info, hf_token, load_state, update_state)
 from trainero.engines import is_installed
 from trainero.presets import (CAPTION_PROFILES, MODEL_ORDER, MODELS,
-                              public_presets, style_rush_models, suggest_schedule)
+                              STYLE_RUSH_SCHEDULE, public_presets,
+                              style_rush_models, suggest_schedule)
 from trainero.training import project_dir, run_training, slugify
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -162,8 +163,8 @@ class Handler(SimpleHTTPRequestHandler):
         if url.path == "/api/samples":
             return self._json({"samples": list_samples(sample_dir())})
         if url.path == "/api/sample":
-            name = parse_qs(url.query).get("name", [""])[0]
-            return self._serve_sample(name)
+            q = parse_qs(url.query)
+            return self._serve_sample(q.get("name", [""])[0], q.get("thumb", [""])[0] == "1")
         if url.path == "/api/dataset/thumbs":
             side = parse_qs(url.query).get("side", ["pos"])[0]
             names, total = dataset_thumbs(dataset_dir(side))
@@ -190,16 +191,18 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _serve_sample(self, name: str):
+    def _serve_sample(self, name: str, thumb: bool = False):
+        """The gallery asks for thumb=1: a 1024px sample PNG is 1-2 MB and the
+        grid cell is 150px, so a run with 40 epochs would push ~60 MB per view."""
         if not safe_sample_name(name):
             return self._error("nome de sample inválido")
         path = sample_dir() / name
         try:
-            data = path.read_bytes()
-        except OSError:
+            data = render_thumb(path, edge=340) if thumb else path.read_bytes()
+        except (OSError, ValueError):
             return self._error("sample não encontrado", 404)
         self.send_response(200)
-        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Type", "image/jpeg" if thumb else "image/png")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "max-age=3600")
         self.end_headers()
@@ -232,6 +235,9 @@ class Handler(SimpleHTTPRequestHandler):
             "models": public_presets(),
             "order": MODEL_ORDER,
             "caption_profiles": CAPTION_PROFILES,
+            # Style Rush ignores suggest_schedule: showing the suggested numbers
+            # in the panel would promise a run that is not the one that happens
+            "style_rush_schedule": STYLE_RUSH_SCHEDULE,
         })
 
     # -- POST --------------------------------------------------------------

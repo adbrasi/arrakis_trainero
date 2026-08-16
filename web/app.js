@@ -109,6 +109,7 @@ function applyMode() {
   $("#trigger-help").textContent = m.triggerHelp;
   if (native && !$("#pair-list").children.length) addPair();
   if (state.status) renderDatasetStats();
+  fillAdvanced();
   renderModelAvailability();
   renderStepState();
   refreshTrainButton();
@@ -370,7 +371,10 @@ ADV_FIELDS.forEach((id) => {
 function fillAdvanced() {
   if (!state.model) return;
   const m = state.presets.models[state.model];
-  const sched = state.status?.schedules?.[state.model];
+  // Style Rush trains on a fixed schedule; the suggested one belongs to the
+  // other modes and showing it here would describe a run that never happens
+  const sched = styleRush() ? state.presets?.style_rush_schedule
+                            : state.status?.schedules?.[state.model];
   const net = $("#adv-net");
   if (net.dataset.model !== state.model) {
     net.dataset.model = state.model;
@@ -406,7 +410,6 @@ function collectOverrides() {
   if (touched.has("adv-save")) o.save_every_n_epochs = parseInt($("#adv-save").value, 10);
   if (touched.has("adv-ltx-res")) o.ltx_resolution = $("#adv-ltx-res").value.trim();
   o.sampling = $("#adv-sampling").checked;
-  o.comfy_convert = $("#adv-comfy").checked;
   const sp = $("#adv-sample-prompt").value.trim();
   if (sp) o.sample_prompt = sp;
   const trig = $("#trigger-word").value.trim();
@@ -583,6 +586,7 @@ async function fetchLog() {
 }
 
 let lastSampleKey = "";
+const SAMPLE_GRID = 12;
 async function fetchSamples() {
   try {
     const { samples } = await api("/api/samples");
@@ -591,13 +595,22 @@ async function fetchSamples() {
     if (key === lastSampleKey) return;
     lastSampleKey = key;
     const box = $("#samples");
+    const head = $("#samples-head");
     box.hidden = samples.length === 0;
-    box.innerHTML = samples.slice(0, 12).map((s) => {
+    head.hidden = samples.length === 0;
+    // a long run makes one sample per epoch: render the newest SAMPLE_GRID and
+    // say so, instead of silently dropping the rest
+    const shown = samples.slice(0, SAMPLE_GRID);
+    head.textContent = samples.length > shown.length
+      ? `${samples.length} amostras · mostrando as ${shown.length} mais recentes`
+      : `${samples.length} amostra${samples.length === 1 ? "" : "s"}`;
+    box.innerHTML = shown.map((s) => {
       const label = s.epoch >= 0 ? `epoch ${s.epoch}` : s.name;
-      const href = `/api/sample?name=${encodeURIComponent(s.name)}`;
+      const q = encodeURIComponent(s.name);
+      // the grid pulls a thumbnail; the link opens the full-resolution PNG
       return `<figure>
-        <a href="${href}" target="_blank">
-          <img src="${href}" alt="${label}" loading="lazy">
+        <a href="/api/sample?name=${q}" target="_blank" rel="noopener">
+          <img src="/api/sample?name=${q}&thumb=1" alt="${label}" loading="lazy">
         </a>
         <figcaption>${label}</figcaption>
       </figure>`;
