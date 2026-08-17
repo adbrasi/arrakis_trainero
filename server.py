@@ -38,7 +38,8 @@ WEB_DIR = Path(__file__).resolve().parent / "web"
 # A job reads the dataset from the first phase to the last; anything that writes
 # to it meanwhile changes the run under its feet. jobs.start() is the mutex for
 # job-vs-job, and these two cover the writes that are plain HTTP requests:
-# uploads/clears wait for the job slot, and a train waits for the uploads.
+# uploads/clears wait for the job slot, and a train or a clear waits for the
+# uploads (a clear racing an in-flight upload would delete files mid-write).
 _uploads = 0
 _uploads_lock = threading.Lock()
 
@@ -425,33 +426,38 @@ class Handler(SimpleHTTPRequestHandler):
         if length <= 0:
             return self._error("corpo vazio")
         dest = target_root / name
+        # staged next to the destination: the trainer and inspect() glob the
+        # dataset dir by media extension, so a half-received file must never
+        # carry a media name — a dropped connection would leave a truncated
+        # image that trains without a single error
+        tmp = target_root / f".{name}.uploading"
         with _UploadInFlight():
-            with open(dest, "wb") as f:
-                remaining = length
-                while remaining > 0:
-                    chunk = self.rfile.read(min(1 << 20, remaining))
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    remaining -= len(chunk)
+            try:
+                with open(tmp, "wb") as f:
+                    remaining = length
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(1 << 20, remaining))
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        remaining -= len(chunk)
+                if remaining > 0:
+                    return self._error(f"upload de {name} truncado "
+                                       f"(faltaram {remaining} bytes) — envie de novo")
+                os.replace(tmp, dest)
+            finally:
+                tmp.unlink(missing_ok=True)
             ext = ds.archive_ext(name)
             if ext:
-                import subprocess
                 import uuid
-
-                class _SyncJob:  # tiny shim: extraction logging goes nowhere useful here
-                    def log(self, *_): pass
-
-                    def run(self, cmd, **kw):
-                        subprocess.run([str(c) for c in cmd], check=True,
-                                       cwd=kw.get("cwd"), capture_output=True)
 
                 # unique per request: parallel uploads of two zips must not share staging
                 staging = target_root.parent / f"_upload_staging_{uuid.uuid4().hex}"
                 try:
-                    ds.extract_archive(dest, staging / "src", _SyncJob())
-                    ds.normalize_into(staging, target_root, _SyncJob())
-                except (JobFailed, subprocess.CalledProcessError, OSError) as exc:
+                    sync = jobs.SyncJob()
+                    ds.extract_archive(dest, staging / "src", sync)
+                    ds.normalize_into(staging, target_root, sync)
+                except (JobFailed, OSError) as exc:
                     return self._error(f"extração de {name} falhou: {exc}")
                 finally:
                     dest.unlink(missing_ok=True)
@@ -464,6 +470,10 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if not self._require_idle():
             return
+        pending = uploads_in_flight()
+        if pending:
+            return self._error(f"{pending} upload(s) ainda em andamento — "
+                               f"espere terminar antes de limpar", 409)
         side = query.get("side", "pos")
         pdir = project_dir(project)
         ds.clear_dataset(pdir, side)

@@ -39,6 +39,31 @@ class JobFailed(Exception):
     pass
 
 
+class SyncJob:
+    """The Job surface (log/run/check_cancel) for work done inline in an HTTP
+    handler — no slot, no thread, no log file. The extraction helpers in
+    dataset.py are written against a Job; a browser upload of a zip extracts
+    synchronously inside the request and has nowhere for a log to go."""
+
+    def log(self, *_args, **_kwargs) -> None:
+        pass
+
+    def check_cancel(self) -> None:
+        pass
+
+    def run(self, cmd: list, cwd: Path | None = None, env: dict | None = None,
+            parse_progress: bool = False) -> int:
+        full_env = dict(os.environ)
+        if env:
+            full_env.update(env)
+        proc = subprocess.run([str(c) for c in cmd], cwd=str(cwd) if cwd else None,
+                              env=full_env, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise JobFailed(f"comando saiu com código {proc.returncode}: "
+                            f"{(proc.stderr or proc.stdout)[-300:]}")
+        return proc.returncode
+
+
 class Job:
     def __init__(self, kind: str, title: str, log_path: Path):
         self.kind = kind

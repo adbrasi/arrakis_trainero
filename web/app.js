@@ -525,8 +525,6 @@ function collectOverrides() {
   o.sampling = $("#adv-sampling").checked;
   const sp = $("#adv-sample-prompt").value.trim();
   if (sp) o.sample_prompt = sp;
-  const trig = $("#trigger-word").value.trim();
-  if (trig) o.trigger = trig;
   return o;
 }
 

@@ -3,16 +3,16 @@
 Repo is created before training starts (animatrem pattern: the repo is born
 documented even if training dies) and carries the run as data — trainero_config.json
 plus captions.json, never a generated model card. A daemon watcher uploads every *.safetensors
-that appears in output_dir once its size stabilizes; dedupe via
-.hf_uploaded.log. A quota/auth failure disables further attempts instead of
-retrying every checkpoint.
+that appears in output_dir once the file is complete (the safetensors header
+says exactly how long the file must be); dedupe via .hf_uploaded.log. A
+quota/auth failure disables further attempts instead of retrying every
+checkpoint.
 """
 
 from __future__ import annotations
 
 import json
 import threading
-import time
 from pathlib import Path
 
 from .config import hf_token
@@ -128,7 +128,7 @@ class UploadWatcher:
     def _loop(self):
         while True:
             stopping = self._stop.wait(30)
-            self._sweep(wait_stable=not stopping)
+            self._sweep(final=stopping)
             # The flag is read AFTER the sweep on purpose. Checking it in the
             # while condition lost the final sweep whenever stop landed while a
             # sweep was already in flight — a 2 GB upload takes minutes, and the
@@ -136,14 +136,21 @@ class UploadWatcher:
             if stopping:
                 return
 
-    def _sweep(self, wait_stable: bool):
+    def _sweep(self, final: bool = False):
         if self._disabled:
             return
         done = self._uploaded()
         for ckpt in sorted(self.output_dir.glob("*.safetensors")):
             if ckpt.name in done or self._disabled:
                 continue
-            if wait_stable and not _stable(ckpt):
+            if not _complete(ckpt):
+                # mid-write on a periodic sweep — the next one picks it up.
+                # On the final sweep it means the writer died first (a
+                # cancelled run SIGTERMs the trainer mid-checkpoint), and a
+                # truncated file must not reach the repo looking like weights.
+                if final:
+                    self.job.log(f"⚠ {ckpt.name} incompleto no disco "
+                                 f"(escrita interrompida) — não enviado.")
                 continue
             files = [ckpt]
             if self.convert:
@@ -181,20 +188,33 @@ class UploadWatcher:
             return False
 
 
-def _stable(path: Path, checks: int = 3, interval: float = 5.0) -> bool:
+def _complete(path: Path) -> bool:
+    """Whether a .safetensors file is entirely on disk.
+
+    Size stability (the previous test) cannot tell a finished checkpoint from
+    one whose writer was killed mid-write — a dead writer is perfectly stable.
+    The format itself can: the first 8 bytes carry the header length, the
+    header carries every tensor's end offset, and the file is complete iff it
+    is exactly as long as the header promises. This also replaces the 15s
+    stability wait per checkpoint — a file still being written simply fails
+    the size equation and is retried on the next sweep.
+    """
+    import struct
+
     try:
-        last = path.stat().st_size
-    except OSError:
-        return False
-    if last == 0:
-        return False
-    for _ in range(checks):
-        time.sleep(interval)
-        try:
-            now = path.stat().st_size
-        except OSError:
+        size = path.stat().st_size
+        if size < 8:
             return False
-        if now != last:
-            return False
-        last = now
-    return True
+        with open(path, "rb") as f:
+            (header_len,) = struct.unpack("<Q", f.read(8))
+            if header_len <= 0 or 8 + header_len > size:
+                return False
+            header = json.loads(f.read(header_len))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(header, dict):
+        return False
+    payload_end = max((entry["data_offsets"][1] for entry in header.values()
+                       if isinstance(entry, dict) and "data_offsets" in entry),
+                      default=0)
+    return size == 8 + header_len + payload_end

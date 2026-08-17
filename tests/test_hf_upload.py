@@ -1,5 +1,7 @@
 """UploadWatcher: what reaches HuggingFace while a run is in flight."""
 
+import json
+import struct
 import sys
 import tempfile
 import unittest
@@ -10,6 +12,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from trainero import hf_upload
 from trainero.hf_upload import UploadWatcher, model_card, upload_run_files
+
+
+def fake_safetensors(tag: str = "x") -> bytes:
+    """A minimal but structurally valid .safetensors: the watcher now refuses
+    anything whose bytes do not match what the header promises."""
+    header = json.dumps({"__metadata__": {"run": tag}}).encode()
+    return struct.pack("<Q", len(header)) + header
 
 
 class _FakeJob:
@@ -33,32 +42,49 @@ class TestUploadWatcher(unittest.TestCase):
         nothing at all, silently — the repo kept the old weights."""
         with tempfile.TemporaryDirectory() as td:
             out = Path(td)
-            (out / "p-000001.safetensors").write_bytes(b"primeiro treino")
+            (out / "p-000001.safetensors").write_bytes(fake_safetensors("primeiro"))
 
             first = []
             w = self._watcher(out, uploaded=first)
-            w._sweep(wait_stable=False)
+            w._sweep()
             self.assertEqual(first, ["p-000001.safetensors"])
 
             # the retrain overwrites the file with different weights
-            (out / "p-000001.safetensors").write_bytes(b"segundo treino")
+            (out / "p-000001.safetensors").write_bytes(fake_safetensors("segundo"))
             second = []
             w2 = self._watcher(out, uploaded=second)
             with mock.patch.object(w2, "_thread"):
                 w2.start()
-            w2._sweep(wait_stable=False)
+            w2._sweep()
             self.assertEqual(second, ["p-000001.safetensors"],
                              "o segundo treino não enviou o checkpoint novo")
 
     def test_within_one_run_a_checkpoint_is_not_sent_twice(self):
         with tempfile.TemporaryDirectory() as td:
             out = Path(td)
-            (out / "p-000001.safetensors").write_bytes(b"x")
+            (out / "p-000001.safetensors").write_bytes(fake_safetensors())
             sent = []
             w = self._watcher(out, uploaded=sent)
-            w._sweep(wait_stable=False)
-            w._sweep(wait_stable=False)
+            w._sweep()
+            w._sweep()
             self.assertEqual(sent, ["p-000001.safetensors"])
+
+    def test_a_truncated_checkpoint_never_reaches_the_repo(self):
+        """A cancelled run SIGTERMs the trainer mid-write. The leftover file is
+        stable (its writer is dead) — only the format check can tell it apart
+        from real weights, and the final sweep has to say why it stayed."""
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td)
+            whole = fake_safetensors("morto no meio")
+            (out / "p-000001.safetensors").write_bytes(whole[:len(whole) - 3])
+            (out / "p-000002.safetensors").write_bytes(fake_safetensors("inteiro"))
+            sent = []
+            job = _FakeJob()
+            w = self._watcher(out, job=job, uploaded=sent)
+            w._sweep(final=True)
+            self.assertEqual(sent, ["p-000002.safetensors"])
+            self.assertTrue(any("incompleto" in ln for ln in job.lines),
+                            "o sweep final não avisou do checkpoint truncado")
 
     def test_an_auth_failure_stops_after_the_first_checkpoint(self):
         """Retrying a 403 for every checkpoint just fills the log with the same
@@ -66,13 +92,13 @@ class TestUploadWatcher(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             out = Path(td)
             for i in (1, 2, 3):
-                (out / f"p-00000{i}.safetensors").write_bytes(b"x")
+                (out / f"p-00000{i}.safetensors").write_bytes(fake_safetensors(str(i)))
             job = _FakeJob()
             w = UploadWatcher("dono/p", out, job)
 
             with mock.patch("huggingface_hub.HfApi") as api:
                 api.return_value.upload_file.side_effect = RuntimeError("403 Forbidden")
-                w._sweep(wait_stable=False)
+                w._sweep()
 
             self.assertTrue(w._disabled, "403 tem de desligar os uploads do run")
             self.assertEqual(api.return_value.upload_file.call_count, 1)

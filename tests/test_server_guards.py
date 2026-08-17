@@ -103,6 +103,28 @@ class TestDatasetIsFrozenDuringAJob(LiveServer):
         self.assertEqual(code, 200)
 
 
+class TestClearWaitsForUploads(LiveServer):
+    def test_clear_is_refused_while_an_upload_is_in_flight(self):
+        """rmtree under a file that is still being received deletes it mid-write."""
+        ds = server.dataset_dir("pos")
+        ds.mkdir(parents=True, exist_ok=True)
+        (ds / "keep.png").write_bytes(b"x" * 2048)
+        with server._UploadInFlight():
+            code, body = self._call("/api/dataset/clear?side=pos")
+        self.assertEqual(code, 409)
+        self.assertIn("upload", body.get("error", ""))
+        self.assertTrue((ds / "keep.png").exists(), "o dataset foi apagado sob o upload")
+
+
+class TestUploadIsAtomic(LiveServer):
+    def test_a_successful_upload_leaves_no_staging_file(self):
+        code, _ = self._call("/api/dataset/file?side=pos&name=a.png", raw=b"x" * 2048)
+        self.assertEqual(code, 200)
+        ds = server.dataset_dir("pos")
+        self.assertTrue((ds / "a.png").exists())
+        self.assertEqual([], [p.name for p in ds.iterdir() if p.name.endswith(".uploading")])
+
+
 class TestTrainWaitsForUploads(LiveServer):
     def test_train_is_refused_while_an_upload_is_in_flight(self):
         with server._UploadInFlight():
