@@ -106,12 +106,24 @@ MODELS = {
             "learning_rate": 1e-4, "optimizer_type": "adamw8bit", "lr_scheduler": "cosine",
             "timestep_sampling": "krea2_shift", "weighting_scheme": "none",
         },
+        # Sampling on the K2 RAW model is CFG-based, and musubi only turns CFG
+        # on when the prompt line carries a negative prompt (--n); the scale is
+        # --l, NOT --g (--g is embedded guidance, which K2 ignores). Without
+        # these two the samples come out blurry BY DESIGN (docs/krea2.md).
+        # 5.5 is the official default (K2 "guidance 4.5" + 1). Every other
+        # arch here injects its own default negative, so only K2 needs this.
+        "sample_args": {"l": 5.5, "n": "blurry, low quality, jpeg artifacts, watermark, text"},
         "resolution": [1024, 1024],
         "target_steps": 2000,
         "vram_tiers": [
             {"min_gb": 70, "train": {}},
-            {"min_gb": 44, "train": {"fp8_base": True, "fp8_scaled": True}},
-            {"min_gb": 30, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 8}},
+            # fp8 halves the 28 main blocks to ~12 GB (docs/krea2.md), leaving
+            # a 32 GB card (RTX 5090) room for activations plus the ~8 GB text
+            # encoder that visits at sample time — swapping blocks there only
+            # costs step time. Swap starts at 24 GB cards, where fp8 alone sits
+            # exactly at the limit during sampling.
+            {"min_gb": 30, "train": {"fp8_base": True, "fp8_scaled": True}},
+            {"min_gb": 22, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 8}},
             {"min_gb": 0, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 20}},
         ],
     },

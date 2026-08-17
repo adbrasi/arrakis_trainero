@@ -246,6 +246,29 @@ class TestSamplePrompts(unittest.TestCase):
         line = sample_prompt_line("a cat", "trg", [768, 512], frames=81)
         self.assertIn("--f 81", line)
 
+    def test_krea2_sample_line_turns_cfg_on(self):
+        """musubi only enables CFG when the line carries --n, and the scale is
+        --l (--g is embedded guidance, which K2 ignores). Without both, the K2
+        RAW model samples blurry by design — docs/krea2.md."""
+        from trainero.presets import MODELS
+        from trainero.training import sample_prompt_line
+
+        line = sample_prompt_line("a cat", "trg", [1024, 1024],
+                                  extra=MODELS["krea2"]["sample_args"])
+        self.assertIn("--l 5.5", line)
+        self.assertIn(" --n ", line)
+        # the parser hands --n everything after it, so it must close the line
+        self.assertGreater(line.index("--n"), line.index("--l"))
+        self.assertGreater(line.index("--n"), line.index("--s"))
+
+    def test_only_krea2_needs_sample_args(self):
+        """The other musubi archs inject their own default negative prompt
+        (qwen/flux/wan) or run their own CFG scheme (ideogram4)."""
+        from trainero.presets import MODEL_ORDER, MODELS
+
+        carriers = [k for k in MODEL_ORDER if "sample_args" in MODELS[k]]
+        self.assertEqual(carriers, ["krea2"])
+
     def test_write_creates_single_line_file(self):
         import tempfile
         from trainero.training import write_sample_prompts

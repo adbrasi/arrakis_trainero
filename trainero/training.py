@@ -170,7 +170,7 @@ def write_dataset_toml(model_key: str, path: Path, subsets: list[dict],
 
 
 def sample_prompt_line(prompt_text: str, trigger: str, resolution: list[int],
-                       frames: int | None = None) -> str:
+                       frames: int | None = None, extra: dict | None = None) -> str:
     text = prompt_text.strip()
     if trigger.strip():
         text = f"{trigger.strip()}, {text}"
@@ -179,17 +179,25 @@ def sample_prompt_line(prompt_text: str, trigger: str, resolution: list[int],
     if frames:
         parts.append(f"--f {int(frames)}")
     parts += [f"--d {SAMPLE_SEED}", f"--s {SAMPLE_STEPS}", f"--g {SAMPLE_GUIDANCE}"]
+    # per-model flags from the preset's sample_args (e.g. K2's CFG). The
+    # negative prompt goes last: musubi's parser hands --n the rest of the line
+    extra = dict(extra or {})
+    negative = extra.pop("n", None)
+    parts += [f"--{k} {v}" for k, v in extra.items()]
+    if negative:
+        parts.append(f"--n {negative}")
     return " ".join(parts)
 
 
 def write_sample_prompts(path: Path, prompt_text: str, trigger: str,
-                         resolution: list[int], frames: int | None = None) -> Path:
+                         resolution: list[int], frames: int | None = None,
+                         extra: dict | None = None) -> Path:
     """Still images get the wide sample frame; video keeps the shape it trains
     on, where frame size is tied to what the model learned."""
     if frames is None:
         resolution = sample_resolution(resolution)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(sample_prompt_line(prompt_text, trigger, resolution, frames) + "\n",
+    path.write_text(sample_prompt_line(prompt_text, trigger, resolution, frames, extra) + "\n",
                     encoding="utf-8")
     return path
 
@@ -652,7 +660,8 @@ def run_style_rush_training(job: Job, params: dict) -> None:
     if overrides.get("sampling", True) and supports_sampling(engine):
         sample_path = write_sample_prompts(
             pdir / "sample_prompts.txt",
-            overrides.get("sample_prompt") or SAMPLE_PROMPT, trigger, resolution)
+            overrides.get("sample_prompt") or SAMPLE_PROMPT, trigger, resolution,
+            extra=model.get("sample_args"))
 
     total_items = stats["items"] + convert_stats["pairs"] + restore_stats["pairs"]
     cfg = build_train_config(model_key, overrides, schedule, {"items": total_items},
@@ -796,7 +805,7 @@ def run_training(job: Job, params: dict) -> None:
         sample_path = write_sample_prompts(
             pdir / "sample_prompts.txt",
             overrides.get("sample_prompt") or SAMPLE_PROMPT,
-            trigger, resolution, frames)
+            trigger, resolution, frames, extra=model.get("sample_args"))
         job.log(f"Samples a cada época: {sample_path}")
     elif overrides.get("sampling", True):
         job.log(f"⚠ engine {engine} não tem --sample_prompts — sampling desligado.")
