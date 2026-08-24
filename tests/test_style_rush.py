@@ -64,6 +64,37 @@ class TestStylePrompts(unittest.TestCase):
         self.assertEqual(len(prompts), 100)
         self.assertEqual(len(set(prompts)), 100, "prompts must be distinct")
 
+    def test_no_prompt_destroys_the_colour(self):
+        """Um controle em preto e branco ensina o LoRA a COLORIR, nao a
+        converter estilo: metade do sinal do par vira recuperacao de cor. O
+        dono so quer mudanca de traco, com a cor preservada."""
+        banned = ("black and white", "black-and-white", "monochrome", "greyscale",
+                  "grayscale", "no color", "no colour", "single hue", "silhouette",
+                  "sepia", "graphite", "charcoal", "1-bit", "ascii", "blueprint")
+        for prompt in load_style_prompts():
+            low = prompt.lower()
+            for word in banned:
+                self.assertNotIn(word, low, prompt)
+
+    def test_every_prompt_actually_converts_the_style(self):
+        """'keep same style' e 'improve the quality' produzem um controle quase
+        identico ao alvo — o par ensina identidade. E e o trabalho da metade de
+        restauracao, que ja tem a legenda certa para ele."""
+        banned = ("keep same style", "improve the quality", "make it hd",
+                  "turn this image hd", "enhance the quality")
+        for prompt in load_style_prompts():
+            low = prompt.lower()
+            for word in banned:
+                self.assertNotIn(word, low, prompt)
+
+    def test_no_prompt_is_just_a_lighting_change(self):
+        banned = ("fix the light", "bad lighting", "rim light", "gallery lighting",
+                  "studio lighting", "practical lighting", "color cast")
+        for prompt in load_style_prompts():
+            low = prompt.lower()
+            for word in banned:
+                self.assertNotIn(word, low, prompt)
+
     def test_every_prompt_names_a_medium_or_technique(self):
         """Um prompt de uma palavra ("make it artistic") não converte estilo
         nenhum: o gpt-image-2 precisa de descritores que ele consiga renderizar."""
