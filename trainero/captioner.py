@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 
 from . import dataset as ds
+from .config import IMAGE_EXTS, VIDEO_EXTS
 from .engines import engine_dir, ensure_engine, venv_python
 from .jobs import Job, JobFailed
 
@@ -25,11 +26,45 @@ FLAGGED_FILE = ".caption_refused.json"
 QUARANTINE_DIR = "descartadas"
 
 # The captioner's CLI names this stage "grok" for historical reasons; the flag
-# takes any OpenRouter model id with vision. Override with CAPTION_MODEL.
-DEFAULT_CAPTION_MODEL = os.environ.get("CAPTION_MODEL", "google/gemini-3.7-flash")
-# Gemini blocks with PROHIBITED_CONTENT on material Grok captions without
-# complaint, which is the entire reason there is a second pass.
-FALLBACK_CAPTION_MODEL = os.environ.get("CAPTION_FALLBACK_MODEL", "x-ai/grok-4.20")
+# takes any OpenRouter model id with vision.
+MUSE_SPARK = "meta/muse-spark-1.2-contributor"
+GEMINI_FLASH = "google/gemini-3.7-flash"
+GROK = "x-ai/grok-4.20"
+
+# The order depends on what the mode does with the primary's refusal. The only
+# consumer of .caption_refused.json is Style Rush's content_flagged, which uses
+# it to avoid paying for a slot gpt-image-2 would refuse — so there the primary
+# has to be the model whose filter most resembles OpenAI's, which is Gemini. A
+# plain LoRA has no paid phase and nothing reads the list, so its order is pure
+# cost and quality: Muse Spark captions the same explicit material for a tenth
+# of the price.
+DEFAULT_CAPTION_MODELS = {
+    "lora": [MUSE_SPARK, GEMINI_FLASH, GROK],
+    "style-rush": [GEMINI_FLASH, MUSE_SPARK, GROK],
+}
+
+# What record_flagged means by "the strict model". Kept as a name because the
+# flag file records it and the Style Rush half reasons about it.
+DEFAULT_CAPTION_MODEL = DEFAULT_CAPTION_MODELS["style-rush"][0]
+
+# The tagger's own default is 32, which is what a thousand-image dataset waits
+# on. One knob, not one per model.
+CAPTION_CONCURRENCY = int(os.environ.get("CAPTION_CONCURRENCY", "64"))
+
+MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
+
+
+def caption_models(mode: str = "lora") -> list[str]:
+    """The cascade for this mode, cheapest-useful first.
+
+    CAPTION_MODELS overrides every mode at once: a comma-separated list is one
+    knob for a cascade of any length, where numbered env vars would silently
+    pin it to the length they were written for.
+    """
+    override = os.environ.get("CAPTION_MODELS", "").strip()
+    if override:
+        return [m.strip() for m in override.split(",") if m.strip()]
+    return list(DEFAULT_CAPTION_MODELS.get(mode) or DEFAULT_CAPTION_MODELS["lora"])
 
 
 def prune_stale_log(dataset_dir: Path, job: Job | None = None) -> int:
@@ -70,6 +105,7 @@ def _tagger_cmd(dataset_dir: Path, media: str, profile: str,
         "--taggers", "pixai,grok",
         "--grok_provider", "openrouter",
         "--grok_model", model,
+        "--grok_concurrency", str(CAPTION_CONCURRENCY),
         "--prompt_profile", profile,
         "--remove_underscore",
         "--thresh", "0.30",
@@ -127,13 +163,15 @@ def openrouter_problem() -> str:
     return ""
 
 
-def record_flagged(dataset_dir: Path, items: list[Path]) -> None:
-    """Remember which items the strict model would not caption.
+def record_flagged(dataset_dir: Path, items: list[Path], model: str) -> None:
+    """Remember which items the primary model would not caption.
 
     They are the ones a content filter objects to, which is the same objection
     gpt-image-2 raises in the Style Rush conversion phase — and there a refusal
     costs a paid slot. Written next to the dataset so that phase can read it
-    without re-running any model.
+    without re-running any model. `model` is recorded because the primary is
+    not the same in every mode, and a list is only as meaningful as the filter
+    that produced it.
     """
     path = dataset_dir / FLAGGED_FILE
     try:
@@ -142,7 +180,7 @@ def record_flagged(dataset_dir: Path, items: list[Path]) -> None:
         known = set()
     known |= {i.name for i in items}
     path.write_text(json.dumps(
-        {"model": DEFAULT_CAPTION_MODEL, "refused_by_primary": sorted(known)},
+        {"model": model, "refused_by_primary": sorted(known)},
         indent=2, ensure_ascii=False))
 
 
@@ -194,32 +232,33 @@ def quarantine_uncaptionable(dataset_dir: Path, items: list[Path], job: Job) -> 
 
 
 def generate_captions(dataset_dir, media: str, profile: str, prompt_vars: dict[str, str],
-                      job: Job) -> None:
+                      job: Job, mode: str = "lora") -> None:
     if not os.environ.get("OPENROUTER_API_KEY"):
         raise JobFailed("defina OPENROUTER_API_KEY para gerar captions com LLM")
     dataset_dir = Path(dataset_dir)
     ensure_engine("captioner", job)
 
-    refused_by_primary = _pass(dataset_dir, media, profile, prompt_vars, job,
-                               DEFAULT_CAPTION_MODEL)
-    missing = refused_by_primary
+    models = caption_models(mode)
+    job.log(f"Cascata de caption: {' → '.join(models)}")
 
-    if missing and FALLBACK_CAPTION_MODEL != DEFAULT_CAPTION_MODEL:
-        job.log(f"{len(missing)} recusadas por {DEFAULT_CAPTION_MODEL} — "
-                f"tentando {FALLBACK_CAPTION_MODEL}: "
+    missing = _pass(dataset_dir, media, profile, prompt_vars, job, models[0])
+    refused_by_primary = missing
+    for model in models[1:]:
+        if not missing:
+            break
+        job.log(f"{len(missing)} sem caption — tentando {model}: "
                 f"{', '.join(p.name for p in missing[:5])}"
                 f"{'…' if len(missing) > 5 else ''}")
-        missing = _pass(dataset_dir, media, profile, prompt_vars, job,
-                        FALLBACK_CAPTION_MODEL)
+        missing = _pass(dataset_dir, media, profile, prompt_vars, job, model)
 
-    # Flag only what the fallback rescued. "Still uncaptioned after pass 1" has
+    # Flag only what a later model rescued. "Still uncaptioned after pass 1" has
     # two causes that look identical on disk — the model refused it, or the API
     # was down — and only one of them justifies excluding the image from the
     # paid conversion phase forever. A second model producing a caption is the
     # proof that the first one refused on content, not that the account died.
     rescued = [p for p in refused_by_primary if p not in set(missing)]
     if rescued:
-        record_flagged(dataset_dir, rescued)
+        record_flagged(dataset_dir, rescued, models[0])
 
     if missing:
         # Never destroy on an infrastructure failure: out of credit looks

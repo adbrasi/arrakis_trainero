@@ -14,9 +14,13 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from trainero import captioner
-from trainero.captioner import (DEFAULT_CAPTION_MODEL, FALLBACK_CAPTION_MODEL,
-                                QUARANTINE_DIR, TAGGER_LOG, generate_captions, prune_stale_log,
+from trainero.captioner import (QUARANTINE_DIR, TAGGER_LOG, caption_models,
+                                generate_captions, prune_stale_log,
                                 quarantine_uncaptionable)
+
+# Os testes deste arquivo exercem a cascata do Style Rush, que é a ordem em que
+# o primário é o Gemini — é essa ordem que alimenta record_flagged.
+PRIMARY, SECOND, THIRD = caption_models("style-rush")
 
 
 class _FakeJob:
@@ -82,7 +86,7 @@ def _dataset(root: Path, captioned: int, uncaptioned: int) -> Path:
     return ds
 
 
-def _run(ds: Path, job: _FakeJob, problem: str = ""):
+def _run(ds: Path, job: _FakeJob, problem: str = "", mode: str = "style-rush"):
     """`problem` is what the OpenRouter health check reports — empty means the
     account works, so an item still missing really was refused by both models."""
     with mock.patch.dict("os.environ", {"OPENROUTER_API_KEY": "k"}), \
@@ -90,7 +94,7 @@ def _run(ds: Path, job: _FakeJob, problem: str = ""):
          mock.patch.object(captioner, "venv_python", return_value=Path("py")), \
          mock.patch.object(captioner, "engine_dir", return_value=Path("/eng")), \
          mock.patch.object(captioner, "openrouter_problem", return_value=problem):
-        generate_captions(ds, "image", "generic-style", {"style_name": "t"}, job)
+        generate_captions(ds, "image", "generic-style", {"style_name": "t"}, job, mode=mode)
 
 
 class TestNoReprocessing(unittest.TestCase):
@@ -99,7 +103,7 @@ class TestNoReprocessing(unittest.TestCase):
         at image 190 of 282 then charged OpenRouter for all 282 on the retry."""
         with tempfile.TemporaryDirectory() as td:
             ds = _dataset(Path(td), captioned=190, uncaptioned=92)
-            job = _FakeJob({DEFAULT_CAPTION_MODEL: {f"falta_{i:03d}.jpg" for i in range(92)}})
+            job = _FakeJob({PRIMARY: {f"falta_{i:03d}.jpg" for i in range(92)}})
             _run(ds, job)
             self.assertNotIn("--force", job.commands[0])
 
@@ -108,9 +112,9 @@ class TestNoReprocessing(unittest.TestCase):
         when the first model captioned everything."""
         with tempfile.TemporaryDirectory() as td:
             ds = _dataset(Path(td), captioned=10, uncaptioned=5)
-            job = _FakeJob({DEFAULT_CAPTION_MODEL: {f"falta_{i:03d}.jpg" for i in range(5)}})
+            job = _FakeJob({PRIMARY: {f"falta_{i:03d}.jpg" for i in range(5)}})
             _run(ds, job)
-            self.assertEqual(job.models_used(), [DEFAULT_CAPTION_MODEL])
+            self.assertEqual(job.models_used(), [PRIMARY])
 
 
 class TestFallback(unittest.TestCase):
@@ -119,13 +123,13 @@ class TestFallback(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             ds = _dataset(Path(td), captioned=5, uncaptioned=3)
             job = _FakeJob({
-                DEFAULT_CAPTION_MODEL: {"falta_000.jpg", "falta_001.jpg"},
-                FALLBACK_CAPTION_MODEL: {"falta_002.jpg"},
+                PRIMARY: {"falta_000.jpg", "falta_001.jpg"},
+                SECOND: {"falta_002.jpg"},
             })
             _run(ds, job)
 
             self.assertEqual(job.models_used(),
-                             [DEFAULT_CAPTION_MODEL, FALLBACK_CAPTION_MODEL])
+                             [PRIMARY, SECOND])
             self.assertTrue((ds / "falta_002.txt").exists(),
                             "o fallback tinha de ter escrito a caption")
             self.assertTrue((ds / "falta_002.jpg").exists(), "nada devia ser removido")
@@ -139,7 +143,7 @@ class TestFallback(unittest.TestCase):
             log["processed"][str(ds / "falta_000.jpg")] = {"taggers": ["grok"]}
             (ds / TAGGER_LOG).write_text(json.dumps(log))
 
-            job = _FakeJob({FALLBACK_CAPTION_MODEL: {"falta_000.jpg"}})
+            job = _FakeJob({SECOND: {"falta_000.jpg"}})
             _run(ds, job)
 
             self.assertTrue((ds / "falta_000.txt").exists())
@@ -153,7 +157,7 @@ class TestDiscard(unittest.TestCase):
         refused twice on content grounds — retrying is not going to help."""
         with tempfile.TemporaryDirectory() as td:
             ds = _dataset(Path(td), captioned=4, uncaptioned=2)
-            job = _FakeJob({FALLBACK_CAPTION_MODEL: {"falta_000.jpg"}})
+            job = _FakeJob({SECOND: {"falta_000.jpg"}})
             _run(ds, job)
 
             self.assertTrue((ds / "falta_000.jpg").exists(), "o fallback salvou esta")
@@ -180,8 +184,8 @@ class TestDiscard(unittest.TestCase):
             from trainero.dataset import inspect
             ds = _dataset(Path(td), captioned=3, uncaptioned=4)
             job = _FakeJob({
-                DEFAULT_CAPTION_MODEL: {"falta_000.jpg", "falta_001.jpg"},
-                FALLBACK_CAPTION_MODEL: {"falta_002.jpg"},
+                PRIMARY: {"falta_000.jpg", "falta_001.jpg"},
+                SECOND: {"falta_002.jpg"},
             })
             _run(ds, job)
             self.assertEqual(inspect(ds)["missing_captions"], 0,
@@ -247,7 +251,7 @@ class TestFlagged(unittest.TestCase):
         refusal costs a paid slot."""
         with tempfile.TemporaryDirectory() as td:
             ds = _dataset(Path(td), captioned=2, uncaptioned=2)
-            job = _FakeJob({FALLBACK_CAPTION_MODEL: {"falta_000.jpg", "falta_001.jpg"}})
+            job = _FakeJob({SECOND: {"falta_000.jpg", "falta_001.jpg"}})
             _run(ds, job)
 
             self.assertEqual(captioner.flagged_names(ds),
@@ -256,14 +260,14 @@ class TestFlagged(unittest.TestCase):
     def test_nothing_is_flagged_when_the_first_model_takes_everything(self):
         with tempfile.TemporaryDirectory() as td:
             ds = _dataset(Path(td), captioned=2, uncaptioned=2)
-            job = _FakeJob({DEFAULT_CAPTION_MODEL: {"falta_000.jpg", "falta_001.jpg"}})
+            job = _FakeJob({PRIMARY: {"falta_000.jpg", "falta_001.jpg"}})
             _run(ds, job)
             self.assertEqual(captioner.flagged_names(ds), set())
 
     def test_the_flag_survives_a_second_caption_run(self):
         with tempfile.TemporaryDirectory() as td:
             ds = _dataset(Path(td), captioned=1, uncaptioned=1)
-            _run(ds, _FakeJob({FALLBACK_CAPTION_MODEL: {"falta_000.jpg"}}))
+            _run(ds, _FakeJob({SECOND: {"falta_000.jpg"}}))
             _run(ds, _FakeJob())  # nada a fazer, tudo já tem caption
             self.assertEqual(captioner.flagged_names(ds), {"falta_000.jpg"})
 
@@ -305,3 +309,75 @@ class TestPruneStaleLog(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCascadeOrder(unittest.TestCase):
+    """A ordem depende do que o modo faz com a recusa do primário: só o Style
+    Rush lê o .caption_refused.json, e lá ele vale dinheiro."""
+
+    def test_lora_starts_with_muse_spark(self):
+        self.assertEqual(caption_models("lora")[0], "meta/muse-spark-1.2-contributor")
+
+    def test_style_rush_starts_with_gemini(self):
+        self.assertEqual(caption_models("style-rush")[0], "google/gemini-3.7-flash")
+
+    def test_both_modes_end_with_grok(self):
+        for mode in ("lora", "style-rush"):
+            self.assertEqual(caption_models(mode)[-1], "x-ai/grok-4.20", mode)
+
+    def test_both_modes_hold_the_same_three_models(self):
+        self.assertEqual(set(caption_models("lora")), set(caption_models("style-rush")))
+
+    def test_an_unknown_mode_falls_back_to_the_lora_order(self):
+        self.assertEqual(caption_models("qualquer-coisa"), caption_models("lora"))
+
+    def test_the_env_var_overrides_every_mode(self):
+        with mock.patch.dict("os.environ", {"CAPTION_MODELS": "a/one, b/two"}, clear=False):
+            self.assertEqual(caption_models("lora"), ["a/one", "b/two"])
+            self.assertEqual(caption_models("style-rush"), ["a/one", "b/two"])
+
+    def test_the_third_model_runs_when_the_second_also_refuses(self):
+        """Dois passes eram o teto antigo. Um item que o Gemini e o Muse recusam
+        tem de chegar no Grok em vez de sair do dataset."""
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=2, uncaptioned=1)
+            job = _FakeJob({THIRD: {"falta_000.jpg"}})
+            _run(ds, job)
+
+            self.assertEqual(job.models_used(), [PRIMARY, SECOND, THIRD])
+            self.assertTrue((ds / "falta_000.txt").exists(), "o terceiro tinha de salvar")
+            self.assertTrue((ds / "falta_000.jpg").exists(), "nada devia sair do dataset")
+
+    def test_the_cascade_stops_as_soon_as_nothing_is_missing(self):
+        """Cada passe extra é uma varredura paga sobre o dataset inteiro."""
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=2, uncaptioned=2)
+            job = _FakeJob({SECOND: {"falta_000.jpg", "falta_001.jpg"}})
+            _run(ds, job)
+            self.assertEqual(job.models_used(), [PRIMARY, SECOND],
+                             "o terceiro modelo não tinha trabalho")
+
+    def test_the_flag_records_the_primary_that_actually_ran(self):
+        """O arquivo diz de quem é a recusa. Gravar um id fixo enquanto a ordem
+        muda com o modo transformaria o registro em mentira."""
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=1, uncaptioned=1)
+            second_of_lora = caption_models("lora")[1]
+            _run(ds, _FakeJob({second_of_lora: {"falta_000.jpg"}}), mode="lora")
+            written = json.loads((ds / captioner.FLAGGED_FILE).read_text())
+            self.assertEqual(written["model"], caption_models("lora")[0])
+
+
+class TestConcurrency(unittest.TestCase):
+    def test_the_command_asks_for_many_parallel_calls(self):
+        """Mil imagens em fila serial é o que faz a fase de caption ser a mais
+        lenta do treino."""
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=0, uncaptioned=1)
+            job = _FakeJob({PRIMARY: {"falta_000.jpg"}})
+            _run(ds, job)
+            cmd = job.commands[0]
+            self.assertIn("--grok_concurrency", cmd)
+            self.assertEqual(int(cmd[cmd.index("--grok_concurrency") + 1]),
+                             captioner.CAPTION_CONCURRENCY)
+            self.assertGreaterEqual(captioner.CAPTION_CONCURRENCY, 32)
