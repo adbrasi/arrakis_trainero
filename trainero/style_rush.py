@@ -129,6 +129,14 @@ def attempt_order(usable: list[Path]) -> list[str]:
     return order
 
 
+def _slot_index(name: str) -> int:
+    """The integer behind a `slot_007` name, or -1 when it is not one."""
+    try:
+        return int(name.rsplit("_", 1)[1])
+    except (IndexError, ValueError):
+        return -1
+
+
 def attempt_at(i: int, prompts: list[str], order: list[str]) -> dict:
     """The i-th attempt. Pure, unbounded, and the single definition of the
     pairing — the queue and the runner must not drift apart."""
@@ -289,10 +297,12 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
                     and (convert_dir / f"{name}.png").exists()
                     and (control_dir / f"{name}.png").exists())
 
-    totals["pairs"] = sum(1 for a in attempts if done(a["attempt"]))
-    # where the runner picks up: everything before this is already recorded
-    start = next((i for i, a in enumerate(attempts) if not done(a["attempt"])),
-                 len(attempts))
+    # Counted from the manifest, not from `attempts`. The runner walks past the
+    # end of that preview list whenever refusals make it, so pairs live at slot
+    # indices the list never reaches — counting there reported 51 pairs with 100
+    # on disk, and would have re-bought the difference.
+    totals["pairs"] = sum(1 for name in manifest["slots"] if done(name))
+    start = max((_slot_index(name) for name in manifest["slots"]), default=-1) + 1
     # what is still to buy. Guarded by `lock` from here on.
     budget = target - totals["pairs"]
 
@@ -322,6 +332,8 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
                 totals[k] += v
             manifest["slots"][name] = entry
             _save_manifest(convert_dir, manifest)
+
+    order_names = {Path(s).name for s in order}
 
     def note_refused(source: str) -> None:
         with lock:
@@ -438,7 +450,12 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
                 return "meta atingida"
             if attempted >= ceiling:
                 return f"o teto de {ceiling} tentativas pagas foi atingido"
-            if len(refused_now) >= len(order):
+            # Only refusals of images still IN this run's order count. The set
+            # loaded from the manifest is historical and content_flagged already
+            # removed those images from `order`, so comparing the two sizes
+            # compared different universes: 50 old refusals against 10 usable
+            # images ended a run that had not made a single call.
+            if len(refused_now & order_names) >= len(order_names):
                 return "todas as imagens utilizáveis foram recusadas"
         return ""
 

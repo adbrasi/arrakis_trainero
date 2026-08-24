@@ -490,3 +490,65 @@ class TestManifestShape(unittest.TestCase):
             result = build_convert_dataset(base, convert, "makima", _FakeJob(),
                                            generate=fake_generate, workers=1, target=3)
             self.assertEqual(result["pairs"], 3)
+
+
+class TestResumeAccounting(unittest.TestCase):
+    """A lista de plan_attempts e so um preview: o runner anda alem dela sempre
+    que recusas fazem isso acontecer. Contar por ela discordava do disco."""
+
+    def _heavy_refusal_run(self, td, target, generate):
+        root = Path(td)
+        base = root / "dataset"
+        base.mkdir(parents=True, exist_ok=True)
+        if not any(base.iterdir()):
+            from PIL import Image
+            for i in range(60):
+                Image.new("RGB", SOURCE_SIZE).save(base / f"img_{i:03d}.png")
+        return build_convert_dataset(base, root / "dataset_convert", "makima",
+                                     _FakeJob(), generate=generate, workers=1,
+                                     target=target)
+
+    @staticmethod
+    def _refuser(bad):
+        def gen(prompt, image_path, timeout=300.0):
+            if Path(image_path).name in bad:
+                raise RefusedError("moderacao recusou a imagem")
+            return _png_bytes(), 0.011
+        return gen
+
+    def test_a_resume_sees_every_pair_already_on_disk(self):
+        """Reportava 51 pares com 100 no disco, e teria recomprado a diferenca."""
+        bad = {f"img_{i:03d}.png" for i in range(50)}
+        with tempfile.TemporaryDirectory() as td:
+            first = self._heavy_refusal_run(td, 100, self._refuser(bad))
+            self.assertEqual(first["pairs"], 100)
+
+            calls = {"n": 0}
+
+            def counting(prompt, image_path, timeout=300.0):
+                calls["n"] += 1
+                return self._refuser(bad)(prompt, image_path)
+
+            second = self._heavy_refusal_run(td, 100, counting)
+            self.assertEqual(second["pairs"], 100, "perdeu pares que existem no disco")
+            self.assertEqual(calls["n"], 0, "recomprou par que ja estava pago")
+            on_disk = len(list((Path(td) / "dataset_convert").glob("slot_*.png")))
+            self.assertEqual(second["pairs"], on_disk)
+
+    def test_old_refusals_do_not_end_a_run_that_has_usable_images(self):
+        """content_flagged ja tira as recusadas do pool, entao comparar o
+        tamanho do historico com o do pool comparava universos diferentes:
+        50 recusas antigas contra 10 imagens boas encerravam o run com zero
+        chamadas."""
+        bad = {f"img_{i:03d}.png" for i in range(50)}
+        with tempfile.TemporaryDirectory() as td:
+            self._heavy_refusal_run(td, 100, self._refuser(bad))
+            calls = {"n": 0}
+
+            def counting(prompt, image_path, timeout=300.0):
+                calls["n"] += 1
+                return self._refuser(bad)(prompt, image_path)
+
+            third = self._heavy_refusal_run(td, 110, counting)
+            self.assertEqual(third["pairs"], 110, "parou com imagens boas de sobra")
+            self.assertEqual(calls["n"], 10, "tinha de comprar so a diferenca")
