@@ -13,6 +13,7 @@ archive-in-snapshot extraction, media+.txt pairing).
 from __future__ import annotations
 
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -301,6 +302,24 @@ def captions_map(dataset_dir: Path) -> dict[str, str]:
         if caption:
             out[f.name] = caption
     return out
+
+
+# Fixed so the sample prompt survives a resume. The sample is only worth looking
+# at because it is the same prompt at every epoch.
+SAMPLE_CAPTION_SEED = 8821
+
+
+def sample_caption(dataset_dir: Path) -> str:
+    """One caption from the dataset, to stand in as the sample prompt.
+
+    A caption from the dataset is the only prompt guaranteed to sit inside the
+    distribution being trained: it carries, by construction, whatever trigger
+    and vocabulary the dataset uses. Empty string when nothing has a caption.
+    """
+    captions = sorted(set(captions_map(Path(dataset_dir)).values()))
+    if not captions:
+        return ""
+    return random.Random(SAMPLE_CAPTION_SEED).choice(captions)
 
 
 #: built FROM the positive dataset, so they cannot outlive it

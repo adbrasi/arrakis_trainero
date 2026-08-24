@@ -488,3 +488,56 @@ class TestEnginePull(unittest.TestCase):
 
             self.assertTrue(any("pull" in ln.lower() for ln in lines),
                             "o dono tem de ver que o clone ficou velho")
+
+
+class TestSampleCaption(unittest.TestCase):
+    """O sample só serve porque é o mesmo prompt a cada época. Uma escolha que
+    mudasse entre resumes jogaria fora a comparação que ele existe para dar."""
+
+    def _ds(self, root, captions):
+        ds = root / "dataset"
+        ds.mkdir(parents=True, exist_ok=True)
+        for i, cap in enumerate(captions):
+            (ds / f"img_{i:03d}.png").write_bytes(b"x")
+            (ds / f"img_{i:03d}.txt").write_text(cap, encoding="utf-8")
+        return ds
+
+    def test_it_returns_a_caption_from_the_dataset(self):
+        import tempfile
+        from pathlib import Path as P
+
+        from trainero.dataset import sample_caption
+
+        with tempfile.TemporaryDirectory() as td:
+            ds = self._ds(P(td), ["mkstyle, uma", "mkstyle, duas", "mkstyle, tres"])
+            self.assertIn(sample_caption(ds),
+                          {"mkstyle, uma", "mkstyle, duas", "mkstyle, tres"})
+
+    def test_it_is_deterministic(self):
+        import tempfile
+        from pathlib import Path as P
+
+        from trainero.dataset import sample_caption
+
+        with tempfile.TemporaryDirectory() as td:
+            ds = self._ds(P(td), [f"cap {i}" for i in range(20)])
+            self.assertEqual(sample_caption(ds), sample_caption(ds))
+
+    def test_an_uncaptioned_dataset_gives_an_empty_string(self):
+        import tempfile
+        from pathlib import Path as P
+
+        from trainero.dataset import sample_caption
+
+        with tempfile.TemporaryDirectory() as td:
+            ds = P(td) / "dataset"
+            ds.mkdir(parents=True)
+            (ds / "img_000.png").write_bytes(b"x")
+            self.assertEqual(sample_caption(ds), "")
+
+    def test_the_training_falls_back_to_it_only_without_a_trigger(self):
+        from pathlib import Path as P
+
+        src = (P(__file__).resolve().parent.parent / "trainero" / "training.py").read_text()
+        self.assertIn("ds.sample_caption(dataset_dir)", src)
+        self.assertIn("not trigger.strip()", src)

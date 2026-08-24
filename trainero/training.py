@@ -808,9 +808,20 @@ def run_training(job: Job, params: dict) -> None:
         if model["media"] == "video":
             frames = int(ltx_cfg["resolution"].split("x")[2]) if engine == "musubi-ltx" \
                 else (model.get("video_dataset", {}).get("max_frames") or 81)
+        # Without a trigger word the generic prompt exercises nothing: it renders
+        # the base model, and the owner watches a sample that would look exactly
+        # the same with no LoRA loaded. A dataset that arrived already captioned
+        # never passes through the screen that asks for a trigger, so this is the
+        # normal case, not the edge one.
+        prompt_text = overrides.get("sample_prompt")
+        if not prompt_text and not trigger.strip():
+            prompt_text = ds.sample_caption(dataset_dir)
+            if prompt_text:
+                job.log(f"Sem trigger word — o sample usa uma caption do dataset: "
+                        f"{prompt_text[:80]}")
         sample_path = write_sample_prompts(
             pdir / "sample_prompts.txt",
-            overrides.get("sample_prompt") or SAMPLE_PROMPT,
+            prompt_text or SAMPLE_PROMPT,
             trigger, resolution, frames, extra=model.get("sample_args"))
         job.log(f"Samples a cada época: {sample_path}")
     elif overrides.get("sampling", True):
