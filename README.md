@@ -115,7 +115,7 @@ de imagem e começa pela trigger word; dá para trocar no painel ⚙.
 |---|---|---|
 | `CAPTION_MODELS` | por modo | sobrescreve a cascata inteira, separada por vírgula |
 | `CAPTION_CONCURRENCY` | 64 | chamadas paralelas na captionagem |
-| `CAPTION_REASONING_EFFORT` | `none` | raciocínio do modelo de caption. Lido pelo tagger, não por este repo |
+| `CAPTION_REASONING_EFFORT` | `minimal` | raciocínio do modelo de caption. Lido pelo tagger, não por este repo |
 | `CONVERT_WORKERS` | 8 | chamadas paralelas ao gpt-image-2 no Style Rush |
 
 A cascata de caption é uma lista ordenada e a ordem muda com o modo. No LoRA
@@ -123,7 +123,8 @@ normal ela começa pelo modelo mais barato; no Style Rush começa pelo Gemini,
 porque é a recusa dele que marca quais imagens o gpt-image-2 também vai recusar
 — e lá uma recusa custa um slot pago.
 
-`CAPTION_REASONING_EFFORT` fica em `none` porque os tiers de effort do
-OpenRouter são fração do `max_tokens`, e o tagger não manda `max_tokens` (um
-teto trunca a caption no meio). Sem teto, `low` não segura nada: um modelo de
-raciocínio chegou a gastar 65k tokens numa caption só.
+`CAPTION_REASONING_EFFORT` fica em `minimal`, o menor tier que o OpenRouter
+documenta. Os tiers são fração do `max_tokens` e o tagger não manda
+`max_tokens` de propósito (um teto trunca a caption no meio), então se o gasto
+continuar alto o próximo passo é `none`, que desliga o orçamento de raciocínio
+em vez de encolhê-lo.

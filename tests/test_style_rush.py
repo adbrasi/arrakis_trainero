@@ -77,7 +77,9 @@ class TestPlanAttempts(unittest.TestCase):
         return [Path(f"/ds/img_{i:03d}.png") for i in range(n)]
 
     def test_the_queue_is_long_enough_to_absorb_refusals(self):
-        """Uma fila do tamanho da meta morre no primeiro item recusado."""
+        """Uma fila do tamanho da meta morre no primeiro item recusado, e uma
+        medida só pela meta encolhe em tentativas reais quanto mais o dataset
+        for recusado — cada pulo grátis comeria uma posição."""
         attempts = plan_attempts(self._imgs(10), load_style_prompts(), 20)
         self.assertEqual(len(attempts), 20 * ATTEMPT_MULTIPLIER)
 
@@ -233,7 +235,10 @@ class TestBuildConvertDataset(unittest.TestCase):
 
     def test_a_short_run_says_so_out_loud(self):
         """Truncar em silencio e o defeito original. Se a meta nao bate, o log
-        tem de dizer quanto faltou."""
+        tem de dizer quanto faltou e por que parou.
+
+        A falha aqui nao e recusa: um arquivo ilegivel nao tira a imagem do
+        pool, entao o que encerra o run e o teto de tentativas pagas."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             base = _make_dataset(root, 4)
@@ -242,7 +247,7 @@ class TestBuildConvertDataset(unittest.TestCase):
 
             def fake_generate(prompt, image_path, timeout=300.0):
                 if Path(image_path).name != "img_000.png":
-                    raise RefusedError("moderacao recusou a imagem")
+                    raise OSError("arquivo ilegivel")
                 return _png_bytes(), 0.011
 
             result = build_convert_dataset(base, convert, "makima", job,
@@ -250,8 +255,9 @@ class TestBuildConvertDataset(unittest.TestCase):
                                            target=self.TARGET)
 
             self.assertLess(result["pairs"], self.TARGET)
-            self.assertTrue(any("meta" in ln.lower() for ln in job.lines),
-                            "o log tem de dizer que o dataset saiu curto")
+            short = [ln for ln in job.lines if "meta de" in ln]
+            self.assertTrue(short, "o log tem de dizer que o dataset saiu curto")
+            self.assertIn("teto", short[0], "tem de dizer QUAL limite encerrou o run")
 
     def test_control_is_the_generated_image_and_target_is_the_original(self):
         """Trocar os dois ensina o LoRA a conversao inversa — um treino inteiro
@@ -356,3 +362,100 @@ class TestBuildConvertDataset(unittest.TestCase):
 
     def test_the_default_target_is_a_hundred(self):
         self.assertEqual(DEFAULT_CONVERT_TARGET, 100)
+
+
+class TestPaidAttemptCeiling(unittest.TestCase):
+    """O teto e sobre dinheiro gasto, nao sobre posicoes de fila."""
+
+    def test_a_free_skip_does_not_bring_the_run_closer_to_giving_up(self):
+        """Com quase tudo recusado, a unica imagem boa tem de ser usada ate a
+        meta bater — antes o run parava com credito de sobra."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = _make_dataset(root, 4)
+            convert = root / "dataset_convert"
+            calls = {"n": 0}
+
+            def fake_generate(prompt, image_path, timeout=300.0):
+                calls["n"] += 1
+                if Path(image_path).name != "img_000.png":
+                    raise RefusedError("moderacao recusou a imagem")
+                return _png_bytes(), 0.011
+
+            result = build_convert_dataset(base, convert, "makima", _FakeJob(),
+                                           generate=fake_generate, workers=1, target=10)
+            self.assertEqual(result["pairs"], 10)
+
+    def test_the_ceiling_still_ends_a_hopeless_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = _make_dataset(root, 5)
+            convert = root / "dataset_convert"
+            calls = {"n": 0}
+
+            def fake_generate(prompt, image_path, timeout=300.0):
+                calls["n"] += 1
+                raise RefusedError("moderacao recusou a imagem")
+
+            from trainero.jobs import JobFailed
+
+            with self.assertRaises(JobFailed):
+                build_convert_dataset(base, convert, "makima", _FakeJob(),
+                                      generate=fake_generate, workers=1, target=10)
+            self.assertLessEqual(calls["n"], 10 * ATTEMPT_MULTIPLIER)
+
+    def test_the_short_run_log_counts_real_api_calls(self):
+        """A mensagem contava posicoes de fila e exagerava em 3x."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = _make_dataset(root, 3)
+            convert = root / "dataset_convert"
+            calls = {"n": 0}
+
+            def fake_generate(prompt, image_path, timeout=300.0):
+                calls["n"] += 1
+                if Path(image_path).name == "img_000.png":
+                    return _png_bytes(), 0.011
+                raise RefusedError("moderacao recusou a imagem")
+
+            job = _FakeJob()
+            build_convert_dataset(base, convert, "makima", job,
+                                  generate=fake_generate, workers=1, target=4)
+            # a meta bate aqui; o que importa e que nenhum log invente tentativas
+            for line in job.lines:
+                if "chamadas à API" in line:
+                    self.assertIn(f"{calls['n']} chamadas", line)
+
+
+class TestManifestShape(unittest.TestCase):
+    def test_a_manifest_without_slots_does_not_kill_the_phase(self):
+        """Um .style_rush.json de uma versao antiga, ou tocado a mao, parseia
+        mas nao tem 'slots' — e derrubava a fase inteira com KeyError."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = _make_dataset(root, 5)
+            convert = root / "dataset_convert"
+            convert.mkdir(parents=True)
+            (convert / MANIFEST_NAME).write_text("{}")
+
+            def fake_generate(prompt, image_path, timeout=300.0):
+                return _png_bytes(), 0.011
+
+            result = build_convert_dataset(base, convert, "makima", _FakeJob(),
+                                           generate=fake_generate, workers=1, target=3)
+            self.assertEqual(result["pairs"], 3)
+
+    def test_a_manifest_that_is_not_even_a_mapping_is_survived(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base = _make_dataset(root, 5)
+            convert = root / "dataset_convert"
+            convert.mkdir(parents=True)
+            (convert / MANIFEST_NAME).write_text("[1, 2, 3]")
+
+            def fake_generate(prompt, image_path, timeout=300.0):
+                return _png_bytes(), 0.011
+
+            result = build_convert_dataset(base, convert, "makima", _FakeJob(),
+                                           generate=fake_generate, workers=1, target=3)
+            self.assertEqual(result["pairs"], 3)

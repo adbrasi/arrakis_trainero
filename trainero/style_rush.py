@@ -92,6 +92,16 @@ def plan_attempts(images: list[Path], prompts: list[str], target: int,
     list wraps, the pairing shifts by one image. Without it the queue would
     repeat the exact (prompt, source) pair it already spent an attempt on.
 
+    This returns the first `target * ATTEMPT_MULTIPLIER` entries, which is what
+    a caller wants to inspect. The runner does NOT stop when this list ends: a
+    queue of fixed length is the wrong terminator, because an entry whose source
+    turns out to be refused is skipped for free and still eats a position. With
+    one usable image in four, only a quarter of the positions can ever succeed,
+    so the run gave up two pairs short with credit to spare. The runner walks
+    `attempt_at` instead and stops on the three conditions that are actually
+    true: the target is met, the paid-attempt ceiling is reached, or every
+    usable image has been refused.
+
     Selection is deterministic so a resumed run rebuilds the same queue.
 
     `avoid` holds file names a content filter has already objected to — the
@@ -107,14 +117,24 @@ def plan_attempts(images: list[Path], prompts: list[str], target: int,
             f"todas as {len(images)} imagens do dataset já foram recusadas por "
             f"filtro de conteúdo — não há o que mandar para o gpt-image-2")
 
-    order = sorted(str(p) for p in usable)
-    rng = random.Random(PLAN_SEED)
-    rng.shuffle(order)
-
-    return [{"attempt": f"slot_{i:03d}",
-             "prompt": prompts[i % len(prompts)],
-             "source": order[(i + i // len(prompts)) % len(order)]}
+    order = attempt_order(usable)
+    return [attempt_at(i, prompts, order)
             for i in range(target * ATTEMPT_MULTIPLIER)]
+
+
+def attempt_order(usable: list[Path]) -> list[str]:
+    """The deterministic image order every attempt index is resolved against."""
+    order = sorted(str(p) for p in usable)
+    random.Random(PLAN_SEED).shuffle(order)
+    return order
+
+
+def attempt_at(i: int, prompts: list[str], order: list[str]) -> dict:
+    """The i-th attempt. Pure, unbounded, and the single definition of the
+    pairing — the queue and the runner must not drift apart."""
+    return {"attempt": f"slot_{i:03d}",
+            "prompt": prompts[i % len(prompts)],
+            "source": order[(i + i // len(prompts)) % len(order)]}
 
 
 MANIFEST_NAME = ".style_rush.json"
@@ -146,10 +166,22 @@ def content_flagged(base_dir: Path, convert_dir: Path) -> set[str]:
 
 
 def _load_manifest(convert_dir: Path) -> dict:
+    """The manifest, always with a usable "slots" mapping.
+
+    A file that fails to parse is caught below, but one that parses into
+    anything without "slots" — `{}`, or a manifest from an older shape — used
+    to reach `manifest["slots"]` and kill the phase with a KeyError. Every
+    caller assumes the key, so it is guaranteed here rather than at each use.
+    """
     try:
-        return json.loads((convert_dir / MANIFEST_NAME).read_text())
+        manifest = json.loads((convert_dir / MANIFEST_NAME).read_text())
     except (OSError, json.JSONDecodeError):
-        return {"slots": {}}
+        manifest = {}
+    if not isinstance(manifest, dict):
+        manifest = {}
+    if not isinstance(manifest.get("slots"), dict):
+        manifest["slots"] = {}
+    return manifest
 
 
 def _save_manifest(convert_dir: Path, manifest: dict) -> None:
@@ -230,9 +262,13 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
         job.log(f"{len(avoid)} imagens fora da conversão por recusa de filtro de "
                 f"conteúdo (o gpt-image-2 recusaria de novo, cobrando a tentativa).")
     try:
-        attempts = plan_attempts(images, load_style_prompts(), target, avoid=avoid)
+        prompts = load_style_prompts()
+        # validates the dataset and gives the run its image order; the runner
+        # walks attempt_at past the end of this list when it needs to
+        attempts = plan_attempts(images, prompts, target, avoid=avoid)
     except (ValueError, FileNotFoundError) as exc:
         raise JobFailed(str(exc))
+    order = attempt_order([p for p in images if p.name not in avoid])
 
     control_dir = convert_dir / "control"
     control_dir.mkdir(parents=True, exist_ok=True)
@@ -241,6 +277,11 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
 
     lock = threading.Lock()
     totals = {"pairs": 0, "refused": 0, "failed": 0, "cost": 0.0}
+    # Real API calls. Distinct from the queue length: an entry whose source is
+    # already refused is skipped for free, and reporting those as "attempts"
+    # overstates what happened by whatever the refusal rate is.
+    attempted = 0
+    ceiling = target * ATTEMPT_MULTIPLIER
 
     def done(name: str) -> bool:
         entry = manifest["slots"].get(name)
@@ -248,8 +289,10 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
                     and (convert_dir / f"{name}.png").exists()
                     and (control_dir / f"{name}.png").exists())
 
-    pending = [a for a in attempts if not done(a["attempt"])]
-    totals["pairs"] = len(attempts) - len(pending)
+    totals["pairs"] = sum(1 for a in attempts if done(a["attempt"]))
+    # where the runner picks up: everything before this is already recorded
+    start = next((i for i, a in enumerate(attempts) if not done(a["attempt"])),
+                 len(attempts))
     # what is still to buy. Guarded by `lock` from here on.
     budget = target - totals["pairs"]
 
@@ -304,6 +347,19 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
         with lock:
             budget += 1
 
+    def spend() -> bool:
+        """Count one real API call, or refuse it because the ceiling is reached.
+
+        The ceiling is on money spent, not on queue positions: a skipped entry
+        costs nothing and must not bring the run closer to giving up.
+        """
+        nonlocal attempted
+        with lock:
+            if attempted >= ceiling:
+                return False
+            attempted += 1
+            return True
+
     # ThreadPoolExecutor.map keeps dispatching after a task raises — the error
     # only surfaces when the results are consumed. Without this the whole queue
     # still runs, and a dead account is asked hundreds more times.
@@ -319,6 +375,9 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
                 return
         if not claim():
             return                      # the target is already met
+        if not spend():
+            release()                   # the paid-attempt ceiling is the real end
+            return
         try:
             png, cost = _generate_with_retries(generate, attempt["prompt"], Path(source))
         except imagegen.AccountError as exc:
@@ -366,9 +425,32 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
         record(name, {"status": "ok", "prompt": attempt["prompt"], "source": source,
                       "cost": cost}, pairs=1, cost=cost)
 
+    def exhausted() -> str:
+        """Empty while there is still work worth dispatching, else why not.
+
+        These three are the real ends of the run. Stopping because a
+        precomputed list ran out is not one of them: a refused source is
+        skipped for free, so a fixed-length queue runs out of positions long
+        before it runs out of budget whenever most of the dataset is refused.
+        """
+        with lock:
+            if budget <= 0:
+                return "meta atingida"
+            if attempted >= ceiling:
+                return f"o teto de {ceiling} tentativas pagas foi atingido"
+            if len(refused_now) >= len(order):
+                return "todas as imagens utilizáveis foram recusadas"
+        return ""
+
     if budget > 0:
+        wave_size = max(1, workers) * 4
+        index = start
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            list(pool.map(work, pending))
+            while not exhausted() and not account_dead:
+                wave = [attempt_at(i, prompts, order)
+                        for i in range(index, index + wave_size)]
+                index += wave_size
+                list(pool.map(work, [a for a in wave if not done(a["attempt"])]))
         if account_dead:
             _save_manifest(convert_dir, manifest)
             raise JobFailed(
@@ -381,9 +463,14 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
             "falharam. Sem ele o LoRA não aprende a converter estilo.")
 
     if totals["pairs"] < target:
-        job.log(f"⚠ meta de {target} pares não atingida: {totals['pairs']} prontos depois "
-                f"de {len(pending)} tentativas. {len(refused_now)} imagens do dataset "
-                f"foram recusadas por moderação.")
+        usable = len(images) - len(refused_now)
+        # Which limit was hit changes what the owner should do: a spent ceiling
+        # means try again, an exhausted queue with images left means the dataset
+        # is too small for this target.
+        job.log(f"⚠ meta de {target} pares não atingida: {totals['pairs']} prontos depois de "
+                f"{attempted} chamadas à API — {exhausted() or 'sem mais tentativas'}. "
+                f"{len(refused_now)} das {len(images)} imagens foram recusadas por "
+                f"moderação, restam {usable} utilizáveis.")
 
     job.log(f"✔ Dataset de conversão: {totals['pairs']} pares, "
             f"{totals['refused']} recusas, custo ~${totals['cost']:.2f}")
