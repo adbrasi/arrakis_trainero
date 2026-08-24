@@ -108,3 +108,22 @@ de imagem e começa pela trigger word; dá para trocar no painel ⚙.
 |---|---|
 | `HF_TOKEN` | repo + upload de checkpoints (privado por default), download de modelos gated (FLUX.2) |
 | `OPENROUTER_API_KEY` | captions via LLM |
+
+### Ajustes opcionais
+
+| Env | Default | Para quê |
+|---|---|---|
+| `CAPTION_MODELS` | por modo | sobrescreve a cascata inteira, separada por vírgula |
+| `CAPTION_CONCURRENCY` | 64 | chamadas paralelas na captionagem |
+| `CAPTION_REASONING_EFFORT` | `none` | raciocínio do modelo de caption. Lido pelo tagger, não por este repo |
+| `CONVERT_WORKERS` | 8 | chamadas paralelas ao gpt-image-2 no Style Rush |
+
+A cascata de caption é uma lista ordenada e a ordem muda com o modo. No LoRA
+normal ela começa pelo modelo mais barato; no Style Rush começa pelo Gemini,
+porque é a recusa dele que marca quais imagens o gpt-image-2 também vai recusar
+— e lá uma recusa custa um slot pago.
+
+`CAPTION_REASONING_EFFORT` fica em `none` porque os tiers de effort do
+OpenRouter são fração do `max_tokens`, e o tagger não manda `max_tokens` (um
+teto trunca a caption no meio). Sem teto, `low` não segura nada: um modelo de
+raciocínio chegou a gastar 65k tokens numa caption só.
