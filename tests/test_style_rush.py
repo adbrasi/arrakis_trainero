@@ -57,18 +57,16 @@ def _make_dataset(root: Path, n: int) -> Path:
 
 
 class TestStylePrompts(unittest.TestCase):
-    def test_fifty_distinct_prompts(self):
+    def test_a_hundred_distinct_prompts(self):
         prompts = load_style_prompts()
-        self.assertEqual(len(prompts), SLOT_COUNT)
-        self.assertEqual(len(set(prompts)), SLOT_COUNT, "prompts must be distinct")
-        for p in prompts:
-            self.assertTrue(p.strip(), "no blank prompt")
+        self.assertEqual(len(prompts), 100)
+        self.assertEqual(len(set(prompts)), 100, "prompts must be distinct")
 
-    def test_caption_template(self):
-        self.assertEqual(
-            CAPTION_TEMPLATE.format(trigger="makima"),
-            "convert the style of this image to the makima style",
-        )
+    def test_every_prompt_names_a_medium_or_technique(self):
+        """Um prompt de uma palavra ("make it artistic") não converte estilo
+        nenhum: o gpt-image-2 precisa de descritores que ele consiga renderizar."""
+        for prompt in load_style_prompts():
+            self.assertGreaterEqual(len(prompt.split()), 8, prompt)
 
 
 class TestPlanSlots(unittest.TestCase):

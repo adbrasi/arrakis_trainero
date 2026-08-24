@@ -53,16 +53,20 @@ RESTORE_MULTIPLIER = 1.0
 
 
 def load_style_prompts(path: Path | None = None) -> list[str]:
-    """The style prompts, one per line. Blank lines and '#' comments ignored."""
+    """The style prompts, one per line. Blank lines and '#' comments ignored.
+
+    No minimum count and no truncation: the attempt queue cycles the list, so
+    any number of prompts serves any target.
+    """
     src = path or PROMPTS_FILE
     try:
         lines = src.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
         raise FileNotFoundError(f"style prompts file missing: {src}") from exc
     prompts = [ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")]
-    if len(prompts) < SLOT_COUNT:
-        raise ValueError(f"{src} has {len(prompts)} prompts, need {SLOT_COUNT}")
-    return prompts[:SLOT_COUNT]
+    if not prompts:
+        raise ValueError(f"{src} não tem nenhum prompt de estilo")
+    return prompts
 
 
 def plan_slots(images: list[Path], prompts: list[str],

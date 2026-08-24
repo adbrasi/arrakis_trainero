@@ -48,3 +48,53 @@ convert the art style of this artwork to sepia vintage engraving, fine etched li
 convert the art style of this artwork to graffiti spray paint on concrete wall, drips, stencil edges, urban texture.
 convert the art style of this artwork to tattoo flash art, bold outlines, limited ink palette, traditional shading.
 convert the art style of this artwork to soft blurred pastel dream, glowing bloom, low contrast, hazy diffuse light.
+convert the art style of this artwork to linocut relief print, bold gouged carving marks, uneven hand-pressed ink, coarse absorbent paper.
+convert the art style of this artwork to scratchboard illustration, white lines scratched out of solid black, fine engraved hatching, no soft edges.
+convert the art style of this artwork to soft chalk pastel on sanded toned paper, velvety blended pigment, dusty smudged edges, visible paper tooth.
+convert the art style of this artwork to egg tempera panel painting, fine cross-hatched brush strokes, gold leaf ground, cracked gesso surface.
+convert the art style of this artwork to fresco mural on lime plaster, chalky matte pigment, flaked and worn patches, plaster seams.
+convert the art style of this artwork to encaustic wax painting, translucent molten beeswax layers, fused tool marks, thick built-up surface.
+convert the art style of this artwork to stone mosaic assembled from small tesserae, visible grout gaps, irregular chipped tile edges.
+convert the art style of this artwork to hand embroidery on linen, satin and chain stitches, visible thread sheen, puckered fabric.
+convert the art style of this artwork to carved white marble sculpture, polished neoclassical stone, visible chisel facets, veined marble.
+convert the art style of this artwork to impressionist plein air oil sketch, short broken dabs of unblended pigment, soft dissolved edges.
+convert the art style of this artwork to pointillist painting, thousands of separate tiny dots of pure pigment, no blended brush strokes.
+convert the art style of this artwork to cubist painting, fragmented geometric planes, multiple simultaneous viewpoints, faceted flattened forms.
+convert the art style of this artwork to medieval illuminated manuscript on vellum, gold leaf, flat stylized figures, ornate decorated border.
+convert the art style of this artwork to byzantine icon panel, flat gold ground, elongated stylized figures, egg tempera on wood.
+convert the art style of this artwork to ancient egyptian tomb wall painting, flat profile figures, banded registers, limestone wall texture.
+convert the art style of this artwork to greek black-figure vase painting, black silhouettes on terracotta, incised interior detail, curved vessel surface.
+convert the art style of this artwork to persian miniature painting, flat stacked perspective, ornate gold detail, tiny precise brushwork.
+convert the art style of this artwork to chinese gongbi painting on silk, meticulous fine outlines, delicate layered washes, restrained detail.
+convert the art style of this artwork to risograph print, two spot inks, misregistered layers, grainy soy-ink texture, blotchy coverage.
+convert the art style of this artwork to pop art screenprint, posterized flat spot-color separations, coarse registration offset, hard-edged blocks.
+convert the art style of this artwork to technical blueprint drafting, white line work on blueprint stock, dimension lines, hatch fills, drafted curves.
+convert the art style of this artwork to mezzotint print, velvety dark tonal fields scraped and burnished from a plate, no drawn outlines.
+convert the art style of this artwork to art nouveau ornamental poster, whiplash curves, flat decorative panels, patterned framing border.
+convert the art style of this artwork to constructivist agitprop poster, hard geometric shapes, sharp diagonal composition, blocky sans-serif type slabs.
+convert the art style of this artwork to art deco travel poster, streamlined stylized forms, symmetrical geometry, flat stepped tonal bands.
+convert the art style of this artwork to hand-colored botanical plate, precise scientific outline, stipple shading, latin label lettering, aged plate paper.
+convert the art style of this artwork to rider-waite tarot card art, thick flat outlines, symbolic emblems, decorative frame border, printed card stock.
+convert the art style of this artwork to photocopied punk zine art, blown-out high contrast xerox, toner streaks, degraded copy-of-a-copy grain.
+convert the art style of this artwork to 1950s newspaper sunday comic strip, coarse offset dot rosettes, off-register plates, yellowed newsprint fibers.
+convert the art style of this artwork to playstation 1 era 3d game graphics, warping low-res textures, jittering vertex edges, chunky faceted polygons.
+convert the art style of this artwork to 1-bit dithered monochrome pixel art, bayer dither patterns, early macintosh screen look, no greys.
+convert the art style of this artwork to voxel art, cubic blocks, stair-stepped blocky volumes, toy-like modular construction.
+convert the art style of this artwork to untextured wireframe render, visible polygon topology, thin edge lines over flat grey shading.
+convert the art style of this artwork to early 1990s CGI render, gouraud shaded plastic surfaces, chrome reflective materials, raytraced checkerboard floor.
+convert the art style of this artwork to ASCII text art, image rebuilt entirely from monospaced characters, terminal typeface, character grid alignment.
+convert the art style of this artwork to pen plotter drawing, single-weight continuous ink lines, mechanical hatching, plotted paths on plain paper.
+convert the art style of this artwork to MS Paint mouse drawing, jagged aliased edges, flood-fill bucket blobs, default 16-color palette, clumsy shapes.
+convert the art style of this artwork to early 2000s flash web cartoon, thin uniform vector outlines, simple tween-ready flat shapes, minimal detail.
+convert the art style of this artwork to rotoscoped animation, traced photographic contours, flattened posterized regions, wobbling boiling linework.
+convert the art style of this artwork to 1930s rubber hose cartoon, noodle limbs, pie-cut eyes, inky black-and-white with film flicker.
+convert the art style of this artwork to UPA mid-century limited animation, flat abstracted angular shapes, textured paper backgrounds, sparse detail.
+convert the art style of this artwork to underground comix, obsessive wobbling crosshatch, bigfoot cartooning, cheap offset printing on pulp paper.
+convert the art style of this artwork to cut-paper shadow puppet theatre, solid black silhouette figures, articulated joints, translucent screen backdrop.
+convert the art style of this artwork to animation production genga sheet, rough graphite key drawing, red and blue color-pencil correction marks, punched paper.
+convert the art style of this artwork to 1970s shoujo manga, delicate thin lineart, floral screentone, feathered hair, oversized sparkling eyes.
+convert the art style of this artwork to a build made of plastic toy bricks, studded modular blocks, glossy injection-molded surfaces, stepped edges.
+convert the art style of this artwork to white chalk drawing on a black slate blackboard, dusty smudged strokes, chalk dust, hand-scrawled lines.
+convert the art style of this artwork to ballpoint pen doodle on lined notebook paper, biro crosshatch, ink blotches, printed rule lines showing through.
+convert the art style of this artwork to batik textile, wax-resist dye fields, fine crackle veins, woven cloth weave texture.
+convert the art style of this artwork to mehndi henna ornament, dense paisley and lattice linework, single reddish-brown stain, no shading.
