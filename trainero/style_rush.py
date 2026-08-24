@@ -12,15 +12,17 @@ original, so every pair teaches "bad input -> the owner's image":
                artefacts an upscaler or generator leaves behind. Reverse
                engineering: teach the repair by manufacturing the damage.
 
-Conversion costs API money per image; restoration is local CPU and free, which
-is why it takes the larger slot count. Both slot counts are fixed. A dataset
-smaller than its slot count simply reuses its images — conversion always under
-a different style prompt, restoration always under a different grit seed.
+Conversion costs API money per image; restoration is local CPU and free. The
+conversion half stops when it has DEFAULT_CONVERT_TARGET *successes*, not when
+it has tried that many times: a refusal costs an attempt, never a pair. A
+dataset smaller than the target simply reuses its images — conversion always
+under a different style prompt, restoration always under a different grit seed.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import random
 import shutil
 import threading
@@ -32,7 +34,15 @@ from . import captioner, degrade, imagegen
 from .config import IMAGE_EXTS, REPO_DIR
 from .jobs import Cancelled, JobFailed
 
-SLOT_COUNT = 50
+# The conversion half stops when it has this many *successes*. A refusal used
+# to cost a pair; now it costs an attempt.
+DEFAULT_CONVERT_TARGET = 100
+# Enough queue to absorb refusals, and a hard end for a dataset where every
+# image is refused — otherwise the loop runs until the account is empty.
+ATTEMPT_MULTIPLIER = 3
+# gpt-image-2 calls are slow and independent. The budget reservation in
+# build_convert_dataset is what makes raising this safe.
+CONVERT_WORKERS = int(os.environ.get("CONVERT_WORKERS", "8"))
 CAPTION_TEMPLATE = "convert the style of this image to the {trigger} style"
 PROMPTS_FILE = REPO_DIR / "data" / "style_prompts.txt"
 
@@ -69,18 +79,24 @@ def load_style_prompts(path: Path | None = None) -> list[str]:
     return prompts
 
 
-def plan_slots(images: list[Path], prompts: list[str],
-               avoid: set[str] | None = None) -> list[dict]:
-    """One slot per prompt, each pointing at a primary image and a fallback.
+def plan_attempts(images: list[Path], prompts: list[str], target: int,
+                  avoid: set[str] | None = None) -> list[dict]:
+    """An ordered queue of (prompt, source) attempts, longer than the target.
 
-    The fallback is what the slot retries with when the primary is refused by
-    moderation; it is always a different image when the dataset has more than
-    one. Selection is deterministic so a resumed run rebuilds the same plan.
+    A queue the length of the target dies on its first refusal, which is the
+    bug this replaces. ATTEMPT_MULTIPLIER gives the run room to route around
+    refused images and, just as importantly, a place to stop: a dataset where
+    every image is refused ends here instead of spending the whole balance.
+
+    The image index carries an extra `i // len(prompts)` so that when the prompt
+    list wraps, the pairing shifts by one image. Without it the queue would
+    repeat the exact (prompt, source) pair it already spent an attempt on.
+
+    Selection is deterministic so a resumed run rebuilds the same queue.
 
     `avoid` holds file names a content filter has already objected to — the
-    strict caption model refused them, or gpt-image-2 itself did on an earlier
-    run. Feeding those back in buys another refusal at full price, so they are
-    excluded outright rather than merely deprioritised.
+    primary caption model refused them, or gpt-image-2 itself did on an earlier
+    run. Feeding those back in buys another refusal at full price.
     """
     if not images:
         raise ValueError("dataset base vazio — nada para converter")
@@ -90,19 +106,15 @@ def plan_slots(images: list[Path], prompts: list[str],
         raise ValueError(
             f"todas as {len(images)} imagens do dataset já foram recusadas por "
             f"filtro de conteúdo — não há o que mandar para o gpt-image-2")
-    pool = sorted(str(p) for p in usable)
+
+    order = sorted(str(p) for p in usable)
     rng = random.Random(PLAN_SEED)
-    order = list(pool)
     rng.shuffle(order)
 
-    slots = []
-    for i in range(SLOT_COUNT):
-        primary = order[i % len(order)]
-        sources = [primary]
-        if len(order) > 1:
-            sources.append(order[(i + 1) % len(order)])
-        slots.append({"slot": f"slot_{i:02d}", "prompt": prompts[i], "sources": sources})
-    return slots
+    return [{"attempt": f"slot_{i:03d}",
+             "prompt": prompts[i % len(prompts)],
+             "source": order[(i + i // len(prompts)) % len(order)]}
+            for i in range(target * ATTEMPT_MULTIPLIER)]
 
 
 MANIFEST_NAME = ".style_rush.json"
@@ -193,15 +205,21 @@ def fit_control_to_target(png: bytes, target: Path) -> bytes:
 
 
 def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
-                          generate=imagegen.generate, workers: int = 4) -> dict:
-    """Produce SLOT_COUNT (control, target, caption) triples under convert_dir.
+                          generate=imagegen.generate, workers: int = CONVERT_WORKERS,
+                          target: int = DEFAULT_CONVERT_TARGET) -> dict:
+    """Produce `target` (control, target, caption) triples under convert_dir.
 
     control/<slot>.png  the restyled image, cropped to the target's aspect ratio
     <slot>.png          an untouched copy of the source image (the target)
-    <slot>.txt          the same caption for every slot
+    <slot>.txt          the same caption for every pair
 
-    Slots already recorded as ok in the manifest are skipped, so a cancelled run
-    resumes without paying for them again.
+    The pair is named after the attempt that produced it, so the numbering has
+    gaps wherever an attempt was refused. Nothing downstream cares: musubi walks
+    the directory. Numbering by success count instead would mean two numbering
+    schemes living side by side, one for work and one for output.
+
+    Pairs already recorded as ok in the manifest count toward the target, so a
+    cancelled run resumes without paying for them again.
     """
     images = base_images(base_dir)
     if not images:
@@ -210,11 +228,12 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
     avoid = content_flagged(base_dir, convert_dir)
     if avoid:
         job.log(f"{len(avoid)} imagens fora da conversão por recusa de filtro de "
-                f"conteúdo (o gpt-image-2 recusaria de novo, cobrando o slot).")
+                f"conteúdo (o gpt-image-2 recusaria de novo, cobrando a tentativa).")
     try:
-        slots = plan_slots(images, load_style_prompts(), avoid=avoid)
-    except ValueError as exc:
+        attempts = plan_attempts(images, load_style_prompts(), target, avoid=avoid)
+    except (ValueError, FileNotFoundError) as exc:
         raise JobFailed(str(exc))
+
     control_dir = convert_dir / "control"
     control_dir.mkdir(parents=True, exist_ok=True)
     manifest = _load_manifest(convert_dir)
@@ -229,30 +248,32 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
                     and (convert_dir / f"{name}.png").exists()
                     and (control_dir / f"{name}.png").exists())
 
-    pending = [s for s in slots if not done(s["slot"])]
-    totals["pairs"] = len(slots) - len(pending)
+    pending = [a for a in attempts if not done(a["attempt"])]
+    totals["pairs"] = len(attempts) - len(pending)
+    # what is still to buy. Guarded by `lock` from here on.
+    budget = target - totals["pairs"]
 
     # the caption carries the trigger word, so a run with a changed trigger has
-    # to rewrite it even for slots it will not regenerate
-    for slot in slots:
-        if (convert_dir / f"{slot['slot']}.png").exists():
-            (convert_dir / f"{slot['slot']}.txt").write_text(caption, encoding="utf-8")
+    # to rewrite it even for pairs it will not regenerate
+    for existing in convert_dir.glob("slot_*.png"):
+        existing.with_suffix(".txt").write_text(caption, encoding="utf-8")
 
-    if pending:
-        job.log(f"Gerando {len(pending)} imagens de conversão com {imagegen.MODEL} "
-                f"(quality low) — ~${imagegen.COST_PER_IMAGE * len(pending):.2f}")
+    if budget > 0:
+        job.log(f"Gerando {budget} imagens de conversão com {imagegen.MODEL} "
+                f"(quality low, {workers} em paralelo) — "
+                f"~${imagegen.COST_PER_IMAGE * budget:.2f}")
     else:
-        job.log(f"Dataset de conversão já completo ({len(slots)} pares).")
+        job.log(f"Dataset de conversão já completo ({totals['pairs']} pares).")
 
-    # Refusals live per image, not per slot: the slot entry gets overwritten the
-    # moment its fallback image succeeds, which used to erase the only record
-    # that the primary image had been refused at all.
+    # Refusals live per image, not per attempt: with a target far above the
+    # dataset size the same picture is the source many times over, so without
+    # this every worker pays to rediscover the same no.
     refused_now: set[str] = set(manifest.get("refused_images", []))
 
     def record(name: str, entry: dict, **deltas) -> None:
-        """Persist one slot's outcome. The manifest is written on every slot, not
-        once at the end: a cancelled run (job.check_cancel raises) or a dead pod
-        would otherwise lose the record of images already paid for."""
+        """Persist one attempt's outcome. The manifest is written on every
+        attempt, not once at the end: a cancelled run (job.check_cancel raises)
+        or a dead pod would otherwise lose the record of images already paid."""
         with lock:
             for k, v in deltas.items():
                 totals[k] += v
@@ -265,86 +286,104 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
             manifest["refused_images"] = sorted(refused_now)
             _save_manifest(convert_dir, manifest)
 
+    def claim() -> bool:
+        """Take one slot of budget before spending money on it.
+
+        This is what makes the target exact. Without it, the N workers still in
+        flight when the last pair lands each go on to buy one more image."""
+        nonlocal budget
+        with lock:
+            if budget <= 0:
+                return False
+            budget -= 1
+            return True
+
+    def release() -> None:
+        """Give the budget back — this attempt produced no pair."""
+        nonlocal budget
+        with lock:
+            budget += 1
+
     # ThreadPoolExecutor.map keeps dispatching after a task raises — the error
-    # only surfaces when the results are consumed. Without this the whole plan
-    # still runs, and a dead account is asked 50 more times.
+    # only surfaces when the results are consumed. Without this the whole queue
+    # still runs, and a dead account is asked hundreds more times.
     account_dead: list[Exception] = []
 
-    def work(slot: dict) -> None:
+    def work(attempt: dict) -> None:
         if account_dead:
             return
         job.check_cancel()
-        name = slot["slot"]
-        refusals = 0
-        for source in slot["sources"]:  # primary, then the fallback image
-            # A refusal is a fact about the image, not about the slot. With 50
-            # slots over few images the same picture is the source many times
-            # over, so without this every worker pays to rediscover the same no.
+        name, source = attempt["attempt"], attempt["source"]
+        with lock:
             if Path(source).name in refused_now:
-                continue
-            try:
-                png, cost = _generate_with_retries(generate, slot["prompt"], Path(source))
-            except imagegen.AccountError as exc:
-                with lock:            # not this slot's problem — it ends the phase
-                    account_dead.append(exc)
                 return
-            except imagegen.RefusedError as exc:
-                refusals += 1
-                note_refused(source)
-                record(name, {"status": "refused", "prompt": slot["prompt"],
-                              "source": source, "error": str(exc)})
-                continue
-            except Cancelled:
-                raise
-            except Exception as exc:
-                # failed before the call was billed: one unreadable file (an
-                # .avif this Pillow cannot open) costs its own slot, never the
-                # phase
-                record(name, {"status": "failed", "prompt": slot["prompt"], "source": source,
-                              "error": f"{type(exc).__name__}: {exc}"},
-                       failed=1, refused=refusals)
-                job.log(f"⚠ {name}: {type(exc).__name__}: {exc}")
-                return
-
-            # billed from here on, so the cost is counted whatever happens next
-            try:
-                png = fit_control_to_target(png, Path(source))
-                (control_dir / f"{name}.png").write_bytes(png)
-                shutil.copyfile(source, convert_dir / f"{name}.png")
-                (convert_dir / f"{name}.txt").write_text(caption, encoding="utf-8")
-            except Cancelled:
-                raise
-            except Exception as exc:
-                record(name, {"status": "failed", "prompt": slot["prompt"], "source": source,
-                              "paid": True, "cost": cost,
-                              "error": f"{type(exc).__name__}: {exc}"},
-                       failed=1, refused=refusals, cost=cost)
-                job.log(f"⚠ {name}: imagem paga mas não gravada "
-                        f"({type(exc).__name__}: {exc}) — ${cost:.4f} perdidos")
-                return
-
-            record(name, {"status": "ok", "prompt": slot["prompt"], "source": source,
-                          "cost": cost},
-                   pairs=1, refused=refusals, cost=cost)
+        if not claim():
+            return                      # the target is already met
+        try:
+            png, cost = _generate_with_retries(generate, attempt["prompt"], Path(source))
+        except imagegen.AccountError as exc:
+            release()
+            with lock:            # not this attempt's problem — it ends the phase
+                account_dead.append(exc)
+            return
+        except imagegen.RefusedError as exc:
+            release()
+            note_refused(source)
+            record(name, {"status": "refused", "prompt": attempt["prompt"],
+                          "source": source, "error": str(exc)}, refused=1)
+            return
+        except Cancelled:
+            release()
+            raise
+        except Exception as exc:
+            # failed before the call was billed: one unreadable file (an .avif
+            # this Pillow cannot open) costs its own attempt, never the phase
+            release()
+            record(name, {"status": "failed", "prompt": attempt["prompt"], "source": source,
+                          "error": f"{type(exc).__name__}: {exc}"}, failed=1)
+            job.log(f"⚠ {name}: {type(exc).__name__}: {exc}")
             return
 
-        with lock:
-            totals["refused"] += refusals
-        job.log(f"⚠ {name}: recusado nas duas tentativas — slot descartado.")
+        # billed from here on, so the cost is counted whatever happens next
+        try:
+            png = fit_control_to_target(png, Path(source))
+            (control_dir / f"{name}.png").write_bytes(png)
+            shutil.copyfile(source, convert_dir / f"{name}.png")
+            (convert_dir / f"{name}.txt").write_text(caption, encoding="utf-8")
+        except Cancelled:
+            release()
+            raise
+        except Exception as exc:
+            release()               # paid, but there is no pair to show for it
+            record(name, {"status": "failed", "prompt": attempt["prompt"], "source": source,
+                          "paid": True, "cost": cost,
+                          "error": f"{type(exc).__name__}: {exc}"},
+                   failed=1, cost=cost)
+            job.log(f"⚠ {name}: imagem paga mas não gravada "
+                    f"({type(exc).__name__}: {exc}) — ${cost:.4f} perdidos")
+            return
 
-    if pending:
+        record(name, {"status": "ok", "prompt": attempt["prompt"], "source": source,
+                      "cost": cost}, pairs=1, cost=cost)
+
+    if budget > 0:
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             list(pool.map(work, pending))
         if account_dead:
             _save_manifest(convert_dir, manifest)
             raise JobFailed(
-                f"{account_dead[0]} — {totals['pairs']} de {len(slots)} pares prontos. "
+                f"{account_dead[0]} — {totals['pairs']} de {target} pares prontos. "
                 f"Resolva e rode de novo: o que já foi pago não é refeito.")
 
     if totals["pairs"] == 0:
         raise JobFailed(
             "o dataset de conversão ficou vazio — todas as imagens foram recusadas ou "
             "falharam. Sem ele o LoRA não aprende a converter estilo.")
+
+    if totals["pairs"] < target:
+        job.log(f"⚠ meta de {target} pares não atingida: {totals['pairs']} prontos depois "
+                f"de {len(pending)} tentativas. {len(refused_now)} imagens do dataset "
+                f"foram recusadas por moderação.")
 
     job.log(f"✔ Dataset de conversão: {totals['pairs']} pares, "
             f"{totals['refused']} recusas, custo ~${totals['cost']:.2f}")
@@ -359,10 +398,9 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
 def convert_sources(convert_dir: Path) -> set[str]:
     """The base images the conversion dataset actually consumed.
 
-    Read from the manifest rather than re-derived from plan_slots, because a
-    slot refused by moderation falls back to its second image — so the plan
-    says which images *might* have been used and only the manifest says which
-    ones were.
+    Read from the manifest rather than re-derived from plan_attempts, because
+    the queue is three times longer than the target — it says which images
+    *might* have been used, and only the manifest says which ones were.
     """
     manifest = _load_manifest(convert_dir)
     return {entry["source"] for entry in manifest.get("slots", {}).values()

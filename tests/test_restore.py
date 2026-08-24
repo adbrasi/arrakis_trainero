@@ -150,7 +150,7 @@ class TestContentFlagged(unittest.TestCase):
             {"model": "google/gemini-3.7-flash", "refused_by_primary": list(names)}))
 
     def test_images_the_caption_model_refused_stay_out_of_the_conversion(self):
-        from trainero.style_rush import content_flagged, load_style_prompts, plan_slots
+        from trainero.style_rush import content_flagged, load_style_prompts, plan_attempts
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -163,8 +163,8 @@ class TestContentFlagged(unittest.TestCase):
             avoid = content_flagged(base, convert)
             self.assertEqual(avoid, banned)
 
-            slots = plan_slots(_paths(base), load_style_prompts(), avoid=avoid)
-            used = {Path(s).name for slot in slots for s in slot["sources"]}
+            attempts = plan_attempts(_paths(base), load_style_prompts(), 50, avoid=avoid)
+            used = {Path(a["source"]).name for a in attempts}
             self.assertEqual(used & banned, set(),
                              "mandou para o gpt-image-2 uma imagem já barrada")
 
@@ -184,22 +184,22 @@ class TestContentFlagged(unittest.TestCase):
             self.assertEqual(content_flagged(base, convert), {img.name})
 
     def test_a_dataset_that_is_entirely_flagged_fails_instead_of_paying(self):
-        from trainero.style_rush import load_style_prompts, plan_slots
+        from trainero.style_rush import load_style_prompts, plan_attempts
 
         with tempfile.TemporaryDirectory() as td:
             base = _make_dataset(Path(td), 6)
             images = _paths(base)
             with self.assertRaises(ValueError):
-                plan_slots(images, load_style_prompts(),
-                           avoid={p.name for p in images})
+                plan_attempts(images, load_style_prompts(), 50,
+                              avoid={p.name for p in images})
 
     def test_no_flags_leaves_the_plan_untouched(self):
-        from trainero.style_rush import load_style_prompts, plan_slots
+        from trainero.style_rush import load_style_prompts, plan_attempts
 
         with tempfile.TemporaryDirectory() as td:
             images = _paths(_make_dataset(Path(td), 60))
-            self.assertEqual(plan_slots(images, load_style_prompts()),
-                             plan_slots(images, load_style_prompts(), avoid=set()))
+            self.assertEqual(plan_attempts(images, load_style_prompts(), 50),
+                             plan_attempts(images, load_style_prompts(), 50, avoid=set()))
 
 
 class TestConversionFailureModes(unittest.TestCase):

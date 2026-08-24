@@ -410,7 +410,7 @@ LORAPLUS_RATIO = 16  # owner's value in image_lora_arrakis
 # ---------------------------------------------------------------------------
 # Style Rush
 # ---------------------------------------------------------------------------
-# The synthetic conversion dataset is always SLOT_COUNT pairs and the owner
+# The synthetic conversion dataset chases a fixed pair count and the owner
 # cancels when the samples look right, so there is no target_steps math here.
 
 STYLE_RUSH_SCHEDULE = {"num_repeats": 1, "epochs": 5, "save_every_n_epochs": 1}
