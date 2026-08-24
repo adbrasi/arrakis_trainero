@@ -388,12 +388,21 @@ function renderCaptionCard() {
   const missing = (s.dataset?.missing_captions || 0) + (s.dataset_neg?.missing_captions || 0);
   // Style Rush writes the captions itself during training, with the trigger word
   // from step 01 — asking the owner to do it here offers a worse path.
-  const show = missing > 0 && !sliderIsNative() && !styleRush();
+  const items = (s.dataset?.items || 0) + (s.dataset_neg?.items || 0);
+  const redo = $("#caption-redo").checked;
+  // The card used to appear only while something was missing. Redoing captions
+  // on a dataset that arrived with .txt files needs it visible when nothing is.
+  const show = !sliderIsNative() && !styleRush()
+               && (missing > 0 || (state.mode === "lora" && items > 0));
   $("#caption-card").hidden = !show;
   if (!show) return;
-  $("#caption-msg").textContent = `${missing} itens sem caption`;
+  $("#caption-redo-wrap").hidden = state.mode !== "lora";
+  $("#caption-msg").textContent = missing > 0
+    ? `${missing} itens sem caption`
+    : `${items} itens, todos com caption`;
   $("#caption-key-hint").hidden = !!s.openrouter;
-  $("#btn-captions").disabled = !s.openrouter;
+  $("#btn-captions").disabled = !s.openrouter || (missing === 0 && !redo);
+  $("#btn-captions").textContent = redo ? "Refazer captions" : "Escrever captions";
   const isVideo = (s.dataset?.videos || 0) > 0;
   const profiles = state.presets?.caption_profiles[isVideo ? "video" : "image"] || [];
   const sel = $("#caption-profile");
@@ -416,6 +425,7 @@ function renderCaptionTriggerNote() {
   note.classList.toggle("alert", needsVar && !trig);
 }
 $("#caption-profile").addEventListener("change", renderCaptionTriggerNote);
+$("#caption-redo").addEventListener("change", renderCaptionCard);
 $("#trigger-word").addEventListener("input", renderCaptionTriggerNote);
 
 $("#btn-captions").addEventListener("click", async () => {
@@ -428,14 +438,20 @@ $("#btn-captions").addEventListener("click", async () => {
     return;
   }
   try {
+    const redo = $("#caption-redo").checked;
     const sides = [];
-    if (state.status?.dataset?.missing_captions) sides.push("pos");
-    if (state.status?.dataset_neg?.missing_captions) sides.push("neg");
+    if (redo) {
+      if (state.status?.dataset?.items) sides.push("pos");
+    } else {
+      if (state.status?.dataset?.missing_captions) sides.push("pos");
+      if (state.status?.dataset_neg?.missing_captions) sides.push("neg");
+    }
     await post("/api/captions", {
       profile: sel.value,
       var_name: opt?.dataset.var || null,
       trigger,
       side: sides[0] || "pos",
+      redo,
     });
     toast("Geração de captions iniciada.");
   } catch (e) { toast(e.message, "error"); }
@@ -470,7 +486,7 @@ function selectModel(key) {
 }
 
 // ---------------------------------------------------------------- advanced
-const ADV_FIELDS = ["adv-net", "adv-dim", "adv-alpha", "adv-lr", "adv-epochs", "adv-repeats", "adv-save", "adv-ltx-res"];
+const ADV_FIELDS = ["adv-net", "adv-dim", "adv-alpha", "adv-lr", "adv-epochs", "adv-repeats", "adv-save", "adv-ltx-res", "adv-convert-target"];
 ADV_FIELDS.forEach((id) => {
   const el = document.getElementById(id);
   el?.addEventListener("change", () => state.advTouched.add(id));
@@ -505,6 +521,15 @@ function fillAdvanced() {
   const isLtx = !!m.ltx;
   $("#adv-ltx-res-wrap").hidden = !isLtx;
   if (isLtx && !state.advTouched.has("adv-ltx-res")) $("#adv-ltx-res").value = m.ltx.resolution;
+  // Only Style Rush pays gpt-image-2, and only Style Rush writes captions from
+  // inside the training job — in every other mode both controls would describe
+  // a run that never happens.
+  const rush = styleRush();
+  $("#adv-convert-target-wrap").hidden = !rush;
+  $("#adv-redo-captions-wrap").hidden = !rush;
+  if (rush && !state.advTouched.has("adv-convert-target")) {
+    $("#adv-convert-target").value = state.presets?.default_convert_target ?? 100;
+  }
 }
 
 function collectOverrides() {
@@ -522,6 +547,8 @@ function collectOverrides() {
   if (touched.has("adv-repeats")) o.num_repeats = parseInt($("#adv-repeats").value, 10);
   if (touched.has("adv-save")) o.save_every_n_epochs = parseInt($("#adv-save").value, 10);
   if (touched.has("adv-ltx-res")) o.ltx_resolution = $("#adv-ltx-res").value.trim();
+  if (touched.has("adv-convert-target")) o.convert_target = parseInt($("#adv-convert-target").value, 10);
+  o.redo_captions = $("#adv-redo-captions").checked;
   o.sampling = $("#adv-sampling").checked;
   const sp = $("#adv-sample-prompt").value.trim();
   if (sp) o.sample_prompt = sp;

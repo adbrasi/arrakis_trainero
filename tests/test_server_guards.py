@@ -142,3 +142,53 @@ class TestTrainWaitsForUploads(LiveServer):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCaptionRedo(unittest.TestCase):
+    def _source(self):
+        from pathlib import Path as P
+        return (P(__file__).resolve().parent.parent / "server.py").read_text()
+
+    def test_the_endpoint_reads_the_redo_flag(self):
+        self.assertIn('body.get("redo")', self._source())
+
+    def test_the_endpoint_clears_before_captioning(self):
+        self.assertIn("clear_captions", self._source())
+
+    def test_the_manual_button_uses_the_lora_cascade(self):
+        """O botão manual é o caminho do LoRA normal, onde o primário é o mais
+        barato — nada lê a lista de flagradas nesse modo."""
+        self.assertIn('mode="lora"', self._source())
+
+
+class TestStyleRushUiControls(unittest.TestCase):
+    def _html(self):
+        from pathlib import Path as P
+        return (P(__file__).resolve().parent.parent / "web" / "index.html").read_text()
+
+    def _js(self):
+        from pathlib import Path as P
+        return (P(__file__).resolve().parent.parent / "web" / "app.js").read_text()
+
+    def test_the_convert_target_input_exists(self):
+        self.assertIn('id="adv-convert-target"', self._html())
+
+    def test_the_convert_target_reaches_the_overrides(self):
+        self.assertIn("o.convert_target", self._js())
+
+    def test_the_redo_checkbox_exists_in_both_entry_points(self):
+        html = self._html()
+        self.assertIn('id="caption-redo"', html)
+        self.assertIn('id="adv-redo-captions"', html)
+
+    def test_both_redo_controls_are_off_by_default(self):
+        html = self._html()
+        for line in html.splitlines():
+            if 'id="caption-redo"' in line or 'id="adv-redo-captions"' in line:
+                self.assertNotIn("checked", line, line.strip())
+
+    def test_the_default_target_is_served_to_the_page(self):
+        from pathlib import Path as P
+        src = (P(__file__).resolve().parent.parent / "server.py").read_text()
+        self.assertIn("default_convert_target", src)
+        self.assertIn("default_convert_target", self._js())

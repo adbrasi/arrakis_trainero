@@ -146,6 +146,11 @@
           <select id="caption-profile" aria-label="Estilo da caption"></select>
           <button class="btn" id="btn-captions">Escrever captions</button>
         </div>
+        <label class="check" id="caption-redo-wrap">
+          <input type="checkbox" id="caption-redo">
+          Refazer as que já têm caption
+          <span class="help">apaga todo .txt do dataset antes de escrever</span>
+        </label>
         <p class="help" id="caption-trigger-note"></p>
         <p class="help">reescreve o .txt de todos os itens; os existentes viram contexto para o LLM</p>
         <p class="help alert" id="caption-key-hint" hidden>defina OPENROUTER_API_KEY no pod para usar isto</p>
@@ -194,11 +199,13 @@
           <label class="field repeats-field"><span class="label">Repeats</span><input type="number" id="adv-repeats" min="1"></label>
           <label class="field"><span class="label">Salvar a cada</span><input type="number" id="adv-save" min="1"></label>
           <label class="field" id="adv-ltx-res-wrap" hidden><span class="label">Resolução LTX</span><input type="text" id="adv-ltx-res" placeholder="768x512x81"></label>
+          <label class="field" id="adv-convert-target-wrap" hidden><span class="label">Imagens para conversão</span><input type="number" id="adv-convert-target" min="1"></label>
           <label class="field wide"><span class="label">Prompt do sample</span><input type="text" id="adv-sample-prompt" placeholder="padrão do trainer"></label>
           <label class="check"><input type="checkbox" id="adv-loraplus"> LoRA+ <span class="help">ratio 16</span></label>
           <label class="check"><input type="checkbox" id="adv-sampling" checked> Gerar sample a cada época</label>
           <label class="check"><input type="checkbox" id="adv-hf" checked> Criar repo no HuggingFace</label>
           <label class="check"><input type="checkbox" id="adv-hf-private" checked> Repo privado</label>
+          <label class="check" id="adv-redo-captions-wrap" hidden><input type="checkbox" id="adv-redo-captions"> Refazer todas as captions</label>
         </div>
         <p class="help" id="adv-foot">Tudo já vem do preset do modelo e do tamanho do dataset. DoRA não existe nos
           backends usados — LoKr e LoHa cobrem o caso.</p>

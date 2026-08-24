@@ -21,9 +21,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from trainero import dataset as ds
 from trainero import jobs
+from trainero import style_rush as sr
 from trainero import project as pj
 from trainero.jobs import JobFailed
-from trainero.captioner import generate_captions
+from trainero.captioner import clear_captions, generate_captions
 from trainero.config import (IMAGE_EXTS, VIDEO_EXTS, WEB_PORT, ensure_dirs,
                              gpu_info, hf_token, load_state, save_state,
                              update_state)
@@ -298,6 +299,7 @@ class Handler(SimpleHTTPRequestHandler):
             # Style Rush ignores suggest_schedule: showing the suggested numbers
             # in the panel would promise a run that is not the one that happens
             "style_rush_schedule": STYLE_RUSH_SCHEDULE,
+            "default_convert_target": sr.DEFAULT_CONVERT_TARGET,
         })
 
     # -- POST --------------------------------------------------------------
@@ -488,6 +490,7 @@ class Handler(SimpleHTTPRequestHandler):
         body = self._body_json()
         profile = body.get("profile") or "default"
         side = body.get("side", "pos")
+        redo = bool(body.get("redo"))
         media = "video" if ds.inspect(dataset_dir(side)).get("videos") else "image"
         prompt_vars = {}
         var = body.get("var_name")
@@ -495,8 +498,17 @@ class Handler(SimpleHTTPRequestHandler):
             prompt_vars[var] = body["trigger"]
         pdir = project_dir(project)
         target = dataset_dir(side)
-        job = jobs.start("captions", "Gerando captions com LLM", pdir / "logs" / "captions.log",
-                         lambda j: generate_captions(target, media, profile, prompt_vars, j))
+
+        def run(j):
+            # Deleting the .txt is not enough on its own: the tagger skips
+            # whatever is in its processing log, so the clear has to happen
+            # inside the job, right before the pass that rewrites them.
+            if redo:
+                clear_captions(target, j)
+            generate_captions(target, media, profile, prompt_vars, j, mode="lora")
+
+        job = jobs.start("captions", "Gerando captions com LLM",
+                         pdir / "logs" / "captions.log", run)
         self._json({"ok": True, "job": job.kind}, 202)
 
     def _train(self):
