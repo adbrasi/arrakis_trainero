@@ -136,3 +136,30 @@ class TestRunTrainingLora(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStyleRushOverrides(unittest.TestCase):
+    """Estes overrides existem para o dono mexer neles pela UI; um deles não
+    ligado ao pipeline é um campo que mente sobre o que vai acontecer."""
+
+    def _source(self):
+        from pathlib import Path as P
+        return (P(__file__).resolve().parent.parent / "trainero" / "training.py").read_text()
+
+    def test_the_convert_target_reaches_the_builder(self):
+        src = self._source()
+        self.assertIn('overrides.get("convert_target")', src)
+        self.assertIn("target=convert_target", src)
+
+    def test_the_default_target_comes_from_style_rush(self):
+        self.assertIn("sr.DEFAULT_CONVERT_TARGET", self._source())
+
+    def test_redo_captions_clears_before_the_caption_phase(self):
+        src = self._source()
+        self.assertIn('overrides.get("redo_captions")', src)
+        self.assertIn("clear_captions(", src)
+
+    def test_style_rush_captions_use_the_style_rush_cascade(self):
+        """No Style Rush o primário tem de ser o Gemini: é a recusa dele que
+        alimenta o content_flagged da fase paga."""
+        self.assertIn('mode="style-rush"', self._source())

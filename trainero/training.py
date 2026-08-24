@@ -20,7 +20,7 @@ from pathlib import Path
 
 from . import dataset as ds
 from . import style_rush as sr
-from .captioner import generate_captions
+from .captioner import clear_captions, generate_captions
 from .config import PROJECTS_DIR, gpu_info
 from .engines import (engine_dir, ensure_engine, supports_sampling, venv_bin,
                       venv_python)
@@ -614,10 +614,14 @@ def run_style_rush_training(job: Job, params: dict) -> None:
     job.end_phase("Modelos base")
 
     job.start_phase("Captions")
+    if overrides.get("redo_captions"):
+        clear_captions(dataset_dir, job)
+        stats = ds.inspect(dataset_dir)
     if stats["missing_captions"]:
         job.log(f"{stats['missing_captions']} itens sem caption — gerando com "
                 f"generic-style e trigger {trigger}")
-        generate_captions(dataset_dir, "image", "generic-style", {"style_name": trigger}, job)
+        generate_captions(dataset_dir, "image", "generic-style", {"style_name": trigger},
+                          job, mode="style-rush")
         stats = ds.inspect(dataset_dir)
         if stats["missing_captions"]:
             raise JobFailed(f"{stats['missing_captions']} itens continuam sem caption")
@@ -626,7 +630,9 @@ def run_style_rush_training(job: Job, params: dict) -> None:
     job.end_phase("Captions")
 
     job.start_phase("Dataset de conversão")
-    convert_stats = sr.build_convert_dataset(dataset_dir, convert_dir, trigger, job)
+    convert_target = int(overrides.get("convert_target") or sr.DEFAULT_CONVERT_TARGET)
+    convert_stats = sr.build_convert_dataset(dataset_dir, convert_dir, trigger, job,
+                                             target=convert_target)
     job.extra["style_rush"] = convert_stats
     job.end_phase("Dataset de conversão")
 
