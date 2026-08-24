@@ -32,19 +32,38 @@ Três problemas independentes, um mesmo caminho de código:
 **uma lista ordenada**:
 
 ```python
-DEFAULT_CAPTION_MODELS = [
-    "google/gemini-3.7-flash",              # primário: barato e é o que flagra
-    "meta/muse-spark-1.2-contributor",      # resgata o que o Gemini recusa
-    "x-ai/grok-4.20",                       # última instância
-]
+MUSE   = "meta/muse-spark-1.2-contributor"
+GEMINI = "google/gemini-3.7-flash"
+GROK   = "x-ai/grok-4.20"
+
+# A ordem depende do que o modo precisa da recusa do primário.
+CAPTION_MODELS = {
+    "lora":       [MUSE, GEMINI, GROK],   # o mais barato e o melhor primeiro
+    "style-rush": [GEMINI, MUSE, GROK],   # o Gemini flagra pro gpt-image-2
+}
 ```
 
-Sobrescrita por `CAPTION_MODELS`, uma variável só, lista separada por vírgula. Três env vars
-numeradas para uma cascata de tamanho fixo seria o mesmo erro que a lista existe para
-consertar.
+Sobrescrita por `CAPTION_MODELS`, uma variável só, lista separada por vírgula, valendo para
+os dois modos. Env vars numeradas para uma cascata de tamanho fixo seriam o mesmo erro que a
+lista existe para consertar.
 
-`DEFAULT_CAPTION_MODEL` continua existindo como `CAPTION_MODELS[0]`, porque `record_flagged`
-grava esse id no `.caption_refused.json` e `tests/test_core.py:340` afirma o valor.
+**Por que a ordem muda com o modo.** O único consumidor do `.caption_refused.json` é o
+`content_flagged` do Style Rush, que o usa para não pagar por um slot que o `gpt-image-2` vai
+recusar. No LoRA normal não existe fase paga, então nada lê essa lista e a ordem pode ser
+puramente a de custo e qualidade — que é o Muse Spark, $0,00061 contra $0,0047 do mais caro
+testado. No Style Rush a lista é dinheiro, e o Gemini é o modelo cujo filtro mais se parece
+com o da OpenAI.
+
+**A consequência aceita:** um projeto captionado no modo normal e depois reaproveitado no
+Style Rush (que é um fluxo real — ver o commit `fb7064c`) carrega um `.caption_refused.json`
+escrito com o Muse de primário. O Muse é mais permissivo, então a lista sai menor e o Style
+Rush paga por alguns slots que o Gemini teria flagrado. É custo, não incorreção, e o erro cai
+para o lado seguro: sub-flagrar paga alguns dólares a mais, sobre-flagrar jogaria imagem boa
+fora. Nada a fazer.
+
+`DEFAULT_CAPTION_MODEL` continua existindo, agora como `CAPTION_MODELS["style-rush"][0]`
+(o Gemini), porque `record_flagged` grava esse id no `.caption_refused.json` e
+`tests/test_core.py:340` afirma o valor.
 
 `generate_captions` roda a lista em ordem, cada passe recebendo só o que sobrou do anterior,
 e para assim que `ds.uncaptioned` volta vazio — a cascata nunca paga por um modelo que não
@@ -78,9 +97,20 @@ O dono comparou cinco modelos com o prompt novo sobre uma imagem explícita
 O Muse Spark captionou sem recusar, sem trace de raciocínio, e foi o mais barato dos cinco.
 O `is_moderated: true` que o catálogo do OpenRouter reporta não bloqueou nada na prática.
 
-Única ressalva: 315 palavras contra o teto de 220 que o prompt pede para cena densa. Ele
-estoura o limite de comprimento em ~50%. Não é defeito de conteúdo e não justifica mexer no
-prompt agora.
+Ele escreveu 315 palavras contra o teto de 220 que o prompt pedia para cena densa — e o dono
+avaliou que caption longa é melhor, não pior. Ver a adaptação 3 na seção 2: o teto sai do
+prompt.
+
+### Concorrência
+
+O dono vai treinar LoRAs com **mais de mil imagens**, e hoje nenhuma das duas fases paralelas
+tem o número certo.
+
+`_tagger_cmd` nunca passa `--grok_concurrency`, então roda no default do tagger: **32**. Passa
+a mandar `CAPTION_CONCURRENCY`, default **64**.
+
+`--max_workers` (default 8) não muda: aquilo é o batch do pixai na GPU local, não tem relação
+com chamada de API.
 
 ---
 
@@ -101,9 +131,12 @@ injeta `{tags}`. Colar o texto sem resolver deixaria o modelo com duas ordens op
    nunca para contradizer a imagem, e nunca entram como sintaxe de tag.
 2. **`user_prompt.md`** hoje diz *"Tags are your primary source of truth"*. Inverte para a
    mesma hierarquia.
+3. **A seção `## Length` sai.** Decisão do dono: não há teto de palavras, caption longa é
+   melhor. Fica só a regra de densidade — nenhuma frase que possa ser apagada sem perder
+   informação visual — sem número nenhum ao lado.
 
 Todo o resto entra literal: política de conteúdo explícito, ordem do camera report, seção do
-que não descrever, comprimento, os três exemplos.
+que não descrever, os três exemplos.
 
 `profile.json` não muda — a variável `style_name` continua sendo a trigger.
 
@@ -180,6 +213,15 @@ Style Rush — mesmo padrão do `#adv-ltx-res-wrap`. Default 100, entra como
 O dataset de restauração continua em 100 e sem input: é CPU local, custo zero, e o dono pediu
 input só para a conversão.
 
+### Concorrência
+
+`build_convert_dataset` tem `workers: int = 4` e `run_style_rush_training` chama sem o
+argumento, então a conversão inteira roda com 4. Vira `CONVERT_WORKERS`, default **8**,
+sobrescrito por env.
+
+A reserva de orçamento sob lock é o que torna subir esse número seguro: sem ela, mais workers
+significaria mais imagens pagas depois da meta.
+
 ### Custo
 
 100 pares × $0,0142 = **~$1,42 por run**, contra ~$0,71 de hoje.
@@ -228,12 +270,14 @@ steps**.
 |---|---|
 | `tests/test_core.py:86` | `STYLE_RUSH_SCHEDULE` com `num_repeats: 1` |
 | `tests/test_core.py:340` | `DEFAULT_CAPTION_MODEL` |
-| `tests/test_captioner.py` | importa `FALLBACK_CAPTION_MODEL`, cascata de dois passes |
+| `tests/test_captioner.py` | importa `FALLBACK_CAPTION_MODEL`, cascata de dois passes, `_run` sem modo |
 | `tests/test_style_rush.py` | `SLOT_COUNT`, `plan_slots`, nomes `slot_%02d` |
 
 Testes novos que o design pede:
 
 - a cascata para no primeiro modelo que zera as pendências, sem chamar os seguintes;
+- o modo `lora` começa pelo Muse e o `style-rush` começa pelo Gemini;
+- `_tagger_cmd` manda `--grok_concurrency`;
 - `record_flagged` marca o que o primário recusou e um modelo posterior resgatou;
 - a fila de conversão para exatamente na meta, com concorrência;
 - o teto de `meta × 3` encerra e loga quando tudo é recusado;
@@ -245,4 +289,4 @@ Testes novos que o design pede:
 - Mexer em `content_flagged` (resolvido: o Gemini fica de primário).
 - Input para o dataset de restauração.
 - `git pull` nos engines de treino.
-- Ajustar o teto de comprimento do prompt por causa das 315 palavras do Muse Spark.
+- Reintroduzir qualquer teto de comprimento na caption.
