@@ -239,6 +239,14 @@ MODELS = {
         "vram_tiers": [
             {"min_gb": 70, "train": {}},
             {"min_gb": 38, "train": {"fp8_base": True, "fp8_scaled": True}},
+            # 32 GB (RTX 5090) used to fall to the 22 GB tier and swap 16 blocks
+            # while sitting at 18 GB of 32. The DiT is 40.9 GB in bf16, so ~20.5
+            # at fp8; measured overhead outside the blocks is ~4.3 GB, which puts
+            # training near 25 GB with nothing swapped. The margin that is left
+            # is for the 7B text encoder that loads to encode the sample prompt,
+            # so a few blocks still travel — 8, not 16. Raise or zero it from the
+            # advanced panel if sampling is off.
+            {"min_gb": 30, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 8}, "cache_te": {"fp8_vl": True}},
             {"min_gb": 22, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 16}, "cache_te": {"fp8_vl": True}},
             {"min_gb": 0, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 45}, "cache_te": {"fp8_vl": True}},
         ],
@@ -273,6 +281,9 @@ MODELS = {
         "vram_tiers": [
             {"min_gb": 70, "train": {}},
             {"min_gb": 38, "train": {"fp8_base": True, "fp8_scaled": True}},
+            # Same as qwen-image above: a 32 GB card was swapping 20 of 60 blocks
+            # to stay at 18 GB of 32. See that comment for the arithmetic.
+            {"min_gb": 30, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 8}, "cache_te": {"fp8_vl": True}},
             {"min_gb": 22, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 20}, "cache_te": {"fp8_vl": True}},
             {"min_gb": 0, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 45}, "cache_te": {"fp8_vl": True}},
         ],

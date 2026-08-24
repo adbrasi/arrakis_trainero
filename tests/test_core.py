@@ -541,3 +541,31 @@ class TestSampleCaption(unittest.TestCase):
         src = (P(__file__).resolve().parent.parent / "trainero" / "training.py").read_text()
         self.assertIn("ds.sample_caption(dataset_dir)", src)
         self.assertIn("not trigger.strip()", src)
+
+
+class TestVramTiers(unittest.TestCase):
+    """Uma 5090 (32 GB) caía no tier de 22 GB e trocava 20 de 60 blocos para
+    ficar em 18 GB de 32. Cada bloco trocado custa tempo de step."""
+
+    def test_a_32gb_card_swaps_far_less_on_qwen(self):
+        from trainero.presets import vram_tier
+
+        for key in ("qwen-image", "qwen-image-edit"):
+            tier = vram_tier(key, 32)["train"]
+            self.assertTrue(tier.get("fp8_base"), key)
+            self.assertLessEqual(tier.get("blocks_to_swap", 0), 8, key)
+
+    def test_swapping_never_grows_as_the_card_grows(self):
+        """Um tier fora de ordem faz uma placa maior trocar mais que uma menor."""
+        from trainero.presets import MODELS, vram_tier
+
+        for key in MODELS:
+            swaps = [vram_tier(key, gb).get("train", {}).get("blocks_to_swap", 0)
+                     for gb in (80, 40, 32, 24, 16, 8)]
+            self.assertEqual(swaps, sorted(swaps), f"{key}: {swaps}")
+
+    def test_blocks_to_swap_can_be_overridden(self):
+        from pathlib import Path as P
+
+        src = (P(__file__).resolve().parent.parent / "trainero" / "training.py").read_text()
+        self.assertIn('"blocks_to_swap")', src)

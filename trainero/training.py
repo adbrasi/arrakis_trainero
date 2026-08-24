@@ -231,7 +231,10 @@ def build_train_config(model_key: str, overrides: dict, schedule: dict, stats: d
         if "network_alpha" not in overrides:
             cfg["network_alpha"] = max(1, int(cfg["network_dim"]) // 2)
 
-    for key in ("network_dim", "network_alpha", "learning_rate"):
+    # blocks_to_swap is the one tier value worth overriding by hand: only the
+    # owner's card can say how much headroom the sample step really leaves, and
+    # every swapped block costs step time for VRAM that may not be needed.
+    for key in ("network_dim", "network_alpha", "learning_rate", "blocks_to_swap"):
         if key in overrides and overrides[key] not in (None, ""):
             # learning_rate chega como texto do painel; se ficar str, o TOML sai
             # com aspas e o argparse do trainer nunca converte (crash no optimizer)

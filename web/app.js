@@ -486,7 +486,7 @@ function selectModel(key) {
 }
 
 // ---------------------------------------------------------------- advanced
-const ADV_FIELDS = ["adv-net", "adv-dim", "adv-alpha", "adv-lr", "adv-epochs", "adv-repeats", "adv-save", "adv-ltx-res", "adv-convert-target"];
+const ADV_FIELDS = ["adv-net", "adv-dim", "adv-alpha", "adv-lr", "adv-epochs", "adv-repeats", "adv-save", "adv-ltx-res", "adv-convert-target", "adv-blocks-swap"];
 ADV_FIELDS.forEach((id) => {
   const el = document.getElementById(id);
   el?.addEventListener("change", () => state.advTouched.add(id));
@@ -548,6 +548,11 @@ function collectOverrides() {
   if (touched.has("adv-save")) o.save_every_n_epochs = parseInt($("#adv-save").value, 10);
   if (touched.has("adv-ltx-res")) o.ltx_resolution = $("#adv-ltx-res").value.trim();
   if (touched.has("adv-convert-target")) o.convert_target = parseInt($("#adv-convert-target").value, 10);
+  // 0 is a real value here (swap nothing), so an untouched field must stay
+  // absent rather than send a zero the preset never chose
+  if (touched.has("adv-blocks-swap") && $("#adv-blocks-swap").value !== "") {
+    o.blocks_to_swap = parseInt($("#adv-blocks-swap").value, 10);
+  }
   o.redo_captions = $("#adv-redo-captions").checked;
   o.sampling = $("#adv-sampling").checked;
   const sp = $("#adv-sample-prompt").value.trim();
