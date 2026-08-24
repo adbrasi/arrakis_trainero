@@ -83,7 +83,7 @@ class TestPresets(unittest.TestCase):
         from trainero.presets import STYLE_RUSH_SCHEDULE
 
         self.assertEqual(STYLE_RUSH_SCHEDULE,
-                         {"num_repeats": 1, "epochs": 5, "save_every_n_epochs": 1})
+                         {"num_repeats": 2, "epochs": 5, "save_every_n_epochs": 1})
 
     def test_sample_prompt_is_prose(self):
         from trainero.presets import SAMPLE_PROMPT

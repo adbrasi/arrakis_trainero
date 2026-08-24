@@ -413,7 +413,7 @@ LORAPLUS_RATIO = 16  # owner's value in image_lora_arrakis
 # The synthetic conversion dataset chases a fixed pair count and the owner
 # cancels when the samples look right, so there is no target_steps math here.
 
-STYLE_RUSH_SCHEDULE = {"num_repeats": 1, "epochs": 5, "save_every_n_epochs": 1}
+STYLE_RUSH_SCHEDULE = {"num_repeats": 2, "epochs": 5, "save_every_n_epochs": 1}
 CONTROL_RESOLUTION = [1024, 1024]
 
 # ---------------------------------------------------------------------------
