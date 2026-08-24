@@ -50,6 +50,13 @@ def ensure_engine(name: str, job: Job) -> None:
         job.log(f"Clonando {spec['repo']} ({spec['branch']})...")
         job.run(["git", "clone", "--depth", "1", "--single-branch",
                  "--branch", spec["branch"], spec["repo"], str(dest)])
+    elif spec.get("pull"):
+        # A stale prompt is bad; a phase that refuses to run is worse. Never let
+        # a network hiccup or a local commit in the clone stop the job.
+        try:
+            job.run(["git", "pull", "--ff-only"], cwd=dest)
+        except Exception as exc:
+            job.log(f"⚠ git pull falhou em {name} ({exc}) — seguindo com o clone atual.")
     else:
         job.log(f"Engine {name} já clonado.")
 

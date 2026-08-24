@@ -402,3 +402,89 @@ class TestSlug(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEnginePull(unittest.TestCase):
+    """O clone do captioner é o único cujo conteúdo (os prompts) muda entre
+    runs enquanto as dependências não. Pull no musubi arriscaria um venv bom."""
+
+    def test_only_the_captioner_declares_pull(self):
+        from trainero.presets import ENGINES
+
+        pulling = {k for k, v in ENGINES.items() if v.get("pull")}
+        self.assertEqual(pulling, {"captioner"})
+
+    def test_an_existing_clone_is_fast_forwarded(self):
+        import tempfile
+        from pathlib import Path as P
+        from unittest import mock
+
+        from trainero import engines
+
+        with tempfile.TemporaryDirectory() as td:
+            dest = P(td) / "data_araknideo"
+            (dest / ".git").mkdir(parents=True)
+            ran = []
+
+            class FakeJob:
+                def log(self, *_): pass
+
+                def run(self, cmd, cwd=None, **_kw):
+                    ran.append(([str(c) for c in cmd], str(cwd) if cwd else None))
+
+            with mock.patch.object(engines, "engine_dir", return_value=dest), \
+                 mock.patch.object(engines, "is_installed", return_value=True):
+                engines.ensure_engine("captioner", FakeJob())
+
+            self.assertEqual(ran, [(["git", "pull", "--ff-only"], str(dest))])
+
+    def test_a_training_engine_is_left_alone(self):
+        import tempfile
+        from pathlib import Path as P
+        from unittest import mock
+
+        from trainero import engines
+
+        with tempfile.TemporaryDirectory() as td:
+            dest = P(td) / "musubi-tuner"
+            (dest / ".git").mkdir(parents=True)
+            ran = []
+
+            class FakeJob:
+                def log(self, *_): pass
+
+                def run(self, cmd, cwd=None, **_kw):
+                    ran.append([str(c) for c in cmd])
+
+            with mock.patch.object(engines, "engine_dir", return_value=dest), \
+                 mock.patch.object(engines, "is_installed", return_value=True):
+                engines.ensure_engine("musubi", FakeJob())
+
+            self.assertEqual(ran, [], "pull no musubi pode quebrar um venv que funciona")
+
+    def test_a_failed_pull_does_not_stop_the_job(self):
+        """Sem rede, ou com commit local no clone, o pull falha. O prompt velho
+        é ruim; não captionar nada é pior."""
+        import tempfile
+        from pathlib import Path as P
+        from unittest import mock
+
+        from trainero import engines
+
+        with tempfile.TemporaryDirectory() as td:
+            dest = P(td) / "data_araknideo"
+            (dest / ".git").mkdir(parents=True)
+            lines = []
+
+            class FakeJob:
+                def log(self, msg): lines.append(msg)
+
+                def run(self, cmd, cwd=None, **_kw):
+                    raise RuntimeError("fatal: not possible to fast-forward")
+
+            with mock.patch.object(engines, "engine_dir", return_value=dest), \
+                 mock.patch.object(engines, "is_installed", return_value=True):
+                engines.ensure_engine("captioner", FakeJob())  # não pode levantar
+
+            self.assertTrue(any("pull" in ln.lower() for ln in lines),
+                            "o dono tem de ver que o clone ficou velho")

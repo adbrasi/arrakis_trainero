@@ -46,6 +46,11 @@ ENGINES = {
         "dir": "data_araknideo",
         "install": "requirements",
         "script_prefix": "",
+        # The only engine whose *content* changes between runs while its
+        # dependencies do not: the caption prompts live here. Without this a
+        # long-lived pod captions a whole dataset with a stale prompt and the
+        # owner only finds out after the training.
+        "pull": True,
     },
 }
 
