@@ -96,10 +96,18 @@ class TestStylePrompts(unittest.TestCase):
                 self.assertNotIn(word, low, prompt)
 
     def test_every_prompt_names_a_medium_or_technique(self):
-        """Um prompt de uma palavra ("make it artistic") não converte estilo
-        nenhum: o gpt-image-2 precisa de descritores que ele consiga renderizar."""
+        """Um descritor de uma palavra ("artistic") nao converte estilo nenhum:
+        o gpt-image-2 precisa de termos que ele consiga renderizar."""
         for prompt in load_style_prompts():
-            self.assertGreaterEqual(len(prompt.split()), 8, prompt)
+            self.assertGreaterEqual(len(prompt.split()), 5, prompt)
+
+    def test_the_file_holds_descriptors_and_not_instructions(self):
+        """A instrucao vive no CONVERT_PROMPT_TEMPLATE, uma vez. Cem copias dela
+        aqui divergiriam na primeira edicao."""
+        for prompt in load_style_prompts():
+            low = prompt.lower()
+            self.assertNotIn("convert the art style", low, prompt)
+            self.assertNotIn("redraw this", low, prompt)
 
 
 class TestPlanAttempts(unittest.TestCase):
@@ -117,7 +125,7 @@ class TestPlanAttempts(unittest.TestCase):
     def test_prompts_cycle_so_any_target_works(self):
         prompts = ["p0", "p1", "p2"]
         attempts = plan_attempts(self._imgs(10), prompts, 4)
-        self.assertEqual([a["prompt"] for a in attempts[:6]],
+        self.assertEqual([a["style"] for a in attempts[:6]],
                          ["p0", "p1", "p2", "p0", "p1", "p2"])
 
     def test_a_wrapped_prompt_gets_a_different_image(self):
@@ -125,7 +133,7 @@ class TestPlanAttempts(unittest.TestCase):
         um resultado novo."""
         prompts = ["p0", "p1"]
         attempts = plan_attempts(self._imgs(5), prompts, 4)
-        pairs = [(a["prompt"], a["source"]) for a in attempts[:8]]
+        pairs = [(a["style"], a["source"]) for a in attempts[:8]]
         self.assertEqual(len(set(pairs)), 8)
 
     def test_refused_images_never_enter_the_queue(self):
@@ -552,3 +560,43 @@ class TestResumeAccounting(unittest.TestCase):
             third = self._heavy_refusal_run(td, 110, counting)
             self.assertEqual(third["pairs"], 110, "parou com imagens boas de sobra")
             self.assertEqual(calls["n"], 10, "tinha de comprar so a diferenca")
+
+
+class TestPreservationTemplate(unittest.TestCase):
+    """Sem restricao explicita o gpt-image-2 faz o que foi de fato pedido:
+    'desenhe isto no estilo X' autoriza outro fundo, outro enquadramento, uma
+    versao escura de uma imagem clara, uma tatuagem que o personagem nao tem.
+    E o alvo do par e a imagem original, entao um controle com fundo trocado
+    ensina o LoRA a trocar o fundo junto com o estilo."""
+
+    def _prompt(self, i=0):
+        from trainero.style_rush import attempt_at, attempt_order
+        return attempt_at(i, load_style_prompts(),
+                          attempt_order([Path("/ds/a.png")]))["prompt"]
+
+    def test_the_style_descriptor_reaches_the_model(self):
+        self.assertIn(load_style_prompts()[0], self._prompt(0))
+
+    def test_composition_and_framing_are_pinned(self):
+        low = self._prompt().lower()
+        for word in ("composition", "framing", "camera angle"):
+            self.assertIn(word, low)
+
+    def test_colour_and_lighting_are_pinned(self):
+        low = self._prompt().lower()
+        for word in ("palette", "bright image stays bright", "lighting",
+                     "shadow placement"):
+            self.assertIn(word, low)
+
+    def test_invention_is_forbidden_by_name(self):
+        """Uma imagem voltou com tatuagem que o personagem nao tinha."""
+        low = self._prompt().lower()
+        self.assertIn("add nothing", low)
+        self.assertIn("tattoo", low)
+        self.assertIn("background", low)
+
+    def test_every_style_gets_the_same_constraints(self):
+        first = self._prompt(0)
+        constraints = first[first.index("This is a style transfer"):]
+        for i in (1, 37, 99):
+            self.assertIn(constraints, self._prompt(i))

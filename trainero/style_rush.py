@@ -46,6 +46,35 @@ CONVERT_WORKERS = int(os.environ.get("CONVERT_WORKERS", "8"))
 CAPTION_TEMPLATE = "convert the style of this image to the {trigger} style"
 PROMPTS_FILE = REPO_DIR / "data" / "style_prompts.txt"
 
+# The instruction that wraps every style descriptor. It lives here, once,
+# because it is the same constraint for all of them and a hundred copies in the
+# prompts file would drift apart on the first edit.
+#
+# Without it gpt-image-2 does what it was actually asked: "draw this in style X"
+# licenses a new background, a re-framed shot, a dark version of a bright image,
+# a tattoo the subject never had. And that damage is not cosmetic — the target
+# of the pair is the untouched original, so a control with a different
+# background teaches the LoRA to change the background along with the style.
+#
+# This is reverse engineering: the control has to be the owner's exact image
+# with only its rendering technique replaced, so that the one thing the LoRA
+# can learn from the pair is the technique.
+CONVERT_PROMPT_TEMPLATE = (
+    "Redraw this exact image in the following art style: {style}.\n\n"
+    "This is a style transfer, not a new illustration. Everything except the "
+    "drawing technique must survive unchanged:\n"
+    "- Composition, framing, crop and camera angle: identical.\n"
+    "- Every subject's pose, proportions, expression and gaze: identical.\n"
+    "- The colour of every element and the overall palette: identical. A bright "
+    "image stays bright, a dark image stays dark.\n"
+    "- Lighting: same direction, same intensity, same shadow placement, same "
+    "contrast.\n"
+    "- The background and every object in it: identical.\n\n"
+    "Add nothing that is not already in the image — no tattoos, marks, jewellery, "
+    "clothing, props, text or scenery. Remove nothing. Move nothing. Do not "
+    "restyle the scene, only the way it is drawn."
+)
+
 # Fixed so a cancelled run resumes onto the same plan instead of paying the
 # API again for a different selection.
 PLAN_SEED = 1707
@@ -141,7 +170,8 @@ def attempt_at(i: int, prompts: list[str], order: list[str]) -> dict:
     """The i-th attempt. Pure, unbounded, and the single definition of the
     pairing — the queue and the runner must not drift apart."""
     return {"attempt": f"slot_{i:03d}",
-            "prompt": prompts[i % len(prompts)],
+            "style": prompts[i % len(prompts)],
+            "prompt": CONVERT_PROMPT_TEMPLATE.format(style=prompts[i % len(prompts)]),
             "source": order[(i + i // len(prompts)) % len(order)]}
 
 
@@ -400,7 +430,7 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
         except imagegen.RefusedError as exc:
             release()
             note_refused(source)
-            record(name, {"status": "refused", "prompt": attempt["prompt"],
+            record(name, {"status": "refused", "style": attempt["style"],
                           "source": source, "error": str(exc)}, refused=1)
             return
         except Cancelled:
@@ -410,7 +440,7 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
             # failed before the call was billed: one unreadable file (an .avif
             # this Pillow cannot open) costs its own attempt, never the phase
             release()
-            record(name, {"status": "failed", "prompt": attempt["prompt"], "source": source,
+            record(name, {"status": "failed", "style": attempt["style"], "source": source,
                           "error": f"{type(exc).__name__}: {exc}"}, failed=1)
             job.log(f"⚠ {name}: {type(exc).__name__}: {exc}")
             return
@@ -426,7 +456,7 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
             raise
         except Exception as exc:
             release()               # paid, but there is no pair to show for it
-            record(name, {"status": "failed", "prompt": attempt["prompt"], "source": source,
+            record(name, {"status": "failed", "style": attempt["style"], "source": source,
                           "paid": True, "cost": cost,
                           "error": f"{type(exc).__name__}: {exc}"},
                    failed=1, cost=cost)
@@ -434,7 +464,7 @@ def build_convert_dataset(base_dir: Path, convert_dir: Path, trigger: str, job,
                     f"({type(exc).__name__}: {exc}) — ${cost:.4f} perdidos")
             return
 
-        record(name, {"status": "ok", "prompt": attempt["prompt"], "source": source,
+        record(name, {"status": "ok", "style": attempt["style"], "source": source,
                       "cost": cost}, pairs=1, cost=cost)
 
     def exhausted() -> str:
