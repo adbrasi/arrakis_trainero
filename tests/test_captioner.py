@@ -381,3 +381,59 @@ class TestConcurrency(unittest.TestCase):
             self.assertEqual(int(cmd[cmd.index("--grok_concurrency") + 1]),
                              captioner.CAPTION_CONCURRENCY)
             self.assertGreaterEqual(captioner.CAPTION_CONCURRENCY, 32)
+
+
+class TestClearCaptions(unittest.TestCase):
+    def test_every_caption_is_deleted_and_counted(self):
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=6, uncaptioned=2)
+            removed = captioner.clear_captions(ds, _FakeJob())
+            self.assertEqual(removed, 6)
+            self.assertEqual(list(ds.glob("*.txt")), [])
+            self.assertEqual(len(list(ds.glob("*.jpg"))), 8, "nenhuma imagem pode sumir")
+
+    def test_the_tagger_log_goes_too(self):
+        """O tagger pula o que está no log. Sem apagá-lo, refazer não refaz nada."""
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=3, uncaptioned=0)
+            captioner.clear_captions(ds, _FakeJob())
+            self.assertFalse((ds / TAGGER_LOG).exists())
+
+    def test_the_flag_file_goes_too(self):
+        """A lista de flagradas é uma conclusão dos modelos antigos sobre estas
+        imagens. Refazer as captions é justamente refazer essa conclusão."""
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=1, uncaptioned=0)
+            captioner.record_flagged(ds, [ds / "ok_000.jpg"], "algum/modelo")
+            captioner.clear_captions(ds, _FakeJob())
+            self.assertEqual(captioner.flagged_names(ds), set())
+
+    def test_the_quarantine_is_not_touched(self):
+        """descartadas/ já saiu do dataset e é a única cópia do que foi movido."""
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=2, uncaptioned=0)
+            quarantine = ds.parent / QUARANTINE_DIR
+            quarantine.mkdir(parents=True, exist_ok=True)
+            (quarantine / "fora.jpg").write_bytes(b"x")
+            (quarantine / "fora.txt").write_text("uma caption")
+
+            captioner.clear_captions(ds, _FakeJob())
+
+            self.assertTrue((quarantine / "fora.jpg").exists())
+            self.assertTrue((quarantine / "fora.txt").exists())
+
+    def test_an_already_clean_dataset_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=0, uncaptioned=3)
+            (ds / TAGGER_LOG).unlink()
+            self.assertEqual(captioner.clear_captions(ds, _FakeJob()), 0)
+
+    def test_the_caption_is_written_again_after_a_clear(self):
+        """O teste que prova o ponto todo: com o log apagado, o passe seguinte
+        reescreve o .txt de um item que já tinha caption."""
+        with tempfile.TemporaryDirectory() as td:
+            ds = _dataset(Path(td), captioned=2, uncaptioned=0)
+            captioner.clear_captions(ds, _FakeJob())
+            _run(ds, _FakeJob({PRIMARY: {"ok_000.jpg", "ok_001.jpg"}}))
+            self.assertTrue((ds / "ok_000.txt").exists())
+            self.assertTrue((ds / "ok_001.txt").exists())

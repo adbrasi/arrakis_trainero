@@ -95,6 +95,35 @@ def prune_stale_log(dataset_dir: Path, job: Job | None = None) -> int:
     return len(stale)
 
 
+def clear_captions(dataset_dir, job: Job | None = None) -> int:
+    """Delete every caption in the dataset so the next run writes them all again.
+
+    Deleting only the .txt would do nothing: the tagger skips anything already
+    in its processing log, which is exactly the property that makes an
+    interrupted run resume for free. The log and the flag file are conclusions
+    the old models drew about these images, and redoing the captions is redoing
+    those conclusions — so all three go together or none of them do.
+
+    QUARANTINE_DIR is not touched. It sits beside the dataset, it already left,
+    and it is the owner's only copy of what was moved out.
+    """
+    dataset_dir = Path(dataset_dir)
+    removed = 0
+    for item in sorted(dataset_dir.iterdir()):
+        if not item.is_file() or item.suffix.lower() not in MEDIA_EXTS:
+            continue
+        try:
+            item.with_suffix(".txt").unlink()
+        except OSError:
+            continue
+        removed += 1
+    for bookkeeping in (dataset_dir / TAGGER_LOG, dataset_dir / FLAGGED_FILE):
+        bookkeeping.unlink(missing_ok=True)
+    if job:
+        job.log(f"{removed} captions apagadas — todas serão reescritas.")
+    return removed
+
+
 def _tagger_cmd(dataset_dir: Path, media: str, profile: str,
                 prompt_vars: dict[str, str], model: str) -> list[str]:
     cap_dir = engine_dir("captioner")
