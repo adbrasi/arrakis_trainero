@@ -41,40 +41,88 @@ ENGINES = {
         "script_prefix": "",
     },
     "captioner": {
-        "repo": "https://github.com/adbrasi/data_araknideo.git",
+        "repo": "https://github.com/adbrasi/captionkreator.git",
         "branch": "main",
-        "dir": "data_araknideo",
-        "install": "requirements",
-        "script_prefix": "",
-        # The only engine whose *content* changes between runs while its
-        # dependencies do not: the caption prompts live here. Without this a
-        # long-lived pod captions a whole dataset with a stale prompt and the
-        # owner only finds out after the training.
+        "dir": "captionkreator",
+        # `pip install -e .[wd14]`: the CLI plus the local booru tagger. No torch
+        # and no accelerate — it is an HTTP client plus an ONNX model on CPU.
+        "install": "package",
+        "extras": "wd14",
+        "torch": False,
+        # The engine's code changes between runs while its dependencies do not;
+        # a long-lived pod would otherwise caption with a stale engine.
         "pull": True,
     },
 }
 
 # ---------------------------------------------------------------------------
-# Caption presets (data_araknideo prompt profiles)
+# Caption profiles (caption_profiles/<media>/<key>/, run by captionkreator)
 # ---------------------------------------------------------------------------
+# `trigger`: the profile writes the trigger word into every caption and refuses
+# to run without one. Kept here as data because the UI and the preflight need it
+# without parsing YAML; a test checks it against each profile.yaml.
 
 CAPTION_PROFILES = {
     "image": [
-        {"key": "anima-character", "label": "Personagem (Anima)", "var": "trigger_character"},
-        {"key": "anima-style", "label": "Estilo (Anima)", "var": "trigger_style"},
-        {"key": "anima-concept", "label": "Conceito (Anima)", "var": None},
-        {"key": "anima-outfit", "label": "Outfit (Anima)", "var": "trigger_outfit"},
-        {"key": "default", "label": "NSFW prosa (Flux/Qwen/Krea)", "var": None},
-        {"key": "generic-character", "label": "Personagem genérico", "var": "character_name"},
-        {"key": "generic-style", "label": "Estilo genérico", "var": "style_name"},
+        {"key": "generic-style", "label": "Estilo", "trigger": True},
+        {"key": "generic-character", "label": "Personagem", "trigger": True},
+        {"key": "default", "label": "Descrição em prosa (conceito, NSFW)", "trigger": False},
+        {"key": "anima-style", "label": "Estilo (Anima)", "trigger": True},
+        {"key": "anima-character", "label": "Personagem (Anima)", "trigger": True},
+        {"key": "anima-concept", "label": "Conceito (Anima)", "trigger": False},
+        {"key": "anima-outfit", "label": "Roupa (Anima)", "trigger": True},
     ],
     "video": [
-        {"key": "nsfw_caption_video", "label": "Animação em loop NSFW", "var": None},
-        {"key": "grok_looping_animation_template", "label": "Loop LTX 2.3 (template novo)", "var": None},
-        {"key": "live-wallpaper", "label": "Live wallpaper", "var": None},
-        {"key": "live_wallpaper_game_cg", "label": "Live wallpaper game CG", "var": None},
+        {"key": "grok_looping_animation_template", "label": "Loop (LTX 2.3)", "trigger": False},
+        {"key": "nsfw_caption_video", "label": "Animação em loop NSFW", "trigger": False},
+        {"key": "live-wallpaper", "label": "Live wallpaper", "trigger": False},
+        {"key": "live_wallpaper_game_cg", "label": "Live wallpaper game CG", "trigger": False},
     ],
 }
+#: not offered in the UI: Style Rush captions its own dataset with it
+STYLE_RUSH_CAPTION_PROFILE = {"key": "style-rush", "label": "Style Rush", "trigger": True}
+
+#: what the owner is training, in his words — the one caption question a
+#: non-expert can answer. The profile follows from it and the model family.
+LORA_KINDS = {
+    "style": "Estilo",
+    "character": "Personagem",
+    "concept": "Conceito / outro",
+    "outfit": "Roupa",
+}
+
+_KIND_PROFILE = {
+    "anima": {"style": "anima-style", "character": "anima-character",
+              "concept": "anima-concept", "outfit": "anima-outfit"},
+    "image": {"style": "generic-style", "character": "generic-character",
+              "concept": "default", "outfit": "default"},
+}
+
+
+def caption_profile(key: str) -> dict | None:
+    if key == STYLE_RUSH_CAPTION_PROFILE["key"]:
+        return dict(STYLE_RUSH_CAPTION_PROFILE, media="image")
+    for media, profiles in CAPTION_PROFILES.items():
+        for p in profiles:
+            if p["key"] == key:
+                return dict(p, media=media)
+    return None
+
+
+def default_caption_profile(model_key: str | None, kind: str | None, media: str) -> str:
+    """The profile a non-expert gets: chosen by what he trains and on what.
+
+    Anima learns from booru tags mixed with prose, everything else here from
+    prose; video has its own family. Without a model yet, prose is the safe
+    default — every image model reads it.
+    """
+    if media == "video":
+        if model_key == "ltx-23":
+            return "grok_looping_animation_template"
+        return "nsfw_caption_video"
+    family = "anima" if model_key == "anima" else "image"
+    return _KIND_PROFILE[family].get(kind or "", _KIND_PROFILE[family]["concept"])
+
 
 # ---------------------------------------------------------------------------
 # Models
@@ -115,9 +163,10 @@ MODELS = {
         # on when the prompt line carries a negative prompt (--n); the scale is
         # --l, NOT --g (--g is embedded guidance, which K2 ignores). Without
         # these two the samples come out blurry BY DESIGN (docs/krea2.md).
-        # 5.5 is the official default (K2 "guidance 4.5" + 1). Every other
-        # arch here injects its own default negative, so only K2 needs this.
+        # 5.5 is the official default (K2 "guidance 4.5" + 1). Anima has the
+        # same --l rule (see its preset); the others ignore --g or set their own.
         "sample_args": {"l": 5.5, "n": "blurry, low quality, jpeg artifacts, watermark, text"},
+        "max_blocks_to_swap": 26,  # docs/krea2.md: 28 blocks − 2
         "resolution": [1024, 1024],
         "target_steps": 2000,
         "vram_tiers": [
@@ -162,6 +211,9 @@ MODELS = {
             "save_model_as": "safetensors", "save_precision": "bf16",
             # DO NOT add noise_offset: green-tint artifacts on Anima.
         },
+        # sd-scripts' Anima sampler reads CFG from --l (prompt "scale") and
+        # ignores --g; without this every sample ran at its 7.5 default.
+        "sample_args": {"l": 4.0},
         "resolution": [1024, 1024],
         "bucket_reso_steps": 64,
         "exposures_per_image": 660,
@@ -203,6 +255,7 @@ MODELS = {
             "learning_rate": 1e-4, "optimizer_type": "adamw8bit", "lr_scheduler": "cosine",
             "timestep_sampling": "flux2_shift", "weighting_scheme": "none",
         },
+        "max_blocks_to_swap": 16,  # docs/flux_2.md, klein-9b with fp8
         "resolution": [1024, 1024],
         "supports_control": True,   # FLUX.2 reference image = control_directory
         "target_steps": 2000,
@@ -251,43 +304,6 @@ MODELS = {
             {"min_gb": 0, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 45}, "cache_te": {"fp8_vl": True}},
         ],
     },
-    "qwen-image-edit": {
-        "label": "Qwen Image Edit",
-        "base_model": "Comfy-Org/Qwen-Image-Edit_ComfyUI",
-        "group": "imagem",
-        "media": "image",
-        "engine": "musubi",
-        "arch": "qwen_image",
-        "downloads": [
-            ("Comfy-Org/Qwen-Image-Edit_ComfyUI", "split_files/diffusion_models/qwen_image_edit_2511_bf16.safetensors", "qwen_image_edit_2511_bf16.safetensors"),
-            ("Comfy-Org/Qwen-Image_ComfyUI", "split_files/vae/qwen_image_vae.safetensors", "qwen_image_vae.safetensors"),
-            ("Comfy-Org/Qwen-Image_ComfyUI", "split_files/text_encoders/qwen_2.5_vl_7b.safetensors", "qwen_2.5_vl_7b.safetensors"),
-        ],
-        "model_args": {"dit": "qwen_image_edit_2511_bf16.safetensors", "vae": "qwen_image_vae.safetensors", "text_encoder": "qwen_2.5_vl_7b.safetensors"},
-        "extra_args": {"model_version": "edit-2511"},
-        "cache_latents_args": {"vae": "qwen_image_vae.safetensors", "model_version": "edit-2511"},
-        "cache_te_args": {"text_encoder": "qwen_2.5_vl_7b.safetensors", "batch_size": 8, "model_version": "edit-2511"},
-        "network_module": "networks.lora_qwen_image",
-        "train": {
-            "network_dim": 64, "network_alpha": 64,
-            "learning_rate": 5e-5, "optimizer_type": "adamw8bit", "lr_scheduler": "cosine",
-            "timestep_sampling": "shift", "weighting_scheme": "none", "discrete_flow_shift": 2.2,
-        },
-        "resolution": [1024, 1024],
-        "needs_control": True,  # dataset must ship a control/ folder
-        "supports_control": True,
-        "control_resolution": [1024, 1024],
-        "target_steps": 2000,
-        "vram_tiers": [
-            {"min_gb": 70, "train": {}},
-            {"min_gb": 38, "train": {"fp8_base": True, "fp8_scaled": True}},
-            # Same as qwen-image above: a 32 GB card was swapping 20 of 60 blocks
-            # to stay at 18 GB of 32. See that comment for the arithmetic.
-            {"min_gb": 30, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 8}, "cache_te": {"fp8_vl": True}},
-            {"min_gb": 22, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 20}, "cache_te": {"fp8_vl": True}},
-            {"min_gb": 0, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 45}, "cache_te": {"fp8_vl": True}},
-        ],
-    },
     "ideogram": {
         "label": "Ideogram",
         "base_model": "Comfy-Org/Ideogram-4",
@@ -302,7 +318,7 @@ MODELS = {
         ],
         "model_args": {
             "dit": "ideogram4_fp8_scaled.safetensors",
-            # same as Wan: sampling reads args.vae / args.text_encoder
+            # sampling reads args.vae / args.text_encoder
             "vae": "flux2-vae.safetensors",
             "text_encoder": "qwen3vl_8b_fp8_scaled.safetensors",
         },
@@ -314,9 +330,9 @@ MODELS = {
             "learning_rate": 1e-4, "optimizer_type": "adamw8bit", "lr_scheduler": "cosine",
             # timestep_sampling defaults to ideogram4_shift; weighting must stay none.
         },
+        "max_blocks_to_swap": 33,  # ideogram4_train_network.py raises above it
         "resolution": [1024, 1024],
         "target_steps": 2000,
-        "net_types": ["lora"],  # DiT base is FP8; LoHa/LoKr unverified here
         "vram_tiers": [
             {"min_gb": 44, "train": {}},
             {"min_gb": 22, "train": {"blocks_to_swap": 16}},
@@ -354,67 +370,19 @@ MODELS = {
         "vram_tiers": [
             {"min_gb": 140, "train": {}},
             {"min_gb": 70, "train": {"fp8_base": True, "fp8_scaled": True}},
-            {"min_gb": 44, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 10}, "cache_te": {"gemma_load_in_8bit": True}},
-            {"min_gb": 30, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 16}, "cache_te": {"gemma_load_in_8bit": True}},
-            {"min_gb": 0, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 24}, "cache_te": {"gemma_load_in_8bit": True}},
-        ],
-    },
-    "wan-22": {
-        "label": "Wan 2.2",
-        "base_model": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
-        "group": "video",
-        "media": "video",
-        "engine": "musubi",
-        "arch": "wan",
-        "downloads": [
-            ("Comfy-Org/Wan_2.2_ComfyUI_Repackaged", "split_files/diffusion_models/wan2.2_t2v_low_noise_14B_fp16.safetensors", "wan2.2_t2v_low_noise_14B_fp16.safetensors"),
-            ("Comfy-Org/Wan_2.2_ComfyUI_Repackaged", "split_files/diffusion_models/wan2.2_t2v_high_noise_14B_fp16.safetensors", "wan2.2_t2v_high_noise_14B_fp16.safetensors"),
-            ("Comfy-Org/Wan_2.1_ComfyUI_repackaged", "split_files/vae/wan_2.1_vae.safetensors", "wan_2.1_vae.safetensors"),
-            ("Wan-AI/Wan2.1-I2V-14B-720P", "models_t5_umt5-xxl-enc-bf16.pth", "models_t5_umt5-xxl-enc-bf16.pth"),
-        ],
-        "model_args": {
-            "dit": "wan2.2_t2v_low_noise_14B_fp16.safetensors",
-            "dit_high_noise": "wan2.2_t2v_high_noise_14B_fp16.safetensors",
-            # sampling loads the VAE and T5 from these same args (trainer_base
-            # _prepare_sampling); without them --sample_prompts crashes the run
-            "vae": "wan_2.1_vae.safetensors",
-            "t5": "models_t5_umt5-xxl-enc-bf16.pth",
-        },
-        "extra_args": {"task": "t2v-A14B"},
-        "cache_latents_args": {"vae": "wan_2.1_vae.safetensors"},
-        "cache_te_args": {"t5": "models_t5_umt5-xxl-enc-bf16.pth", "batch_size": 8},
-        "cache_te_key": "t5",
-        "network_module": "networks.lora_wan",
-        "train": {
-            "network_dim": 32, "network_alpha": 32,
-            "learning_rate": 2e-4, "optimizer_type": "adamw8bit", "lr_scheduler": "cosine",
-            "timestep_sampling": "shift", "discrete_flow_shift": 3.0,
-        },
-        "video_dataset": {"target_frames": [1, 33, 65], "frame_extraction": "full", "max_frames": 81, "source_fps": None},
-        "resolution": [832, 480],
-        "target_steps": 3000,
-        "vram_tiers": [
-            {"min_gb": 70, "train": {"fp8_base": True, "fp8_scaled": True}},
-            {"min_gb": 44, "train": {"fp8_base": True, "fp8_scaled": True, "offload_inactive_dit": True}, "cache_te": {"fp8_t5": True}},
-            {"min_gb": 30, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 20}, "cache_te": {"fp8_t5": True}},
-            {"min_gb": 0, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 30}, "cache_te": {"fp8_t5": True}},
+            # gemma_load_in_8bit in train too: the trainer loads Gemma-12B to
+            # encode the sample prompt (ltx2_sampling.py), ~24 GB in bf16
+            {"min_gb": 44, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 10, "gemma_load_in_8bit": True}, "cache_te": {"gemma_load_in_8bit": True}},
+            {"min_gb": 30, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 16, "gemma_load_in_8bit": True}, "cache_te": {"gemma_load_in_8bit": True}},
+            {"min_gb": 0, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 24, "gemma_load_in_8bit": True}, "cache_te": {"gemma_load_in_8bit": True}},
         ],
     },
 }
 
-MODEL_ORDER = ["krea2", "anima", "flux-klein", "qwen-image", "qwen-image-edit", "ideogram", "ltx-23", "wan-22"]
+MODEL_ORDER = ["krea2", "anima", "flux-klein", "qwen-image", "ideogram", "ltx-23"]
 
-# Network-type availability. LoRA+ rides on standard LoRA only.
-# DoRA is not implemented by any of the chosen backends (musubi has LoRA/LoHa/
-# LoKr; sd-scripts' networks.lora_anima has no dora_wd) — documented in README.
-NET_TYPES_MUSUBI = ["lora", "loha", "lokr"]
-NET_TYPES_SDSCRIPTS = ["lora"]
-
-NETWORK_MODULES = {
-    "musubi": {"loha": "networks.loha", "lokr": "networks.lokr"},
-    "musubi-ltx": {"loha": "networks.loha", "lokr": "networks.lokr"},
-}
-
+# Only standard LoRA is offered (LoHa/LoKr were dropped on purpose: one network
+# type keeps every preset proven). LoRA+ rides on it as an optional ratio.
 LORAPLUS_RATIO = 16  # owner's value in image_lora_arrakis
 
 
@@ -476,15 +444,6 @@ def style_rush_models() -> list[str]:
     return [k for k in MODEL_ORDER if MODELS[k].get("supports_control")]
 
 
-def net_types_for(model_key: str) -> list[str]:
-    model = MODELS[model_key]
-    if "net_types" in model:
-        return model["net_types"]
-    if model["engine"] == "sd-scripts":
-        return NET_TYPES_SDSCRIPTS
-    return NET_TYPES_MUSUBI
-
-
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
@@ -524,7 +483,6 @@ def public_presets() -> dict:
             "group": m["group"],
             "media": m["media"],
             "engine": m["engine"],
-            "net_types": net_types_for(key),
             "train": {k: v for k, v in m["train"].items()
                       if k in ("network_dim", "network_alpha", "learning_rate", "optimizer_type",
                                "lr_scheduler", "timestep_sampling")},

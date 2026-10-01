@@ -4,7 +4,7 @@ One input field accepts: local folder, local archive, HTTP(S) URL, Mega link,
 HuggingFace repo (user/repo) or HF file URL. Browser uploads land in the same
 staging dir. The source is NEVER mutated — everything is copied/extracted into
 projects/<name>/dataset/. A `control/` subfolder survives the flatten as
-<dataset>/control/ (Qwen Image Edit control images, paired by stem).
+<dataset>/control/ (edit-model control images, paired by stem).
 
 Patterns ported from character_animatrem (mega dir-diff, wrapper descent,
 archive-in-snapshot extraction, media+.txt pairing).
@@ -71,13 +71,25 @@ def import_source(source: str, dataset_dir: Path, job: Job) -> None:
     staging = dataset_dir.parent / "_staging"
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True)
+    # a failed or cancelled download must not leave GBs behind in the project
+    try:
+        _import_into(kind, source, staging, dataset_dir, job)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
+
+def _import_into(kind: str, source: str, staging: Path, dataset_dir: Path, job: Job) -> None:
     if kind == "empty":
         raise JobFailed("fonte vazia")
     elif kind == "unknown":
         raise JobFailed(f"não reconheci a fonte: {source!r} (pasta, zip, URL, Mega ou user/repo do HF)")
     elif kind == "local-dir":
-        _copytree(Path(source).expanduser(), staging / "src")
+        src = Path(source).expanduser().resolve()
+        project = dataset_dir.parent.resolve()
+        if src == project or project in src.parents or src in project.parents:
+            raise JobFailed("essa pasta contém (ou está dentro de) o próprio projeto — "
+                            "aponte para a pasta das imagens")
+        _copy_media_tree(src, staging / "src")
     elif kind == "local-archive":
         extract_archive(Path(source).expanduser(), staging / "src", job)
     elif kind == "hf-repo":
@@ -93,16 +105,43 @@ def import_source(source: str, dataset_dir: Path, job: Job) -> None:
 
     _resolve_archives(staging, job)
     normalize_into(staging, dataset_dir, job)
-    shutil.rmtree(staging, ignore_errors=True)
 
 
 def _copytree(src: Path, dest: Path) -> None:
     shutil.copytree(src, dest, dirs_exist_ok=True)
 
 
+def _copy_media_tree(src: Path, dest: Path) -> None:
+    """Copy only what an import keeps (media, captions, archives).
+
+    A whole-tree copy of a local folder also copied checkpoints, caches and
+    anything else living there — tens of GB — only to throw them away.
+    """
+    keep = IMAGE_EXTS | VIDEO_EXTS | {".txt"}
+    for f in src.rglob("*"):
+        if not f.is_file() or is_junk(f.relative_to(src)):
+            continue
+        if f.suffix.lower() not in keep and not archive_ext(f.name):
+            continue
+        target = dest / f.relative_to(src)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, target)
+
+
+def is_junk(rel: Path) -> bool:
+    """macOS resource forks (`__MACOSX/`, `._name`) and hidden files.
+
+    Finder puts a `._001.png` next to every image of a zip; it has an image
+    extension, no caption and no pixels, and it used to count as a dataset item.
+    """
+    return any(part == "__MACOSX" or part.startswith(".") for part in rel.parts)
+
+
 def _hf_snapshot(repo: str, dest: Path, job: Job) -> None:
     from huggingface_hub import snapshot_download
     from huggingface_hub.errors import RepositoryNotFoundError
+
+    from huggingface_hub.errors import GatedRepoError
 
     job.log(f"Baixando repo HF {repo}...")
     token = hf_token()
@@ -110,9 +149,12 @@ def _hf_snapshot(repo: str, dest: Path, job: Job) -> None:
         try:
             snapshot_download(repo, repo_type=repo_type, local_dir=str(dest), token=token)
             return
+        except GatedRepoError:  # a subclass of RepositoryNotFoundError
+            raise JobFailed(f"{repo} é gated — aceite os termos no HuggingFace com a conta "
+                            f"do HF_TOKEN e tente de novo")
         except RepositoryNotFoundError:
             continue
-    raise JobFailed(f"repo HF não encontrado: {repo}")
+    raise JobFailed(f"repo HF não encontrado (ou privado sem acesso pelo HF_TOKEN): {repo}")
 
 
 def _hf_file(repo: str, fname: str, is_dataset: bool, staging: Path, job: Job) -> None:
@@ -249,7 +291,7 @@ def normalize_into(staging: Path, dataset_dir: Path, job: Job) -> None:
     moved = 0
     media_exts = IMAGE_EXTS | VIDEO_EXTS
     for f in sorted(src.rglob("*")):
-        if not f.is_file():
+        if not f.is_file() or is_junk(f.relative_to(src)):
             continue
         ext = f.suffix.lower()
         in_control = "control" in [p.name.lower() for p in f.relative_to(src).parents if p.name]
@@ -292,7 +334,7 @@ def captions_map(dataset_dir: Path) -> dict[str, str]:
     if not dataset_dir.exists():
         return out
     for f in sorted(dataset_dir.iterdir()):
-        if not f.is_file() or f.suffix.lower() not in (IMAGE_EXTS | VIDEO_EXTS):
+        if not is_media_item(f):
             continue
         txt = f.with_suffix(".txt")
         try:
@@ -365,6 +407,13 @@ def captions_digest(dataset_dir: Path) -> str:
     return h.hexdigest()
 
 
+def is_media_item(f: Path) -> bool:
+    """A training item: a visible media file. Dotfiles are never items — that
+    covers macOS `._x.png` forks and the `.x.png.uploading` staging names."""
+    return f.is_file() and not f.name.startswith(".") \
+        and f.suffix.lower() in (IMAGE_EXTS | VIDEO_EXTS)
+
+
 def has_caption(item: Path) -> bool:
     """One rule for "this item is captioned", used by inspect and by the
     captioner's retry loop — two copies of it would drift."""
@@ -380,8 +429,7 @@ def uncaptioned(dataset_dir: Path) -> list[Path]:
     if not dataset_dir.exists():
         return []
     return [f for f in sorted(dataset_dir.iterdir())
-            if f.is_file() and f.suffix.lower() in (IMAGE_EXTS | VIDEO_EXTS)
-            and not has_caption(f)]
+            if is_media_item(f) and not has_caption(f)]
 
 
 def inspect(dataset_dir: Path) -> dict:
@@ -389,7 +437,7 @@ def inspect(dataset_dir: Path) -> dict:
     control = 0
     if dataset_dir.exists():
         for f in sorted(dataset_dir.iterdir()):
-            if not f.is_file():
+            if not is_media_item(f):
                 continue
             ext = f.suffix.lower()
             if ext in IMAGE_EXTS or ext in VIDEO_EXTS:

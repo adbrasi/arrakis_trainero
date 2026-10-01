@@ -31,8 +31,26 @@ def venv_bin(name: str, tool: str) -> Path:
     return engine_dir(name) / ".venv" / "bin" / tool
 
 
+#: written as the very last install step. The venv's python appears the moment
+#: `uv venv` runs, long before torch and the requirements land, so "python
+#: exists" called a half-installed engine ready forever after one failed pip —
+#: and the training then crashed on an import, after the base-model download.
+INSTALL_MARKER = ".trainero_installed"
+
+
+def _spec_stamp(name: str) -> str:
+    import hashlib
+    import json
+
+    return hashlib.sha256(json.dumps(ENGINES[name], sort_keys=True).encode()).hexdigest()[:16]
+
+
 def is_installed(name: str) -> bool:
-    return venv_python(name).exists()
+    marker = engine_dir(name) / ".venv" / INSTALL_MARKER
+    try:
+        return venv_python(name).exists() and marker.read_text().strip() == _spec_stamp(name)
+    except OSError:
+        return False
 
 
 def _uv() -> str | None:
@@ -41,53 +59,91 @@ def _uv() -> str | None:
     )
 
 
+def _pip(name: str, job: Job) -> list[str]:
+    venv = engine_dir(name) / ".venv"
+    uv = _uv()
+    if not (venv / "bin" / "python").exists():
+        if uv:
+            job.run([uv, "venv", str(venv), "--python", "3.11", "--seed"])
+        else:
+            job.run(["python3", "-m", "venv", str(venv)])
+    if uv:
+        return [uv, "pip", "install", "--python", str(venv / "bin/python")]
+    return [str(venv / "bin/python"), "-m", "pip", "install"]
+
+
+def _install_target(spec: dict) -> list[str]:
+    extras = spec.get("extras")
+    return ["-e", f".[{extras}]" if extras else "."]
+
+
 def ensure_engine(name: str, job: Job) -> None:
     spec = ENGINES[name]
     dest = engine_dir(name)
     ENGINES_DIR.mkdir(parents=True, exist_ok=True)
 
+    pulled = False
     if not (dest / ".git").exists():
+        # a leftover directory from an interrupted clone would make git refuse
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
         job.log(f"Clonando {spec['repo']} ({spec['branch']})...")
         job.run(["git", "clone", "--depth", "1", "--single-branch",
                  "--branch", spec["branch"], spec["repo"], str(dest)])
     elif spec.get("pull"):
-        # A stale prompt is bad; a phase that refuses to run is worse. Never let
+        # A stale engine is bad; a phase that refuses to run is worse. Never let
         # a network hiccup or a local commit in the clone stop the job.
         try:
             job.run(["git", "pull", "--ff-only"], cwd=dest)
+            pulled = True
         except Exception as exc:
             job.log(f"⚠ git pull falhou em {name} ({exc}) — seguindo com o clone atual.")
     else:
         job.log(f"Engine {name} já clonado.")
 
     if is_installed(name):
-        job.log(f"venv de {name} já existe.")
+        if pulled and spec["install"] == "package":
+            # new code may bring a new dependency; a satisfied install is a no-op
+            job.run(_pip(name, job) + _install_target(spec), cwd=dest)
+        job.log(f"venv de {name} pronto.")
         return
 
-    uv = _uv()
-    venv = dest / ".venv"
-    if uv:
-        job.run([uv, "venv", str(venv), "--python", "3.11", "--seed"])
-        pip = [uv, "pip", "install", "--python", str(venv / "bin/python")]
-    else:
-        job.run(["python3", "-m", "venv", str(venv)])
-        pip = [str(venv / "bin/python"), "-m", "pip", "install"]
-
-    job.log(f"Instalando torch no venv de {name} (pode demorar)...")
-    job.run(pip + TORCH_SPEC)
+    pip = _pip(name, job)
+    if spec.get("torch", True):
+        job.log(f"Instalando torch no venv de {name} (pode demorar)...")
+        job.run(pip + TORCH_SPEC)
 
     if spec["install"] == "package":
-        job.run(pip + ["-e", "."], cwd=dest)
+        job.run(pip + _install_target(spec), cwd=dest)
     else:
         req = dest / "requirements.txt"
         if not req.exists():
             raise JobFailed(f"{name}: requirements.txt não encontrado em {dest}")
-        # sd-scripts/data_araknideo requirements contain '.' — install from cwd
+        # sd-scripts requirements contain '.' — install from cwd
         job.run(pip + ["-r", "requirements.txt"], cwd=dest)
 
-    job.run(pip + ["accelerate>=1.6.0", "huggingface_hub[hf_xet]>=0.31.4", "protobuf", "six"])
-    _write_accelerate_config(job)
+    if spec.get("torch", True):
+        job.run(pip + ["accelerate>=1.6.0", "huggingface_hub[hf_xet]>=0.31.4", "protobuf", "six"])
+        _write_accelerate_config(job)
+        _check_cuda(name, job)
+    (dest / ".venv" / INSTALL_MARKER).write_text(_spec_stamp(name))
     job.log(f"✔ Engine {name} pronto.")
+
+
+def _check_cuda(name: str, job: Job) -> None:
+    """Fail at install, not after a 40 GB download: an unpinned torch can be
+    built for a CUDA newer than the pod's driver, and then it sees no GPU."""
+    if not shutil.which("nvidia-smi"):
+        job.log("⚠ nvidia-smi não encontrado — sem GPU visível; o treino não vai rodar aqui.")
+        return
+    probe = subprocess.run(
+        [str(venv_python(name)), "-c", "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 3)"],
+        capture_output=True, text=True, timeout=300)
+    if probe.returncode != 0:
+        raise JobFailed(
+            f"o torch instalado em {name} não enxerga a GPU (driver antigo para esta build "
+            f"de CUDA?). Use um pod com driver mais novo ou instale um torch compatível em "
+            f"{engine_dir(name) / '.venv'}. Detalhe: {(probe.stderr or probe.stdout)[-300:]}")
 
 
 def _write_accelerate_config(job: Job) -> None:

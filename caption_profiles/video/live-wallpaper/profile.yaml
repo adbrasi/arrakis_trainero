@@ -1,0 +1,26 @@
+name: live-wallpaper
+media: video
+display_name: "Live wallpaper"
+description: "Live wallpaper scene description."
+concurrency: 64
+stages:
+  - id: tags
+    type: wd14
+    threshold: 0.35
+  - id: caption
+    type: llm
+    provider: openrouter
+    model: meta/muse-spark-1.3-contributor
+    fallback:
+      - google/gemini-3.8-flash
+      - z-ai/glm-5.3-flash
+    system_prompt_file: system.md
+    user_prompt_file: user.md
+    extract_json: caption
+    reasoning_effort: minimal
+    params:
+      response_format:
+        type: json_object
+    retries: 1
+    validate:
+      - not_empty

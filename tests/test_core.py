@@ -7,8 +7,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from trainero.dataset import archive_ext, detect_source
-from trainero.presets import (MODEL_ORDER, MODELS, net_types_for,
-                              public_presets, suggest_schedule, vram_tier)
+from trainero.presets import (MODEL_ORDER, MODELS, public_presets,
+                              suggest_schedule, vram_tier)
 from trainero.training import (_cli_args, build_train_config, image_subset, slugify,
                                write_dataset_toml)
 
@@ -29,7 +29,7 @@ class TestPresets(unittest.TestCase):
         from the very args model_args writes into the config (trainer_base
         _prepare_sampling). A preset missing them only crashes after the engine
         install, the 40 GB download and the caching — so it is caught here."""
-        te_keys = ("text_encoder", "t5", "qwen3", "gemma_root")
+        te_keys = ("text_encoder", "qwen3", "gemma_root")
         for key in MODEL_ORDER:
             m = MODELS[key]
             if m["engine"] == "musubi-ltx":
@@ -60,10 +60,20 @@ class TestPresets(unittest.TestCase):
                     # intencional: cada imagem precisa ser vista o suficiente
                     self.assertLess(total, max(target * 2.5, n * 4 + 1), (key, n, total))
 
-    def test_net_types(self):
-        self.assertEqual(net_types_for("anima"), ["lora"])
-        self.assertIn("lokr", net_types_for("wan-22"))
-        self.assertEqual(net_types_for("ideogram"), ["lora"])
+    def test_only_standard_lora_is_offered(self):
+        """LoHa/LoKr were dropped: upstream musubi crashes on them for Krea 2
+        (network_arch cannot detect it) and one network type keeps every preset
+        proven."""
+        for key in MODEL_ORDER:
+            self.assertNotIn("net_types", public_presets()[key], key)
+            cfg = build_train_config(key, {"net_type": "lokr"}, suggest_schedule(key, 10),
+                                     {"items": 10}, 48, Path("/t.toml"), Path("/o"), "x", 1)
+            self.assertEqual(cfg["network_module"], MODELS[key]["network_module"], key)
+
+    def test_dropped_models_are_gone(self):
+        for key in ("wan-22", "qwen-image-edit"):
+            self.assertNotIn(key, MODELS)
+            self.assertNotIn(key, MODEL_ORDER)
 
     def test_public_presets_json_safe(self):
         import json
@@ -74,10 +84,7 @@ class TestPresets(unittest.TestCase):
         from trainero.presets import style_rush_models
 
         keys = style_rush_models()
-        self.assertIn("flux-klein", keys)
-        self.assertIn("qwen-image-edit", keys)
-        self.assertNotIn("wan-22", keys)
-        self.assertNotIn("anima", keys)
+        self.assertEqual(keys, ["flux-klein"])
 
     def test_style_rush_schedule_is_fixed(self):
         from trainero.presets import STYLE_RUSH_SCHEDULE
@@ -122,20 +129,34 @@ class TestTrainConfig(unittest.TestCase):
             self.assertNotIn("max_train_steps", cfg, key)  # epochs, never steps
             self.assertTrue(cfg["output_name"], key)
 
-    def test_lokr_switch(self):
-        cfg = self._cfg("wan-22", {"net_type": "lokr"})
-        self.assertEqual(cfg["network_module"], "networks.lokr")
-        self.assertEqual(cfg["network_alpha"], cfg["network_dim"] // 2)
-
     def test_loraplus(self):
         cfg = self._cfg("flux-klein", {"loraplus": True})
         self.assertIn("loraplus_lr_ratio=16", cfg["network_args"])
 
-    def test_invalid_net_type_rejected(self):
+    def test_blocks_to_swap_above_the_upstream_maximum_is_refused_upfront(self):
         from trainero.jobs import JobFailed
 
-        with self.assertRaises(JobFailed):
-            self._cfg("anima", {"net_type": "lokr"})
+        for key, cap in (("krea2", 26), ("flux-klein", 16), ("ideogram", 33)):
+            self._cfg(key, {"blocks_to_swap": cap})
+            with self.assertRaises(JobFailed, msg=key):
+                self._cfg(key, {"blocks_to_swap": cap + 1})
+
+    def test_anima_samples_set_cfg_through_l(self):
+        """sd-scripts' Anima sampler reads CFG from --l and ignores --g."""
+        from trainero.training import sample_prompt_line
+
+        line = sample_prompt_line("x", "", [1024, 1024], extra=MODELS["anima"].get("sample_args"))
+        self.assertIn("--l 4.0", line)
+
+    def test_ltx_loads_gemma_in_8bit_for_sampling_below_140gb(self):
+        for vram in (32, 48, 80):
+            cfg = self._cfg_v("ltx-23", vram)
+            if vram < 70:
+                self.assertTrue(cfg.get("gemma_load_in_8bit"), vram)
+
+    def _cfg_v(self, key, vram):
+        return build_train_config(key, {}, suggest_schedule(key, 10), {"items": 10}, vram,
+                                  Path("/tmp/ds.toml"), Path("/tmp/out"), "t", 1)
 
     def test_overrides_apply(self):
         cfg = self._cfg("qwen-image", {"network_dim": "16", "learning_rate": "1e-4"})
@@ -178,7 +199,7 @@ class TestDatasetToml(unittest.TestCase):
         self.assertNotIn("control_directory", text)
 
     def test_musubi_edit_has_control(self):
-        toml = self._write("qwen-image-edit", [
+        toml = self._write("flux-klein", [
             image_subset(Path("/ds"), Path("/cache"), 1,
                          control_dir=Path("/ds/control"), control_resolution=[1024, 1024]),
         ])
@@ -261,13 +282,13 @@ class TestSamplePrompts(unittest.TestCase):
         self.assertGreater(line.index("--n"), line.index("--l"))
         self.assertGreater(line.index("--n"), line.index("--s"))
 
-    def test_only_krea2_needs_sample_args(self):
-        """The other musubi archs inject their own default negative prompt
-        (qwen/flux/wan) or run their own CFG scheme (ideogram4)."""
+    def test_only_the_archs_that_read_cfg_from_l_carry_sample_args(self):
+        """Krea 2 (musubi) and Anima (sd-scripts) read CFG from --l; the other
+        archs inject their own default negative prompt or run their own CFG."""
         from trainero.presets import MODEL_ORDER, MODELS
 
         carriers = [k for k in MODEL_ORDER if "sample_args" in MODELS[k]]
-        self.assertEqual(carriers, ["krea2"])
+        self.assertEqual(carriers, ["krea2", "anima"])
 
     def test_write_creates_single_line_file(self):
         import tempfile
@@ -312,7 +333,7 @@ class TestComfyConvert(unittest.TestCase):
     def test_models_without_the_key_convert_nothing(self):
         from trainero.training import comfy_convert_command
 
-        for key in ("flux-klein", "qwen-image", "krea2", "wan-22"):
+        for key in ("flux-klein", "qwen-image", "krea2", "ltx-23"):
             self.assertIsNone(
                 comfy_convert_command(key, Path("/o/a.safetensors"),
                                       Path("/o/a_comfy.safetensors")), key)
@@ -328,54 +349,6 @@ class TestComfyConvert(unittest.TestCase):
         self.assertNotIn("forced", inspect.signature(training.comfy_converter).parameters)
         src = Path(training.__file__).read_text()
         self.assertNotIn('overrides.get("comfy_convert")', src)
-
-
-class TestCaptionModel(unittest.TestCase):
-    """Os flags do captioner se chamam --grok_* por razões históricas; o modelo
-    atrás deles é uma escolha, e ela muda com o modo."""
-
-    def test_the_flag_default_is_still_gemini(self):
-        from trainero.captioner import DEFAULT_CAPTION_MODEL
-
-        self.assertEqual(DEFAULT_CAPTION_MODEL, "google/gemini-3.7-flash")
-
-    def test_the_command_passes_the_mode_primary_to_openrouter(self):
-        import os
-        from pathlib import Path as P
-
-        from trainero import captioner
-
-        cmds = []
-
-        class FakeJob:
-            def log(self, *_): pass
-
-            def run(self, cmd, cwd=None, **_kw):
-                cmds.append([str(c) for c in cmd])
-
-        saved = (captioner.ensure_engine, captioner.venv_python, captioner.engine_dir,
-                 os.environ.get("OPENROUTER_API_KEY"))
-        captioner.ensure_engine = lambda *_a: None
-        captioner.venv_python = lambda _e: P("/v/python")
-        captioner.engine_dir = lambda _e: P("/e/captioner")
-        os.environ["OPENROUTER_API_KEY"] = "sk-test"
-        try:
-            for mode in ("lora", "style-rush"):
-                cmds.clear()
-                captioner.generate_captions(P("/ds"), "image", "generic-style",
-                                            {"style_name": "makima"}, FakeJob(), mode=mode)
-                cmd = cmds[0]
-                self.assertIn("--grok_model", cmd)
-                self.assertEqual(cmd[cmd.index("--grok_model") + 1],
-                                 captioner.caption_models(mode)[0], mode)
-                self.assertEqual(cmd[cmd.index("--grok_provider") + 1], "openrouter")
-                self.assertIn("style_name=makima", cmd)
-        finally:
-            captioner.ensure_engine, captioner.venv_python, captioner.engine_dir = saved[:3]
-            if saved[3] is None:
-                os.environ.pop("OPENROUTER_API_KEY", None)
-            else:
-                os.environ["OPENROUTER_API_KEY"] = saved[3]
 
 
 class TestDetectSource(unittest.TestCase):
@@ -422,8 +395,10 @@ class TestEnginePull(unittest.TestCase):
         from trainero import engines
 
         with tempfile.TemporaryDirectory() as td:
-            dest = P(td) / "data_araknideo"
+            dest = P(td) / "captionkreator"
             (dest / ".git").mkdir(parents=True)
+            (dest / ".venv" / "bin").mkdir(parents=True)
+            (dest / ".venv" / "bin" / "python").touch()
             ran = []
 
             class FakeJob:
@@ -436,7 +411,11 @@ class TestEnginePull(unittest.TestCase):
                  mock.patch.object(engines, "is_installed", return_value=True):
                 engines.ensure_engine("captioner", FakeJob())
 
-            self.assertEqual(ran, [(["git", "pull", "--ff-only"], str(dest))])
+            self.assertEqual(ran[0], (["git", "pull", "--ff-only"], str(dest)))
+            # new code may need a new dependency: the editable install is redone
+            self.assertEqual(len(ran), 2)
+            self.assertEqual(ran[1][0][-2:], ["-e", ".[wd14]"])
+            self.assertNotIn("torch", ran[1][0])
 
     def test_a_training_engine_is_left_alone(self):
         import tempfile
@@ -550,7 +529,7 @@ class TestVramTiers(unittest.TestCase):
     def test_a_32gb_card_swaps_far_less_on_qwen(self):
         from trainero.presets import vram_tier
 
-        for key in ("qwen-image", "qwen-image-edit"):
+        for key in ("qwen-image",):
             tier = vram_tier(key, 32)["train"]
             self.assertTrue(tier.get("fp8_base"), key)
             self.assertLessEqual(tier.get("blocks_to_swap", 0), 8, key)

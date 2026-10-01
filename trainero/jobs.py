@@ -31,6 +31,10 @@ _EPOCH_RE = re.compile(r"epoch (\d+)/(\d+)", re.IGNORECASE)
 _EOL_RE = re.compile(rb"([\r\n])")
 
 
+#: seconds between SIGTERM and SIGKILL on cancel — time for the trainer to exit
+KILL_GRACE = 15.0
+
+
 class Cancelled(Exception):
     pass
 
@@ -52,22 +56,29 @@ class SyncJob:
         pass
 
     def run(self, cmd: list, cwd: Path | None = None, env: dict | None = None,
-            parse_progress: bool = False) -> int:
+            parse_progress: bool = False, check: bool = True, on_line=None) -> int:
         full_env = dict(os.environ)
         if env:
             full_env.update(env)
         proc = subprocess.run([str(c) for c in cmd], cwd=str(cwd) if cwd else None,
                               env=full_env, capture_output=True, text=True)
-        if proc.returncode != 0:
+        if on_line:
+            for line in (proc.stdout or "").splitlines():
+                on_line(line)
+        if check and proc.returncode != 0:
             raise JobFailed(f"comando saiu com código {proc.returncode}: "
                             f"{(proc.stderr or proc.stdout)[-300:]}")
         return proc.returncode
 
 
 class Job:
-    def __init__(self, kind: str, title: str, log_path: Path):
+    def __init__(self, kind: str, title: str, log_path: Path, project: str = ""):
         self.kind = kind
         self.title = title
+        # the project the job reads and writes. The UI's selected project can
+        # change under a running job; anything that shows the job's output
+        # (samples, log) has to follow this, not the selection.
+        self.project = project
         self.log_path = log_path
         self.phase = ""
         self.phases: list[dict] = []  # [{name, status: pending|running|done|failed}]
@@ -149,12 +160,14 @@ class Job:
                 return
 
             def _escalate():
-                time.sleep(15)
-                if proc.poll() is None:
-                    try:
-                        os.killpg(pgid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
+                time.sleep(KILL_GRACE)
+                # the whole group, even when the leader already exited: a stuck
+                # grandchild (a DataLoader worker, a CUDA call) keeps the stdout
+                # pipe open, and the job would sit in "running" forever
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
 
             threading.Thread(target=_escalate, daemon=True).start()
 
@@ -164,9 +177,12 @@ class Job:
 
     # -- subprocess with streaming ----------------------------------------
     def run(self, cmd: list[str], cwd: Path | None = None, env: dict | None = None,
-            parse_progress: bool = False) -> int:
+            parse_progress: bool = False, check: bool = True, on_line=None) -> int:
         """Run a child, stream every output line to the log, optionally parse
-        training progress. Raises Cancelled/JobFailed."""
+        training progress. Raises Cancelled, and JobFailed on a non-zero exit
+        unless check=False (then the caller reads the return code). on_line, when
+        given, sees every output line — the hook for progress formats other than
+        the trainers' tqdm bar."""
         self.check_cancel()
         self.log("$ " + " ".join(str(c) for c in cmd))
         full_env = dict(os.environ)
@@ -179,9 +195,13 @@ class Job:
             start_new_session=True,
         )
         self._proc = proc
+        # a cancel that landed between check_cancel() and the line above found
+        # no process to kill; without this the child would run to completion
+        if self._cancel.is_set():
+            self.cancel()
         assert proc.stdout is not None
         try:
-            self._stream(proc.stdout, parse_progress)
+            self._stream(proc.stdout, parse_progress, on_line)
             proc.wait()
         finally:
             self._proc = None
@@ -191,11 +211,11 @@ class Job:
                 pass
         if self._cancel.is_set():
             raise Cancelled()
-        if proc.returncode != 0:
+        if check and proc.returncode != 0:
             raise JobFailed(f"comando saiu com código {proc.returncode}")
         return proc.returncode
 
-    def _stream(self, stdout, parse_progress: bool) -> None:
+    def _stream(self, stdout, parse_progress: bool, on_line=None) -> None:
         """Turn the child's output into log lines as it arrives.
 
         Splitting on \\r as well as \\n is the whole point: tqdm — and every
@@ -217,6 +237,8 @@ class Job:
                 transient = pieces[i + 1] == b"\r"
                 if parse_progress:
                     self._parse_progress(line)
+                if on_line:
+                    on_line(line)
                 if line.strip():
                     self.log(line, transient=transient)
                 elif not transient:
@@ -227,6 +249,8 @@ class Job:
         if tail.strip():
             if parse_progress:
                 self._parse_progress(tail)
+            if on_line:
+                on_line(tail)
             self.log(tail)
 
     def _parse_progress(self, line: str) -> None:
@@ -250,6 +274,7 @@ class Job:
         return {
             "kind": self.kind,
             "title": self.title,
+            "project": self.project,
             "status": self.status,
             "phase": self.phase,
             "phases": self.phases,
@@ -265,7 +290,7 @@ def current() -> Job | None:
     return _current
 
 
-def start(kind: str, title: str, log_path: Path, target) -> Job:
+def start(kind: str, title: str, log_path: Path, target, project: str = "") -> Job:
     """Reserve the slot and run `target(job)` in a daemon thread.
     Raises RuntimeError if a job is already running (server-side guard —
     the client-side one is lost on page reload)."""
@@ -273,7 +298,7 @@ def start(kind: str, title: str, log_path: Path, target) -> Job:
     with _lock:
         if _current is not None and _current.status == "running":
             raise RuntimeError("Já existe um job em andamento.")
-        job = Job(kind, title, log_path)
+        job = Job(kind, title, log_path, project=project)
         _current = job
 
     def _runner():

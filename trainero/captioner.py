@@ -1,114 +1,68 @@
-"""LLM captioning via data_araknideo (PixAI booru tags -> Grok/OpenRouter).
+"""LLM captioning via captionkreator (`captioner run`), with this repo's profiles.
 
-Same invocation character_animatrem uses; the prompt profiles live in the
-captioner clone (prompts/<image|video>/<profile>/). Needs OPENROUTER_API_KEY.
+captionkreator is the engine: discovery, WD14 booru tags, the OpenRouter model
+cascade, JSON extraction, validation, resume state and cost accounting all live
+there. What lives here is what is specific to training a LoRA:
 
-Three passes, because a caption is not optional: a single item without one
-blocks the whole training. The cheap model runs first; whatever it refuses on
-content grounds goes to a second model with different policies; whatever both
-refuse leaves the dataset. Refusal is a property of the image, not a transient
-error, so retrying the same model would only cost time.
+- the prompt profiles (caption_profiles/<media>/<name>/), passed with
+  --prompts-dir, so a caption is written for the model being trained;
+- the decision of what to do with an item no model would caption: it blocks
+  the whole training, so it leaves the dataset — but only after proving the
+  OpenRouter account is alive, because a dead key looks exactly like every
+  model refusing;
+- the list of items the primary model refused, which Style Rush reads to avoid
+  paying gpt-image-2 for slots it would refuse too.
+
+The cascade is the profile's `model` + `fallback`. A refusal is not retried on
+the same model forever (profiles set retries: 1); it moves down the chain.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 from . import dataset as ds
-from .config import IMAGE_EXTS, VIDEO_EXTS
-from .engines import engine_dir, ensure_engine, venv_python
+from .config import IMAGE_EXTS, REPO_DIR, VIDEO_EXTS
+from .engines import engine_dir, ensure_engine, venv_bin
 from .jobs import Job, JobFailed
+from .presets import caption_profile, default_caption_profile
 
-TAGGER_LOG = ".tagger_log.json"
+PROFILES_DIR = REPO_DIR / "caption_profiles"
 FLAGGED_FILE = ".caption_refused.json"
 QUARANTINE_DIR = "descartadas"
+#: written by captionkreator inside the dataset; all of it describes the captions
+STATE_FILES = (".captioner.sqlite", ".captioner.sqlite-wal", ".captioner.sqlite-shm",
+               "captions.json")
+#: bookkeeping of the previous engine (data_araknideo); cleared with the captions
+LEGACY_FILES = (".tagger_log.json",)
 
-# The captioner's CLI names this stage "grok" for historical reasons; the flag
-# takes any OpenRouter model id with vision.
-MUSE_SPARK = "meta/muse-spark-1.2-contributor"
-GEMINI_FLASH = "google/gemini-3.7-flash"
-GROK = "x-ai/grok-4.20"
-
-# The order depends on what the mode does with the primary's refusal. The only
-# consumer of .caption_refused.json is Style Rush's content_flagged, which uses
-# it to avoid paying for a slot gpt-image-2 would refuse — so there the primary
-# has to be the model whose filter most resembles OpenAI's, which is Gemini. A
-# plain LoRA has no paid phase and nothing reads the list, so its order is pure
-# cost and quality: Muse Spark captions the same explicit material for a tenth
-# of the price.
-DEFAULT_CAPTION_MODELS = {
-    "lora": [MUSE_SPARK, GEMINI_FLASH, GROK],
-    "style-rush": [GEMINI_FLASH, MUSE_SPARK, GROK],
-}
-
-# What record_flagged means by "the strict model". Kept as a name because the
-# flag file records it and the Style Rush half reasons about it.
-DEFAULT_CAPTION_MODEL = DEFAULT_CAPTION_MODELS["style-rush"][0]
-
-# The tagger's own default is 32, which is what a thousand-image dataset waits
-# on. One knob, not one per model.
+# One knob for the whole cascade; captionkreator paces itself down on 429s.
 CAPTION_CONCURRENCY = int(os.environ.get("CAPTION_CONCURRENCY", "64"))
 
 MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
 
-
-def caption_models(mode: str = "lora") -> list[str]:
-    """The cascade for this mode, cheapest-useful first.
-
-    CAPTION_MODELS overrides every mode at once: a comma-separated list is one
-    knob for a cascade of any length, where numbered env vars would silently
-    pin it to the length they were written for.
-    """
-    override = os.environ.get("CAPTION_MODELS", "").strip()
-    if override:
-        return [m.strip() for m in override.split(",") if m.strip()]
-    return list(DEFAULT_CAPTION_MODELS.get(mode) or DEFAULT_CAPTION_MODELS["lora"])
-
-
-def prune_stale_log(dataset_dir: Path, job: Job | None = None) -> int:
-    """Drop processing-log entries whose caption file is gone.
-
-    The tagger skips anything already in its log, which is what makes an
-    interrupted run resume for free. The log is only trustworthy while it
-    agrees with the disk: a .txt deleted by hand (or never written, because the
-    LLM returned nothing) would otherwise be skipped forever. Reconciling here
-    keeps "delete the caption to redo it" working without a reprocess-all flag.
-    """
-    path = Path(dataset_dir) / TAGGER_LOG
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return 0
-    processed = data.get("processed")
-    if not isinstance(processed, dict):
-        return 0
-    stale = [f for f in processed if not Path(f).with_suffix(".txt").exists()]
-    if not stale:
-        return 0
-    for f in stale:
-        del processed[f]
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-    if job:
-        job.log(f"{len(stale)} itens sem caption no disco voltaram para a fila.")
-    return len(stale)
+_PROGRESS_RE = re.compile(r"^progress: (\d+)/(\d+)")
+_COST_RE = re.compile(r"cost \$([0-9.]+)")
 
 
 def clear_captions(dataset_dir, job: Job | None = None) -> int:
     """Delete every caption in the dataset so the next run writes them all again.
 
-    Deleting only the .txt would do nothing: the tagger skips anything already
-    in its processing log, which is exactly the property that makes an
-    interrupted run resume for free. The log and the flag file are conclusions
-    the old models drew about these images, and redoing the captions is redoing
-    those conclusions — so all three go together or none of them do.
+    The .txt alone is not enough: captionkreator restores a missing sidecar from
+    its state without asking the model again — the property that makes an
+    interrupted run free to resume. Its state, the refusal list and captions.json
+    are conclusions drawn about the old captions, so they go together.
 
-    QUARANTINE_DIR is not touched. It sits beside the dataset, it already left,
-    and it is the owner's only copy of what was moved out.
+    QUARANTINE_DIR is not touched: it sits beside the dataset and is the owner's
+    only copy of what was moved out.
     """
     dataset_dir = Path(dataset_dir)
     removed = 0
+    if not dataset_dir.is_dir():
+        return 0
     for item in sorted(dataset_dir.iterdir()):
         if not item.is_file() or item.suffix.lower() not in MEDIA_EXTS:
             continue
@@ -117,69 +71,43 @@ def clear_captions(dataset_dir, job: Job | None = None) -> int:
         except OSError:
             continue
         removed += 1
-    for bookkeeping in (dataset_dir / TAGGER_LOG, dataset_dir / FLAGGED_FILE):
-        bookkeeping.unlink(missing_ok=True)
+    for name in (*STATE_FILES, *LEGACY_FILES, FLAGGED_FILE):
+        (dataset_dir / name).unlink(missing_ok=True)
     if job:
         job.log(f"{removed} captions apagadas — todas serão reescritas.")
     return removed
 
 
-def _tagger_cmd(dataset_dir: Path, media: str, profile: str,
-                prompt_vars: dict[str, str], model: str) -> list[str]:
-    cap_dir = engine_dir("captioner")
+def captioner_cmd(dataset_dir: Path, profile: str, trigger: str = "") -> list[str]:
     cmd = [
-        str(venv_python("captioner")),
-        str(cap_dir / "tag_images_by_wd14_tagger.py"),
-        str(dataset_dir),
-        "--taggers", "pixai,grok",
-        "--grok_provider", "openrouter",
-        "--grok_model", model,
-        "--grok_concurrency", str(CAPTION_CONCURRENCY),
-        "--prompt_profile", profile,
-        "--remove_underscore",
-        "--thresh", "0.30",
-        # No --force. That flag reprocesses every file already in the tagger's
-        # log, so an interrupted run (OpenRouter running out of credits at image
-        # 190 of 282) charged for the whole dataset again on the retry. Both
-        # callers want the same thing — fill what is missing — and the UI only
-        # ever offers the button while something is missing.
-        "--grok_context_from_existing",  # manual .txt vira contexto do LLM
+        str(venv_bin("captioner", "captioner")), "run", str(dataset_dir),
+        "--profile", profile,
+        "--prompts-dir", str(PROFILES_DIR),
+        # control/ holds edit-model references, not training items
+        "--no-recursive",
+        # fill gaps only: an imported or hand-edited caption is the owner's
+        "--skip-captioned",
+        "--concurrency", str(CAPTION_CONCURRENCY),
     ]
-    if media == "video":
-        cmd.append("--video")
-    for key, value in prompt_vars.items():
-        if value:
-            cmd += ["--prompt_var", f"{key}={value}"]
+    if trigger:
+        cmd += ["--var", f"trigger={trigger}"]
     return cmd
-
-
-def _pass(dataset_dir: Path, media: str, profile: str, prompt_vars: dict[str, str],
-          job: Job, model: str) -> list[Path]:
-    """One tagger run with one model. Returns what is still uncaptioned.
-
-    The stale-log prune has to happen before every run, not once: a refusal can
-    leave the item in the tagger's log without a caption beside it, and the next
-    run would then skip the very file it is here to rescue.
-    """
-    prune_stale_log(dataset_dir, job)
-    job.run(_tagger_cmd(dataset_dir, media, profile, prompt_vars, model),
-            cwd=engine_dir("captioner"))
-    return ds.uncaptioned(dataset_dir)
 
 
 def openrouter_problem() -> str:
     """Empty string when the account can actually serve requests, else why not.
 
     Guards the discard: a dead key or an empty balance leaves every item
-    uncaptioned, which looks exactly like every model refusing them. Deleting
-    the owner's images because his card expired is not a recovery.
+    uncaptioned, which looks exactly like every model refusing them. Moving the
+    owner's images out because his card expired is not a recovery.
     """
     import urllib.error
     import urllib.request
 
     key = os.environ.get("OPENROUTER_API_KEY", "")
-    req = urllib.request.Request("https://openrouter.ai/api/v1/key",
-                                 headers={"Authorization": f"Bearer {key}"})
+    base = os.environ.get("OPENROUTER_BASE_URL", "").strip().rstrip("/") \
+        or "https://openrouter.ai/api/v1"
+    req = urllib.request.Request(f"{base}/key", headers={"Authorization": f"Bearer {key}"})
     try:
         data = json.load(urllib.request.urlopen(req, timeout=30)).get("data", {})
     except urllib.error.HTTPError as exc:
@@ -192,29 +120,37 @@ def openrouter_problem() -> str:
     return ""
 
 
-def record_flagged(dataset_dir: Path, items: list[Path], model: str) -> None:
+def fallback_names(dataset_dir: Path) -> set[str]:
+    """Items whose caption came from a fallback route, per captions.json."""
+    try:
+        rows = json.loads((Path(dataset_dir) / "captions.json").read_text()).get("items", [])
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return set()
+    return {r.get("filename") for r in rows
+            if isinstance(r, dict) and r.get("fallback") is True and r.get("filename")}
+
+
+def record_flagged(dataset_dir: Path, names: set[str], profile: str) -> None:
     """Remember which items the primary model would not caption.
 
     They are the ones a content filter objects to, which is the same objection
     gpt-image-2 raises in the Style Rush conversion phase — and there a refusal
-    costs a paid slot. Written next to the dataset so that phase can read it
-    without re-running any model. `model` is recorded because the primary is
-    not the same in every mode, and a list is only as meaningful as the filter
-    that produced it.
+    costs a paid slot. Kept as a union across runs: a resumed run only sees the
+    items it captioned itself.
     """
     path = dataset_dir / FLAGGED_FILE
     try:
         known = set(json.loads(path.read_text()).get("refused_by_primary", []))
     except (OSError, json.JSONDecodeError, AttributeError):
         known = set()
-    known |= {i.name for i in items}
+    known |= names
     path.write_text(json.dumps(
-        {"model": model, "refused_by_primary": sorted(known)},
+        {"profile": profile, "refused_by_primary": sorted(known)},
         indent=2, ensure_ascii=False))
 
 
 def flagged_names(dataset_dir: Path) -> set[str]:
-    """File names the strict caption model refused, as recorded by record_flagged."""
+    """File names the primary caption model refused, as recorded by record_flagged."""
     try:
         return set(json.loads((Path(dataset_dir) / FLAGGED_FILE).read_text())
                    .get("refused_by_primary", []))
@@ -225,17 +161,13 @@ def flagged_names(dataset_dir: Path) -> set[str]:
 def quarantine_uncaptionable(dataset_dir: Path, items: list[Path], job: Job) -> None:
     """Move items no model would caption out of the dataset, so the run goes on.
 
-    Moved, not deleted. An uncaptioned item blocks the training outright, so it
-    has to leave the dataset — but the only evidence that a model *refused* is
-    that it returned nothing, which is also what a dead endpoint, a retired
-    model id and a rate limit return. The account check upstream catches the
-    common case and cannot catch all of them, and unlink on the owner's only
-    copy of an imported image is not a recoverable mistake. QUARANTINE_DIR sits
-    beside the dataset, so nothing scans it and he can look at what left.
+    Moved, not deleted: the only evidence that a model *refused* is that it
+    returned nothing, which is also what a retired model id returns. The account
+    check upstream catches the common case and cannot catch all of them.
     """
     dest = dataset_dir.parent / QUARANTINE_DIR
     dest.mkdir(parents=True, exist_ok=True)
-    moved = []
+    moved = 0
     for item in items:
         try:
             item.replace(dest / item.name)
@@ -245,50 +177,77 @@ def quarantine_uncaptionable(dataset_dir: Path, items: list[Path], job: Job) -> 
         txt = item.with_suffix(".txt")
         if txt.exists():
             txt.replace(dest / txt.name)
-        moved.append(item)
+        moved += 1
         job.log(f"✗ fora do dataset (nenhum modelo aceitou): {item.name}")
-    try:
-        log = dataset_dir / TAGGER_LOG
-        data = json.loads(log.read_text())
-        gone = {str(i) for i in moved}
-        data["processed"] = {k: v for k, v in data.get("processed", {}).items()
-                             if k not in gone}
-        log.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-    except (OSError, json.JSONDecodeError, AttributeError):
-        pass
     if moved:
-        job.log(f"⚠ {len(moved)} itens movidos para {dest}")
+        job.log(f"⚠ {moved} itens movidos para {dest}")
 
 
-def generate_captions(dataset_dir, media: str, profile: str, prompt_vars: dict[str, str],
-                      job: Job, mode: str = "lora") -> None:
+def _uncaptioned(dataset_dir: Path, media: str) -> list[Path]:
+    exts = IMAGE_EXTS if media == "image" else VIDEO_EXTS
+    return [p for p in ds.uncaptioned(dataset_dir) if p.suffix.lower() in exts]
+
+
+def _progress_hook(job: Job, errors: list[str]):
+    def on_line(line: str) -> None:
+        if line.strip().startswith("error:"):
+            errors.append(line.strip()[len("error:"):].strip())
+        m = _PROGRESS_RE.match(line.strip())
+        if not m:
+            return
+        job.progress.update({"step": int(m.group(1)), "total_steps": int(m.group(2)),
+                             "unit": "captions"})
+        cost = _COST_RE.search(line)
+        if cost:
+            job.extra["caption_cost"] = float(cost.group(1))
+    return on_line
+
+
+def generate_captions(dataset_dir, profile: str, job: Job, trigger: str = "",
+                      redo: bool = False) -> None:
+    """Caption every item of `dataset_dir` that has no caption yet.
+
+    Ends with every remaining item captioned, or raises. What no model would
+    caption is moved out (see quarantine_uncaptionable); an infrastructure
+    failure raises instead and leaves the dataset as it was.
+    """
+    spec = caption_profile(profile)
+    if spec is None:
+        raise JobFailed(f"perfil de caption desconhecido: {profile}")
+    trigger = (trigger or "").strip()
+    if spec["trigger"] and not trigger:
+        raise JobFailed(f"o perfil '{spec['label']}' precisa da trigger word — preencha no passo 01")
+    dataset_dir = Path(dataset_dir)
+    media = spec["media"]
+    if not redo and not _uncaptioned(dataset_dir, media):
+        job.log("Todos os itens já têm caption.")
+        return
+    # checked before the clear: a redo without a key would delete every
+    # caption and then fail to write a single one
     if not os.environ.get("OPENROUTER_API_KEY"):
         raise JobFailed("defina OPENROUTER_API_KEY para gerar captions com LLM")
-    dataset_dir = Path(dataset_dir)
+    if redo:
+        clear_captions(dataset_dir, job)
+
     ensure_engine("captioner", job)
+    job.log(f"Perfil de caption: {spec['label']} ({profile})")
+    errors: list[str] = []
+    code = job.run(captioner_cmd(dataset_dir, profile, trigger if spec["trigger"] else ""),
+                   cwd=engine_dir("captioner"), check=False, on_line=_progress_hook(job, errors))
+    job.progress.clear()
+    # 0 = all done, 1 = some items failed (handled below). Anything else is the
+    # run refusing to start — bad profile, missing variable — before any spend.
+    if code not in (0, 1):
+        why = errors[-1] if errors else "veja o log"
+        raise JobFailed(f"o captioner não rodou (código {code}): {why}")
 
-    models = caption_models(mode)
-    job.log(f"Cascata de caption: {' → '.join(models)}")
-
-    missing = _pass(dataset_dir, media, profile, prompt_vars, job, models[0])
-    refused_by_primary = missing
-    for model in models[1:]:
-        if not missing:
-            break
-        job.log(f"{len(missing)} sem caption — tentando {model}: "
-                f"{', '.join(p.name for p in missing[:5])}"
-                f"{'…' if len(missing) > 5 else ''}")
-        missing = _pass(dataset_dir, media, profile, prompt_vars, job, model)
-
-    # Flag only what a later model rescued. "Still uncaptioned after pass 1" has
-    # two causes that look identical on disk — the model refused it, or the API
-    # was down — and only one of them justifies excluding the image from the
-    # paid conversion phase forever. A second model producing a caption is the
-    # proof that the first one refused on content, not that the account died.
-    rescued = [p for p in refused_by_primary if p not in set(missing)]
+    rescued = fallback_names(dataset_dir)
     if rescued:
-        record_flagged(dataset_dir, rescued, models[0])
+        record_flagged(dataset_dir, rescued, profile)
 
+    # only this profile's media: a video left uncaptioned by an image profile was
+    # never asked about, and moving it out would be a decision nobody made
+    missing = _uncaptioned(dataset_dir, media)
     if missing:
         # Never destroy on an infrastructure failure: out of credit looks
         # exactly like every model refusing, and one of the two is recoverable.
@@ -301,3 +260,28 @@ def generate_captions(dataset_dir, media: str, profile: str, prompt_vars: dict[s
         quarantine_uncaptionable(dataset_dir, missing, job)
 
     job.log("✔ Captions geradas.")
+
+
+def caption_datasets(job: Job, dirs: list[Path], *, model_key: str | None, kind: str | None,
+                     trigger: str = "", profile: str | None = None, redo: bool = False) -> None:
+    """Caption whatever is missing in each dataset directory.
+
+    A dataset can hold images and videos (LTX trains on both), and one
+    profile only speaks one of them, so each media present gets its own: the
+    chosen profile where its media matches, the default for (model, kind)
+    elsewhere. Redo clears each directory once, before its first pass.
+    """
+    chosen = caption_profile(profile) if profile else None
+    for d in dirs:
+        stats = ds.inspect(d)
+        first = True
+        for media in ("image", "video"):
+            count = stats["images"] if media == "image" else stats["videos"]
+            if not count:
+                continue
+            if not redo and not _uncaptioned(d, media):
+                continue
+            key = chosen["key"] if chosen and chosen["media"] == media \
+                else default_caption_profile(model_key, kind, media)
+            generate_captions(d, key, job, trigger=trigger, redo=redo and first)
+            first = False

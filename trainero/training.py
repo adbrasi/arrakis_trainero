@@ -6,7 +6,7 @@ epoch-based training with live progress, and continuous HF upload.
 
 Engines differ in invocation only:
   musubi      accelerate launch src/musubi_tuner/<arch>_train_network.py --config_file
-  musubi-ltx  CLI args at repo root (the fork predates --config_file everywhere)
+  musubi-ltx  CLI args at repo root (the fork reads --lora_target_preset from argv)
   sd-scripts  accelerate launch anima_train_network.py --config_file (cache built in)
 """
 
@@ -20,16 +20,16 @@ from pathlib import Path
 
 from . import dataset as ds
 from . import style_rush as sr
-from .captioner import clear_captions, generate_captions
+from .captioner import caption_datasets, generate_captions
 from .config import PROJECTS_DIR, gpu_info
 from .engines import (engine_dir, ensure_engine, supports_sampling, venv_bin,
                       venv_python)
 from .hf_upload import UploadWatcher, create_repo, hf_username, upload_run_files
 from .jobs import Job, JobFailed
 from .models_download import ensure_models, resolve
-from .presets import (CONTROL_RESOLUTION, LORAPLUS_RATIO, MODELS, NETWORK_MODULES,
+from .presets import (CONTROL_RESOLUTION, LORAPLUS_RATIO, MODELS,
                       SAMPLE_GUIDANCE, SAMPLE_PROMPT, SAMPLE_SEED, SAMPLE_STEPS,
-                      STYLE_RUSH_SCHEDULE, net_types_for, sample_resolution,
+                      STYLE_RUSH_CAPTION_PROFILE, STYLE_RUSH_SCHEDULE, sample_resolution,
                       style_rush_models, suggest_schedule, vram_tier)
 
 
@@ -145,17 +145,12 @@ def write_dataset_toml(model_key: str, path: Path, subsets: list[dict],
                 "cache_directory": str(sub["cache"]),
                 "num_repeats": sub["num_repeats"],
             }
-            if engine == "musubi-ltx":
+            if engine == "musubi-ltx":  # the only video engine
                 frames = int((ltx_cfg or {}).get("resolution", "768x512x81").split("x")[2])
                 block["target_frames"] = [frames]
                 block["target_fps"] = float((ltx_cfg or {}).get("fps", 25.0))
                 block["frame_extraction"] = "full"
                 block["max_frames"] = frames
-            else:  # wan
-                vd = model.get("video_dataset", {})
-                block["target_frames"] = vd.get("target_frames", [1, 33, 65])
-                block["frame_extraction"] = vd.get("frame_extraction", "full")
-                block["max_frames"] = vd.get("max_frames", 81)
         lines += ["[[datasets]]"] + _toml_lines(block) + [""]
 
     path.write_text("\n".join(lines) + "\n")
@@ -221,15 +216,7 @@ def build_train_config(model_key: str, overrides: dict, schedule: dict, stats: d
     cfg.update(model["train"])
     cfg.update(tier.get("train", {}))
 
-    net_type = overrides.get("net_type", "lora")
-    if net_type not in net_types_for(model_key):
-        raise JobFailed(f"{model['label']} não suporta rede {net_type}")
-    if net_type == "lora":
-        cfg["network_module"] = model["network_module"]
-    else:
-        cfg["network_module"] = NETWORK_MODULES[model["engine"]][net_type]
-        if "network_alpha" not in overrides:
-            cfg["network_alpha"] = max(1, int(cfg["network_dim"]) // 2)
+    cfg["network_module"] = model["network_module"]
 
     # blocks_to_swap is the one tier value worth overriding by hand: only the
     # owner's card can say how much headroom the sample step really leaves, and
@@ -243,8 +230,13 @@ def build_train_config(model_key: str, overrides: dict, schedule: dict, stats: d
             except (TypeError, ValueError):
                 raise JobFailed(f"valor inválido para {key}: {overrides[key]!r}")
 
+    cap = model.get("max_blocks_to_swap")
+    if cap is not None and int(cfg.get("blocks_to_swap") or 0) > cap:
+        raise JobFailed(f"{model['label']} aceita no máximo {cap} blocks_to_swap "
+                        f"(pedido: {cfg['blocks_to_swap']})")
+
     network_args = []
-    if overrides.get("loraplus") and net_type == "lora":
+    if overrides.get("loraplus"):
         network_args.append(f"loraplus_lr_ratio={LORAPLUS_RATIO}")
     if network_args:
         cfg["network_args"] = network_args
@@ -349,7 +341,7 @@ def run_caches(model_key: str, dataset_toml: Path, vram_gb: float, job: Job) -> 
         if isinstance(value, bool):
             if value:
                 cmd.append(f"--{key}")
-        elif key in ("vae", "text_encoder", "t5"):
+        elif key in ("vae", "text_encoder"):
             cmd += [f"--{key}", str(resolve(model_key, value))]
         else:
             cmd += [f"--{key}", str(value)]
@@ -535,6 +527,34 @@ def comfy_converter(model_key: str, job: Job):
     return convert
 
 
+RUNS_DIR = "runs"
+
+
+def archive_previous_run(pdir: Path, job: Job, names: tuple[str, ...] = ("output",)) -> None:
+    """Move what an earlier run left in output/ to runs/<timestamp>/.
+
+    output/ was shared by every run of the project: a retrain re-uploaded the
+    old checkpoints (even another model's) to the repo, finalise counted them as
+    this run's, and the gallery showed last week's epoch 10 above today's epoch
+    1 — the owner judged the new run by old images. Moved, not deleted: those
+    checkpoints may exist nowhere else.
+    """
+    import os
+    import time
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for name in names:
+        d = pdir / name
+        if not d.is_dir() or not any(d.iterdir()):
+            continue
+        dest = pdir / RUNS_DIR / stamp / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(d, dest)
+        job.log(f"Treino anterior guardado em {dest.relative_to(pdir)}")
+    for name in names:
+        (pdir / name).mkdir(parents=True, exist_ok=True)
+
+
 def finalise(job: Job, output_dir: Path, repo_id: str | None) -> None:
     """Report what actually landed, not what was attempted.
 
@@ -579,7 +599,7 @@ def run_style_rush_training(job: Job, params: dict) -> None:
     if model_key not in style_rush_models():
         raise JobFailed(
             f"{MODELS[model_key]['label']} não aceita control image — o Style Rush precisa "
-            f"de um modelo que suporte (Flux Klein ou Qwen Image Edit)")
+            f"de um modelo que suporte (Flux Klein)")
     if not trigger:
         raise JobFailed("defina a trigger word antes de treinar no modo Style Rush")
 
@@ -591,7 +611,6 @@ def run_style_rush_training(job: Job, params: dict) -> None:
     convert_dir = pdir / "dataset_convert"
     restore_dir = pdir / "dataset_restore"
     output_dir = pdir / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     stats = ds.inspect(dataset_dir)
     if stats["items"] == 0:
@@ -617,19 +636,13 @@ def run_style_rush_training(job: Job, params: dict) -> None:
     job.end_phase("Modelos base")
 
     job.start_phase("Captions")
-    if overrides.get("redo_captions"):
-        clear_captions(dataset_dir, job)
-        stats = ds.inspect(dataset_dir)
+    generate_captions(dataset_dir, STYLE_RUSH_CAPTION_PROFILE["key"], job, trigger=trigger,
+                      redo=bool(overrides.get("redo_captions")))
+    stats = ds.inspect(dataset_dir)
+    if stats["items"] == 0:
+        raise JobFailed("nenhuma imagem sobrou no dataset depois das captions")
     if stats["missing_captions"]:
-        job.log(f"{stats['missing_captions']} itens sem caption — gerando com "
-                f"generic-style e trigger {trigger}")
-        generate_captions(dataset_dir, "image", "generic-style", {"style_name": trigger},
-                          job, mode="style-rush")
-        stats = ds.inspect(dataset_dir)
-        if stats["missing_captions"]:
-            raise JobFailed(f"{stats['missing_captions']} itens continuam sem caption")
-    else:
-        job.log("Todas as imagens já têm caption.")
+        raise JobFailed(f"{stats['missing_captions']} itens continuam sem caption")
     job.end_phase("Captions")
 
     job.start_phase("Dataset de conversão")
@@ -691,6 +704,8 @@ def run_style_rush_training(job: Job, params: dict) -> None:
 
     run_caches(model_key, dataset_toml, vram_gb, job)
 
+    # before the upload watcher exists: it must only ever see this run's files
+    archive_previous_run(pdir, job)
     watcher = None
     repo_id = None
     if overrides.get("hf_upload", True):
@@ -731,6 +746,37 @@ def run_style_rush_training(job: Job, params: dict) -> None:
 # Full pipeline
 # ---------------------------------------------------------------------------
 
+def preflight_captions(params: dict, *stats_list: dict) -> None:
+    """Refuse in the first second what the Captions phase would refuse later.
+
+    Missing captions are written by the job itself — a beginner should not have
+    to know that a LoRA needs them — but only if the job can: an OpenRouter key,
+    and a trigger word when the chosen profile writes one into every caption.
+    """
+    import os
+
+    from .presets import caption_profile, default_caption_profile
+
+    missing = sum(st.get("missing_captions", 0) for st in stats_list)
+    if not missing:
+        return
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        raise JobFailed(
+            f"{missing} itens sem caption e sem OPENROUTER_API_KEY para escrevê-las — "
+            f"defina a chave no pod ou envie um .txt com o mesmo nome de cada imagem")
+    trigger = (params.get("trigger") or "").strip()
+    medias = [m for m, key in (("image", "images"), ("video", "videos"))
+              if any(st.get(key) for st in stats_list)]
+    for media in medias:
+        chosen = caption_profile(params.get("caption_profile") or "")
+        key = chosen["key"] if chosen and chosen["media"] == media \
+            else default_caption_profile(params["model"], params.get("kind"), media)
+        spec = caption_profile(key)
+        if spec and spec["trigger"] and not trigger:
+            raise JobFailed(f"as captions vão ser escritas com o perfil '{spec['label']}', "
+                            f"que precisa da trigger word — preencha no passo 01")
+
+
 def run_training(job: Job, params: dict) -> None:
     project = params["project"]
     model_key = params["model"]
@@ -747,7 +793,6 @@ def run_training(job: Job, params: dict) -> None:
     slug = slugify(project)
     dataset_dir = pdir / "dataset"
     output_dir = pdir / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     if mode == "slider":
         from .sliders import run_slider_training
@@ -760,16 +805,12 @@ def run_training(job: Job, params: dict) -> None:
     stats = ds.inspect(dataset_dir)
     if stats["items"] == 0:
         raise JobFailed("importe o dataset antes de treinar")
-    if stats["missing_captions"] > 0:
-        raise JobFailed(
-            f"{stats['missing_captions']} itens sem caption — gere as captions primeiro "
-            f"(ex.: {', '.join(stats['missing_sample'][:3])})")
     if model.get("needs_control") and stats["control_images"] == 0:
-        raise JobFailed("Qwen Image Edit precisa de imagens de controle em dataset/control/")
-    if model["media"] == "video" and stats["videos"] == 0 and stats["images"] == 0:
-        raise JobFailed("dataset vazio")
+        raise JobFailed(f"{model['label']} precisa de imagens de controle em dataset/control/")
+    needs_captions = stats["missing_captions"] > 0
+    preflight_captions(params, stats)
 
-    phases = ["Engine", "Modelos base", "Configuração"]
+    phases = (["Captions"] if needs_captions else []) + ["Engine", "Modelos base", "Configuração"]
     if engine != "sd-scripts":
         phases += ["Cache de latents", "Cache do text encoder"]
     phases += ["Treino", "Finalização"]
@@ -779,6 +820,20 @@ def run_training(job: Job, params: dict) -> None:
     vram_gb = gpu.get("vram_mb", 24576) / 1024
     job.extra["gpu"] = gpu
     job.log(f"GPU: {gpu.get('name', '?')} ({vram_gb:.0f} GB)")
+
+    if needs_captions:
+        # first: it is the cheap step that can still fail on the owner's input
+        # (refused images, no credit), before tens of GB of downloads
+        job.start_phase("Captions")
+        caption_datasets(job, [dataset_dir], model_key=model_key, kind=params.get("kind"),
+                         trigger=trigger, profile=params.get("caption_profile"))
+        stats = ds.inspect(dataset_dir)
+        if stats["items"] == 0:
+            raise JobFailed("nenhum item sobrou no dataset depois das captions")
+        if stats["missing_captions"]:
+            raise JobFailed(f"{stats['missing_captions']} itens continuam sem caption "
+                            f"(ex.: {', '.join(stats['missing_sample'][:3])})")
+        job.end_phase("Captions")
 
     job.start_phase("Engine")
     ensure_engine(engine, job)
@@ -809,8 +864,7 @@ def run_training(job: Job, params: dict) -> None:
     if overrides.get("sampling", True) and supports_sampling(engine):
         frames = None
         if model["media"] == "video":
-            frames = int(ltx_cfg["resolution"].split("x")[2]) if engine == "musubi-ltx" \
-                else (model.get("video_dataset", {}).get("max_frames") or 81)
+            frames = int(ltx_cfg["resolution"].split("x")[2])
         # Without a trigger word the generic prompt exercises nothing: it renders
         # the base model, and the owner watches a sample that would look exactly
         # the same with no LoRA loaded. A dataset that arrived already captioned
@@ -858,6 +912,8 @@ def run_training(job: Job, params: dict) -> None:
     run_caches(model_key, dataset_toml, vram_gb, job)
 
     # HuggingFace repo + watcher (default ON)
+    # before the upload watcher exists: it must only ever see this run's files
+    archive_previous_run(pdir, job)
     watcher = None
     repo_id = None
     if overrides.get("hf_upload", True):

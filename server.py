@@ -24,12 +24,13 @@ from trainero import jobs
 from trainero import style_rush as sr
 from trainero import project as pj
 from trainero.jobs import JobFailed
-from trainero.captioner import clear_captions, generate_captions
-from trainero.config import (IMAGE_EXTS, VIDEO_EXTS, WEB_PORT, ensure_dirs,
+from trainero.captioner import caption_datasets
+from trainero.config import (DATA_DIR, IMAGE_EXTS, PROJECTS_DIR, VIDEO_EXTS, WEB_PORT, ensure_dirs,
                              gpu_info, hf_token, load_state, save_state,
                              update_state)
 from trainero.engines import is_installed
-from trainero.presets import (CAPTION_PROFILES, MODEL_ORDER, MODELS,
+from trainero.presets import (CAPTION_PROFILES, LORA_KINDS, MODEL_ORDER, MODELS,
+                              caption_profile, default_caption_profile,
                               STYLE_RUSH_SCHEDULE, public_presets,
                               style_rush_models, suggest_schedule)
 from trainero.training import project_dir, run_training, slugify
@@ -105,7 +106,7 @@ def dataset_thumbs(directory: Path, limit: int = THUMB_LIMIT) -> tuple[list[str]
     """The first `limit` image names in a dataset, plus how many there are."""
     try:
         names = sorted(p.name for p in directory.iterdir()
-                       if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
+                       if p.is_file() and not p.name.startswith(".") and p.suffix.lower() in IMAGE_EXTS)
     except OSError:
         return [], 0
     return names[:limit], len(names)
@@ -170,8 +171,56 @@ def dataset_dir(side: str = "pos") -> Path:
                    "restore": "dataset_restore"}.get(side, "dataset")
 
 
+def disk_free_gb() -> float:
+    try:
+        return round(shutil.disk_usage(PROJECTS_DIR.parent).free / 1024**3, 1)
+    except OSError:
+        return -1.0
+
+
+def shown_project() -> str:
+    """The project whose job output is on screen.
+
+    The progress card shows the current job; its samples and log belong to the
+    job's own project. Reading them from the selected project instead showed
+    another project's gallery (or none) under a running training as soon as
+    the owner typed a new name.
+    """
+    job = jobs.current()
+    return (job.project if job and job.project else "") or current_project() or "projeto"
+
+
 def sample_dir() -> Path:
-    return project_dir(current_project() or "projeto") / "output" / "sample"
+    return project_dir(shown_project()) / "output" / "sample"
+
+
+def unique_upload_name(directory: Path, name: str) -> str:
+    """`name`, or `stem_2.ext`, `stem_3.ext`… — the first free media name.
+
+    A phone names every photo image.jpg, and a second batch reuses 1.png..N.png:
+    replacing the file kept the old image's .txt beside the new image, so the
+    run trained on captions describing pictures no longer there.
+    """
+    stem, suffix = Path(name).stem, Path(name).suffix
+    candidate, n = name, 2
+    while (directory / candidate).exists() or (directory / f"{Path(candidate).stem}.txt").exists():
+        candidate = f"{stem}_{n}{suffix}"
+        n += 1
+    return candidate
+
+
+def same_bytes(a: Path, b: Path) -> bool:
+    import filecmp
+
+    try:
+        return a.stat().st_size == b.stat().st_size and filecmp.cmp(a, b, shallow=False)
+    except OSError:
+        return False
+
+
+def valid_upload_name(name: str) -> bool:
+    return bool(name) and "\x00" not in name and name == Path(name).name \
+        and not name.startswith(".") and "/" not in name and "\\" not in name
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -194,17 +243,53 @@ class Handler(SimpleHTTPRequestHandler):
     def _error(self, msg: str, code: int = 400) -> None:
         self._json({"error": msg}, code)
 
-    def _body_json(self) -> dict:
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0:
-            return {}
+    def _content_length(self) -> int:
         try:
-            return json.loads(self.rfile.read(length).decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return {}
+            return max(0, int(self.headers.get("Content-Length") or 0))
+        except ValueError:
+            return 0
+
+    def _body_json(self) -> dict:
+        """The request body as a dict; anything else reads as empty.
+
+        Cached: a handler may call it twice, and the stream can only be read once.
+        """
+        if hasattr(self, "_body_cache"):
+            return self._body_cache
+        length = self._content_length()
+        data = {}
+        if 0 < length <= 1 << 20:
+            try:
+                data = json.loads(self.rfile.read(length).decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                data = {}
+        self._body_cache = data if isinstance(data, dict) else {}
+        return self._body_cache
+
+    def _guarded(self, handler) -> None:
+        """Any error becomes a JSON answer instead of a dropped connection,
+        which the browser can only report as "Failed to fetch"."""
+        try:
+            handler()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+
+            traceback.print_exc()
+            try:
+                self._error(f"erro interno: {type(exc).__name__}: {exc}", 500)
+            except Exception:
+                pass
 
     # -- GET ---------------------------------------------------------------
     def do_GET(self):
+        self._guarded(self._do_get)
+
+    def do_POST(self):
+        self._guarded(self._do_post)
+
+    def _do_get(self):
         url = urlparse(self.path)
         if url.path == "/api/status":
             return self._status()
@@ -239,7 +324,7 @@ class Handler(SimpleHTTPRequestHandler):
             return self._error("não é imagem")
         try:
             data = render_thumb(path)
-        except (OSError, ValueError):
+        except Exception:  # unreadable, truncated, decompression bomb…
             return self._error("miniatura indisponível", 404)
         self.send_response(200)
         self.send_header("Content-Type", "image/jpeg")
@@ -256,7 +341,7 @@ class Handler(SimpleHTTPRequestHandler):
         path = sample_dir() / name
         try:
             data = render_thumb(path, edge=340) if thumb else path.read_bytes()
-        except (OSError, ValueError):
+        except Exception:
             return self._error("sample não encontrado", 404)
         self.send_response(200)
         self.send_header("Content-Type", "image/jpeg" if thumb else "image/png")
@@ -286,7 +371,19 @@ class Handler(SimpleHTTPRequestHandler):
             "dataset_restore": ds.inspect(dataset_dir("restore")) if project else {},
             "style_rush_models": style_rush_models(),
             "engines": {name: is_installed(name) for name in ("musubi", "musubi-ltx", "sd-scripts", "captioner")},
+            "kind": meta.get("kind", ""),
+            "caption_profile": meta.get("caption_profile", ""),
+            "disk_free_gb": disk_free_gb(),
         }
+        if project:
+            media = "video" if stats.get("videos") and not stats.get("images") else "image"
+            # which profile the job would write missing captions with, per model:
+            # the UI says it before the click instead of the log saying it after
+            chosen = caption_profile(meta.get("caption_profile") or "")
+            payload["caption_plan"] = {
+                key: (chosen["key"] if chosen and chosen["media"] == media
+                      else default_caption_profile(key, meta.get("kind"), media))
+                for key in MODEL_ORDER}
         if project and stats.get("items"):
             payload["schedules"] = {key: suggest_schedule(key, stats["items"]) for key in MODEL_ORDER}
         self._json(payload)
@@ -296,6 +393,7 @@ class Handler(SimpleHTTPRequestHandler):
             "models": public_presets(),
             "order": MODEL_ORDER,
             "caption_profiles": CAPTION_PROFILES,
+            "lora_kinds": LORA_KINDS,
             # Style Rush ignores suggest_schedule: showing the suggested numbers
             # in the panel would promise a run that is not the one that happens
             "style_rush_schedule": STYLE_RUSH_SCHEDULE,
@@ -303,7 +401,7 @@ class Handler(SimpleHTTPRequestHandler):
         })
 
     # -- POST --------------------------------------------------------------
-    def do_POST(self):
+    def _do_post(self):
         url = urlparse(self.path)
         query = {k: v[0] for k, v in parse_qs(url.query).items()}
         try:
@@ -337,17 +435,28 @@ class Handler(SimpleHTTPRequestHandler):
         name = (body.get("name") or "").strip()
         if not name:
             return self._error("nome vazio")
+        switching = slugify(name) != slugify(current_project() or "")
         update_state(project=name)
         pdir = project_dir(name)
         (pdir / "dataset").mkdir(parents=True, exist_ok=True)
         fields = {"name": name}
-        # only touch the trigger when the client actually sent one: the UI omits
-        # it until it has read the stored value, so a fast typist cannot wipe it
-        if "trigger" in body and not pj.trigger_locked(pdir):
+        # The trigger only travels with a save of the SAME project. On a switch
+        # the field still shows the previous project's word, and writing it
+        # would give project B the trigger of project A — the server ignores it
+        # and answers with B's stored value for the UI to show.
+        if "trigger" in body and not switching and not pj.trigger_locked(pdir):
             fields["trigger"] = (body.get("trigger") or "").strip()
-        pj.save_meta(pdir, **fields)
-        self._json({"ok": True, "slug": slugify(name),
-                    "trigger": pj.load_meta(pdir).get("trigger", "")})
+        if body.get("kind") in LORA_KINDS:
+            fields["kind"] = body["kind"]
+        if "caption_profile" in body:
+            prof = body.get("caption_profile") or ""
+            if prof and caption_profile(prof) is None:
+                return self._error(f"perfil de caption desconhecido: {prof}")
+            fields["caption_profile"] = prof
+        meta = pj.save_meta(pdir, **fields)
+        self._json({"ok": True, "slug": slugify(name), "switched": switching,
+                    "trigger": meta.get("trigger", ""), "kind": meta.get("kind", ""),
+                    "caption_profile": meta.get("caption_profile", "")})
 
     def _fork_project(self):
         """Fill the current (empty) project with another project's dataset."""
@@ -375,12 +484,14 @@ class Handler(SimpleHTTPRequestHandler):
         job = jobs.current()
         if job and job.status == "running" and not self._body_json().get("force"):
             return self._error("há um job rodando — cancele antes ou confirme para encerrar", 409)
-        if job and job.status == "running":
-            job.cancel()
         self._json({"ok": True})
         # shutdown() blocks until serve_forever returns, so it can never run on
         # the thread that is currently serving this request
-        threading.Thread(target=self.server.shutdown, daemon=True).start()
+        def stop():
+            stop_running_job()
+            self.server.shutdown()
+
+        threading.Thread(target=stop, daemon=True).start()
 
     def _require_project(self) -> str | None:
         project = current_project()
@@ -388,6 +499,13 @@ class Handler(SimpleHTTPRequestHandler):
             self._error("defina o nome do projeto primeiro")
             return None
         return project
+
+    def _require_no_uploads(self) -> bool:
+        pending = uploads_in_flight()
+        if pending:
+            self._error(f"{pending} upload(s) ainda em andamento — espere terminar", 409)
+            return False
+        return True
 
     def _require_idle(self) -> bool:
         """Refuse to touch the dataset while a job is reading it."""
@@ -401,12 +519,14 @@ class Handler(SimpleHTTPRequestHandler):
         project = self._require_project()
         if not project:
             return
+        if not self._require_no_uploads():
+            return
         source = (self._body_json().get("source") or "").strip()
         side = query.get("side", "pos")
         target = dataset_dir(side)
         pdir = project_dir(project)
         job = jobs.start("import", f"Importando dataset ({side})", pdir / "logs" / "import.log",
-                         lambda j: ds.import_source(source, target, j))
+                         lambda j: ds.import_source(source, target, j), project=project)
         self._json({"ok": True, "job": job.kind}, 202)
 
     def _upload_file(self, query):
@@ -415,16 +535,16 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if not self._require_idle():
             return
-        name = Path(query.get("name", "")).name  # basename only — no traversal
-        if not name:
-            return self._error("nome do arquivo ausente")
+        name = query.get("name", "")
+        if not valid_upload_name(name):
+            return self._error(f"nome de arquivo inválido: {name!r}")
         side = query.get("side", "pos")
         target_root = dataset_dir(side)
         sub = query.get("dir", "")
         if sub == "control":
             target_root = target_root / "control"
         target_root.mkdir(parents=True, exist_ok=True)
-        length = int(self.headers.get("Content-Length") or 0)
+        length = self._content_length()
         if length <= 0:
             return self._error("corpo vazio")
         dest = target_root / name
@@ -446,7 +566,17 @@ class Handler(SimpleHTTPRequestHandler):
                 if remaining > 0:
                     return self._error(f"upload de {name} truncado "
                                        f"(faltaram {remaining} bytes) — envie de novo")
+                is_media = Path(name).suffix.lower() in (IMAGE_EXTS | VIDEO_EXTS)
+                if is_media and dest.exists():
+                    if same_bytes(tmp, dest):
+                        # the same file sent twice: nothing new, and the
+                        # caption beside it still describes it
+                        return self._json({"ok": True, "name": name, "duplicate": True,
+                                           "stats": ds.inspect(dataset_dir(side))})
+                    dest = target_root / unique_upload_name(target_root, name)
                 os.replace(tmp, dest)
+            except OSError as exc:
+                return self._error(f"não consegui gravar {name}: {exc}", 507)
             finally:
                 tmp.unlink(missing_ok=True)
             ext = ds.archive_ext(name)
@@ -464,7 +594,7 @@ class Handler(SimpleHTTPRequestHandler):
                 finally:
                     dest.unlink(missing_ok=True)
                     shutil.rmtree(staging, ignore_errors=True)
-        self._json({"ok": True, "stats": ds.inspect(dataset_dir(side))})
+        self._json({"ok": True, "name": dest.name, "stats": ds.inspect(dataset_dir(side))})
 
     def _clear_dataset(self, query):
         project = self._require_project()
@@ -487,28 +617,37 @@ class Handler(SimpleHTTPRequestHandler):
         project = self._require_project()
         if not project:
             return
+        if not self._require_no_uploads():
+            return
         body = self._body_json()
-        profile = body.get("profile") or "default"
-        side = body.get("side", "pos")
+        meta = current_meta()
         redo = bool(body.get("redo"))
-        media = "video" if ds.inspect(dataset_dir(side)).get("videos") else "image"
-        prompt_vars = {}
-        var = body.get("var_name")
-        if var and body.get("trigger"):
-            prompt_vars[var] = body["trigger"]
+        trigger = (body.get("trigger") or meta.get("trigger") or "").strip()
+        profile = body.get("profile") or None
+        if profile and caption_profile(profile) is None:
+            return self._error(f"perfil de caption desconhecido: {profile}")
+        sides = [sd for sd in (body.get("sides") or ["pos", "neg"]) if sd in ("pos", "neg")]
+        # every side that needs it, in one job: the card counts both, so one
+        # click has to fix both (it used to caption only the first)
+        dirs = [dataset_dir(sd) for sd in sides
+                if (ds.inspect(dataset_dir(sd))["items"] if redo
+                    else ds.inspect(dataset_dir(sd))["missing_captions"])]
+        if not dirs:
+            return self._error("nada para legendar")
         pdir = project_dir(project)
-        target = dataset_dir(side)
+        model = body.get("model") if body.get("model") in MODELS else None
+        kind = meta.get("kind")
 
         def run(j):
-            # Deleting the .txt is not enough on its own: the tagger skips
-            # whatever is in its processing log, so the clear has to happen
-            # inside the job, right before the pass that rewrites them.
+            caption_datasets(j, dirs, model_key=model, kind=kind, trigger=trigger,
+                             profile=profile, redo=redo)
             if redo:
-                clear_captions(target, j)
-            generate_captions(target, media, profile, prompt_vars, j, mode="lora")
+                # every caption was rewritten with the trigger from step 01: an
+                # inherited trigger no longer describes anything on disk
+                pj.clear_origin(pdir)
 
         job = jobs.start("captions", "Gerando captions com LLM",
-                         pdir / "logs" / "captions.log", run)
+                         pdir / "logs" / "captions.log", run, project=project)
         self._json({"ok": True, "job": job.kind}, 202)
 
     def _train(self):
@@ -516,6 +655,7 @@ class Handler(SimpleHTTPRequestHandler):
         if not project:
             return
         body = self._body_json()
+        meta = current_meta()
         model_key = body.get("model")
         if model_key not in MODELS:
             return self._error(f"modelo inválido: {model_key}")
@@ -526,18 +666,43 @@ class Handler(SimpleHTTPRequestHandler):
             "project": project,
             "model": model_key,
             "mode": body.get("mode", "lora"),
-            "trigger": (body.get("trigger") or current_meta().get("trigger") or "").strip(),
-            "overrides": body.get("overrides") or {},
+            "trigger": (body.get("trigger") or meta.get("trigger") or "").strip(),
+            "overrides": body.get("overrides") if isinstance(body.get("overrides"), dict) else {},
             "slider_targets": body.get("slider_targets") or [],
+            # what the captions are written with, if the job has to write them
+            "kind": meta.get("kind") or "",
+            "caption_profile": meta.get("caption_profile") or "",
         }
+        if params["mode"] not in ("lora", "slider", "style-rush"):
+            return self._error(f"modo inválido: {params['mode']}")
         pdir = project_dir(project)
         title = f"Treinando {MODELS[model_key]['label']}"
         job = jobs.start("train", title, pdir / "logs" / "train.log",
-                         lambda j: run_training(j, params))
+                         lambda j: run_training(j, params), project=project)
         self._json({"ok": True, "job": job.kind}, 202)
 
 
+def stop_running_job(timeout: float = 30.0) -> None:
+    """Cancel the job and wait for its process group to go.
+
+    Without the wait the server process exits first, the trainer keeps the GPU
+    with a dead stdout pipe, and the next server starts a second training into
+    an out-of-memory.
+    """
+    import time
+
+    job = jobs.current()
+    if not job or job.status != "running":
+        return
+    job.cancel()
+    deadline = time.monotonic() + timeout
+    while job.status == "running" and time.monotonic() < deadline:
+        time.sleep(0.5)
+
+
 def main():
+    import signal
+
     ensure_dirs()
     migrate_global_trigger()
     port = WEB_PORT
@@ -545,17 +710,33 @@ def main():
     # without this a handler thread can keep the process alive after shutdown,
     # and the port stays taken until someone hunts down the pid
     server.daemon_threads = True
+
+    def on_signal(signum, _frame):
+        # a bootstrap re-run or `kill` arrives as SIGTERM
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, on_signal)
+    # a closed web terminal must not cancel a two-hour training
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    # bootstrap.sh stops exactly this process through the pidfile instead of a
+    # `pkill -f server.py` that would also hit any other server.py on the pod
+    pidfile = DATA_DIR / "server.pid"
+    pidfile.write_text(str(os.getpid()))
     print(f"⚔ Arrakis Trainero em http://0.0.0.0:{port}")
     try:
         server.serve_forever()
         print("Desligado pela interface. Até logo.")
     except KeyboardInterrupt:
-        job = jobs.current()
-        if job and job.status == "running":
-            job.cancel()
-        print("\nAté logo.")
+        print("\nEncerrando — cancelando o job em andamento, se houver...")
+        stop_running_job()
+        print("Até logo.")
     finally:
         server.server_close()
+        try:
+            if pidfile.read_text().strip() == str(os.getpid()):
+                pidfile.unlink()
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

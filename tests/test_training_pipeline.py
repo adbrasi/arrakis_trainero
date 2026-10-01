@@ -134,9 +134,6 @@ class TestRunTrainingLora(unittest.TestCase):
             self.assertNotIn("Cache de latents", job.phases)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestStyleRushOverrides(unittest.TestCase):
     """Estes overrides existem para o dono mexer neles pela UI; um deles não
@@ -154,12 +151,136 @@ class TestStyleRushOverrides(unittest.TestCase):
     def test_the_default_target_comes_from_style_rush(self):
         self.assertIn("sr.DEFAULT_CONVERT_TARGET", self._source())
 
-    def test_redo_captions_clears_before_the_caption_phase(self):
-        src = self._source()
-        self.assertIn('overrides.get("redo_captions")', src)
-        self.assertIn("clear_captions(", src)
+    def test_style_rush_captions_with_its_own_profile_and_honours_redo(self):
+        """Style Rush captions with the style-rush profile (Gemini first: its
+        refusals feed the paid phase's content_flagged) and redo reaches it."""
+        from unittest import mock
 
-    def test_style_rush_captions_use_the_style_rush_cascade(self):
-        """No Style Rush o primário tem de ser o Gemini: é a recusa dele que
-        alimenta o content_flagged da fase paga."""
-        self.assertIn('mode="style-rush"', self._source())
+        from trainero import training
+        from trainero.jobs import JobFailed
+
+        calls = []
+
+        def fake_generate(dataset_dir, profile, job, trigger="", redo=False):
+            calls.append((profile, trigger, redo))
+            raise JobFailed("stop here")
+
+        with tempfile.TemporaryDirectory() as td:
+            pdir = Path(td) / "p"
+            (pdir / "dataset").mkdir(parents=True)
+            (pdir / "dataset" / "a.png").write_bytes(b"x")
+            with mock.patch.object(training, "project_dir", lambda _n: pdir), \
+                 mock.patch.object(training, "generate_captions", fake_generate), \
+                 mock.patch.object(training, "ensure_engine", lambda *a: None), \
+                 mock.patch.object(training, "ensure_models", lambda *a: None), \
+                 mock.patch.object(training, "gpu_info", lambda: {}):
+                for redo in (False, True):
+                    job = _FakeJob()
+                    with self.assertRaises(JobFailed):
+                        training.run_training(job, {"project": "p", "model": "flux-klein",
+                                                    "mode": "style-rush", "trigger": "zz",
+                                                    "overrides": {"redo_captions": redo}})
+        self.assertEqual(calls, [("style-rush", "zz", False), ("style-rush", "zz", True)])
+
+
+class TestBeginnerScenarios(TestRunTrainingLora):
+    """A beginner uploads images, picks a model and clicks TREINAR."""
+
+    def _strip_captions(self, pdir):
+        for t in (pdir / "dataset").glob("*.txt"):
+            t.unlink()
+
+    def _run_uncaptioned(self, td, model_key, env, caption_impl=None, params_extra=None):
+        from trainero import training
+
+        order = []
+        real_make = _make_dataset
+
+        def make_without_captions(pdir, n=6):
+            base = real_make(pdir, n)
+            for t in base.glob("*.txt"):
+                t.unlink()
+            return base
+
+        def fake_caption(job, dirs, **kw):
+            order.append(("captions", kw))
+            if caption_impl:
+                return caption_impl(dirs)
+            for d in dirs:
+                for img in d.glob("*.png"):
+                    img.with_suffix(".txt").write_text(f"{kw.get('trigger')}, a caption")
+
+        with mock.patch.dict("os.environ", env, clear=False), \
+             mock.patch(__name__ + "._make_dataset", make_without_captions), \
+             mock.patch.object(training, "caption_datasets", fake_caption):
+            pdir, job, _ = self._run(td, model_key, params_extra)
+        return pdir, job, order
+
+    def test_missing_captions_are_written_by_the_job_before_any_download(self):
+        with tempfile.TemporaryDirectory() as td:
+            pdir, job, order = self._run_uncaptioned(
+                Path(td), "flux-klein", {"OPENROUTER_API_KEY": "sk"},
+                params_extra={"kind": "style"})
+            self.assertEqual(order[0][0], "captions")
+            self.assertEqual(order[0][1]["kind"], "style")
+            self.assertEqual(job.phases[:2], ["Captions", "Engine"])
+            self.assertTrue(all(t.read_text().startswith("anime loven")
+                                for t in (pdir / "dataset").glob("*.txt")))
+
+    def test_missing_captions_without_a_key_fail_in_the_first_second(self):
+        from trainero.jobs import JobFailed
+
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(JobFailed) as ctx:
+                self._run_uncaptioned(Path(td), "flux-klein", {"OPENROUTER_API_KEY": ""})
+            self.assertIn("OPENROUTER_API_KEY", str(ctx.exception))
+            self.assertIn(".txt", str(ctx.exception))
+
+    def test_a_trigger_profile_without_a_trigger_fails_before_downloading(self):
+        from trainero.jobs import JobFailed
+
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(JobFailed) as ctx:
+                self._run_uncaptioned(Path(td), "flux-klein", {"OPENROUTER_API_KEY": "sk"},
+                                      params_extra={"kind": "style", "trigger": ""})
+            self.assertIn("trigger", str(ctx.exception))
+
+    def test_a_concept_needs_no_trigger(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, _, order = self._run_uncaptioned(
+                Path(td), "flux-klein", {"OPENROUTER_API_KEY": "sk"},
+                params_extra={"kind": "concept", "trigger": ""})
+            self.assertEqual(order[0][0], "captions")
+
+    def test_everything_refused_ends_with_a_clear_message(self):
+        from trainero.jobs import JobFailed
+
+        def refuse_all(dirs):
+            for d in dirs:
+                for img in d.glob("*.png"):
+                    img.unlink()
+
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(JobFailed) as ctx:
+                self._run_uncaptioned(Path(td), "flux-klein", {"OPENROUTER_API_KEY": "sk"},
+                                      caption_impl=refuse_all, params_extra={"kind": "concept"})
+            self.assertIn("nenhum item sobrou", str(ctx.exception))
+
+    def test_a_retrain_starts_with_an_empty_output_and_keeps_the_old_one(self):
+        """output/ used to be shared: a retrain re-uploaded old checkpoints and
+        the gallery mixed old samples above new ones."""
+        with tempfile.TemporaryDirectory() as td:
+            pdir, _, _ = self._run(Path(td), "qwen-image")
+            (pdir / "output" / "sample").mkdir()
+            (pdir / "output" / "sample" / "old_e000009_00_x.png").write_bytes(b"x")
+            (pdir / "output" / "p-000001.safetensors").write_bytes(b"OLD")
+            pdir, job, _ = self._run(Path(td), "qwen-image")
+            self.assertEqual((pdir / "output" / "p-000001.safetensors").read_bytes(), b"ckpt")
+            self.assertFalse((pdir / "output" / "sample").exists())
+            archived = list((pdir / "runs").glob("*/output/p-000001.safetensors"))
+            self.assertEqual([a.read_bytes() for a in archived], [b"OLD"])
+            self.assertEqual(job.extra["outputs"], ["p-000001.safetensors"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -9,3 +9,5 @@ build/
 .vscode/
 data/*.corrupt
 data/state.json
+data/server.log
+data/server.pid

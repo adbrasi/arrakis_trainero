@@ -99,8 +99,27 @@ def update_state(**kwargs) -> dict:
         return state
 
 
-def gpu_info() -> dict:
-    """Name and VRAM (MiB) of GPU 0 via nvidia-smi; {} when unavailable."""
+_gpu_cache: tuple[float, dict] | None = None
+
+
+def gpu_info(max_age: float = 300.0) -> dict:
+    """Name and VRAM (MiB) of GPU 0 via nvidia-smi; {} when unavailable.
+
+    Cached: the UI polls status every few seconds, and spawning nvidia-smi (up
+    to 10 s when the driver is busy) on every poll made polls pile up.
+    """
+    import time
+
+    global _gpu_cache
+    now = time.monotonic()
+    if _gpu_cache and now - _gpu_cache[0] < max_age:
+        return dict(_gpu_cache[1])
+    info = _query_gpu()
+    _gpu_cache = (now, info)
+    return dict(info)
+
+
+def _query_gpu() -> dict:
     import subprocess
 
     try:

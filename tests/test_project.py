@@ -217,10 +217,20 @@ class TestProjectRoutes(LiveServer):
         """Switching projects used to keep the previous project's trigger: the
         run then trained `arkstyle` captions while sampling the other word."""
         self._call("/api/project", {"name": "guardtest", "trigger": "primeira"})
+        self._call("/api/project", {"name": "outra"})
         self._call("/api/project", {"name": "outra", "trigger": "segunda"})
         self.assertEqual(json.loads(self._get("/api/status"))["trigger"], "segunda")
         self._call("/api/project", {"name": "guardtest"})
         self.assertEqual(json.loads(self._get("/api/status"))["trigger"], "primeira")
+
+    def test_switching_projects_never_carries_the_old_trigger_over(self):
+        """The UI field still shows A's word when the owner types B's name: the
+        save that switches must not write it into B."""
+        self._call("/api/project", {"name": "outra"})
+        self._call("/api/project", {"name": "outra", "trigger": "novastyle"})
+        self._call("/api/project", {"name": "guardtest", "trigger": "arkstyle"})
+        self._call("/api/project", {"name": "outra", "trigger": "arkstyle"})
+        self.assertEqual(json.loads(self._get("/api/status"))["trigger"], "novastyle")
 
 
 class TestGlobalTriggerMigration(unittest.TestCase):

@@ -144,23 +144,6 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestCaptionRedo(unittest.TestCase):
-    def _source(self):
-        from pathlib import Path as P
-        return (P(__file__).resolve().parent.parent / "server.py").read_text()
-
-    def test_the_endpoint_reads_the_redo_flag(self):
-        self.assertIn('body.get("redo")', self._source())
-
-    def test_the_endpoint_clears_before_captioning(self):
-        self.assertIn("clear_captions", self._source())
-
-    def test_the_manual_button_uses_the_lora_cascade(self):
-        """O botão manual é o caminho do LoRA normal, onde o primário é o mais
-        barato — nada lê a lista de flagradas nesse modo."""
-        self.assertIn('mode="lora"', self._source())
-
-
 class TestStyleRushUiControls(unittest.TestCase):
     def _html(self):
         from pathlib import Path as P

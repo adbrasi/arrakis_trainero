@@ -222,9 +222,27 @@ def _load_manifest(convert_dir: Path) -> dict:
     return manifest
 
 
+def _write_json_atomic(path: Path, data: dict) -> None:
+    """Temp file + rename. The manifest is the record of what was paid for: a
+    pod dying mid-write used to leave half a JSON, which reads as "no slots",
+    and the resume bought every pair again."""
+    import os
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def _save_manifest(convert_dir: Path, manifest: dict) -> None:
-    (convert_dir / MANIFEST_NAME).write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False))
+    _write_json_atomic(convert_dir / MANIFEST_NAME, manifest)
 
 
 def _generate_with_retries(generate, prompt: str, source: Path):
@@ -567,14 +585,18 @@ def plan_restore(images: list[Path], used: set[str],
 
 def _load_restore_manifest(restore_dir: Path) -> dict:
     try:
-        return json.loads((restore_dir / RESTORE_MANIFEST_NAME).read_text())
+        manifest = json.loads((restore_dir / RESTORE_MANIFEST_NAME).read_text())
     except (OSError, json.JSONDecodeError):
-        return {"slots": {}}
+        manifest = {}
+    if not isinstance(manifest, dict):
+        manifest = {}
+    if not isinstance(manifest.get("slots"), dict):
+        manifest["slots"] = {}
+    return manifest
 
 
 def _save_restore_manifest(restore_dir: Path, manifest: dict) -> None:
-    (restore_dir / RESTORE_MANIFEST_NAME).write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False))
+    _write_json_atomic(restore_dir / RESTORE_MANIFEST_NAME, manifest)
 
 
 def build_restore_dataset(base_dir: Path, restore_dir: Path, job,

@@ -52,21 +52,42 @@ make_venv() {
     log "criando venv leve do servidor…"
     if command -v uv >/dev/null; then
       uv venv "$APP_DIR/.venv" --seed
-      uv pip install --python "$APP_DIR/.venv/bin/python" -r "$APP_DIR/requirements.txt"
     else
       python3 -m venv "$APP_DIR/.venv"
-      "$APP_DIR/.venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
     fi
   fi
+  sync_requirements "$APP_DIR"
 }
 
-free_port() {
-  # uma instância anterior segurando a porta é o motivo mais comum de o bootstrap
-  # morrer com "Address already in use" na segunda vez que se roda o comando.
-  # pkill cobre o caso normal; fuser é o reforço e pode não existir no container.
-  pkill -f "[s]erver\.py" >/dev/null 2>&1 || true
+stop_previous_server() {
+  # The server cancels its running job on SIGTERM and waits for the trainer to
+  # exit (up to ~30 s) — killing it harder would orphan a training on the GPU.
+  local pidfile="$1/data/server.pid" pid
+  if [ -f "$pidfile" ]; then
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [ -n "$pid" ] && grep -q "server.py" "/proc/$pid/cmdline" 2>/dev/null; then
+      log "parando a instância anterior (pid $pid)…"
+      kill -TERM "$pid" 2>/dev/null || true
+      for _ in $(seq 1 45); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+    fi
+  fi
+  # a server from before the pidfile existed: free the port the old way
   command -v fuser >/dev/null 2>&1 && fuser -k "$PORT/tcp" >/dev/null 2>&1 || true
-  sleep 1
+}
+
+sync_requirements() {
+  # a `git pull` that adds a dependency must reach the venv, or the new
+  # server dies on an import
+  local stamp="$1/.venv/.requirements.sha" want
+  want="$(sha256sum "$1/requirements.txt" | cut -d' ' -f1)"
+  [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$want" ] && return
+  log "instalando dependências do servidor…"
+  if command -v uv >/dev/null; then
+    uv pip install -q --python "$1/.venv/bin/python" -r "$1/requirements.txt"
+  else
+    "$1/.venv/bin/pip" install -q -r "$1/requirements.txt"
+  fi
+  echo "$want" > "$stamp"
 }
 
 main() {
@@ -74,10 +95,16 @@ main() {
   install_uv
   clone_repo
   make_venv
-  free_port
+  stop_previous_server "$APP_DIR"
   log "subindo em http://0.0.0.0:$PORT  (abra a porta $PORT no painel do pod)"
   cd "$APP_DIR"
-  exec "$APP_DIR/.venv/bin/python" server.py
+  mkdir -p "$APP_DIR/data"
+  # detached from this terminal: closing the pod's web terminal must not take
+  # the server — and a running training — down with it
+  setsid nohup "$APP_DIR/.venv/bin/python" server.py >> "$APP_DIR/data/server.log" 2>&1 < /dev/null &
+  log "servidor em segundo plano (log: $APP_DIR/data/server.log). Ctrl+C só para de mostrar o log."
+  sleep 2
+  exec tail -n 20 -f "$APP_DIR/data/server.log"
 }
 
 main "$@"

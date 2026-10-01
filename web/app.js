@@ -17,9 +17,18 @@ const state = {
   uploading: false,
   samples: [],
   triggerHydrated: false,
+  savedName: null,   // the project name the server last confirmed
+  polling: false,
 };
 
 // ---------------------------------------------------------------- helpers
+// Everything the server says can carry a file name from a third-party zip or a
+// pasted URL. It reaches innerHTML only through here.
+function esc(v) {
+  return String(v ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
 function toast(msg, type = "info") {
   const el = document.createElement("div");
   el.className = `toast ${type}`;
@@ -43,26 +52,54 @@ const post = (path, body) => api(path, {
 });
 
 // ---------------------------------------------------------------- project
-let projectTimer = null;
+// Saved when the field is left (change), not per keystroke: a debounce on
+// input created a project folder for every half-typed name ("m", "ma", "mak").
+// Uploads, imports and TREINAR call saveProject() first anyway.
 for (const id of ["#project-name", "#trigger-word"]) {
-  $(id).addEventListener("input", () => {
-    clearTimeout(projectTimer);
-    projectTimer = setTimeout(saveProject, 600);
-  });
+  $(id).addEventListener("change", () => saveProject());
+  $(id).addEventListener("input", () => { renderStepState(); refreshTrainButton(); });
 }
-async function saveProject() {
+async function saveProject(extra = {}) {
   const name = $("#project-name").value.trim();
   if (!name) return;
-  const body = { name };
-  // before the first /api/status lands the field is empty because we have not
-  // read the stored value yet — sending it would erase the saved trigger
-  if (state.triggerHydrated) body.trigger = $("#trigger-word").value.trim();
+  const switching = state.savedName !== null && name !== state.savedName;
+  const body = { name, ...extra };
+  // The trigger goes only with a save of the same project. Before the first
+  // poll the field is empty because the stored value was not read yet, and on a
+  // switch it still shows the previous project's word — both would overwrite
+  // the right one. The server answers with the stored trigger either way.
+  if (state.triggerHydrated && !switching) body.trigger = $("#trigger-word").value.trim();
   try {
-    await post("/api/project", body);
+    const r = await post("/api/project", body);
     state.projectSet = true;
+    state.savedName = name;
+    if (r.switched || switching) {
+      $("#trigger-word").value = r.trigger || "";
+      state.triggerHydrated = true;
+      renderKind(r.kind);
+    }
     refreshTrainButton();
   } catch (e) { toast(e.message, "error"); }
 }
+
+// ---------------------------------------------------------------- kind
+// The one caption question a beginner can answer. The server turns it (plus
+// the model) into a caption profile; nobody has to know what a profile is.
+function renderKindButtons() {
+  const kinds = state.presets?.lora_kinds || {};
+  $("#kind-toggle").innerHTML = Object.entries(kinds).map(([k, label]) =>
+    `<button type="button" data-kind="${esc(k)}">${esc(label)}</button>`).join("");
+}
+function renderKind(kind) {
+  $$("#kind-toggle button").forEach((b) => b.classList.toggle("active", b.dataset.kind === kind));
+}
+$("#kind-toggle").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-kind]");
+  if (!btn || !requireProject()) return;
+  renderKind(btn.dataset.kind);
+  await saveProject({ kind: btn.dataset.kind });
+  poll();
+});
 
 // ------------------------------------------------------- dataset de origem
 // A dataset costs captions, conversion pairs and curation; none of that
@@ -258,34 +295,56 @@ function requireProject() {
   return true;
 }
 
+const stemOf = (name) => name.replace(/\.[^.]+$/, "");
+
 async function uploadFiles(files, side) {
   if (!files.length || !requireProject()) return;
+  if (state.status?.job?.status === "running") {
+    return toast("há um job rodando — espere terminar ou cancele antes de enviar arquivos", "error");
+  }
   await saveProject();
   state.uploading = true;
   refreshTrainButton();
-  let done = 0, ok = 0;
-  const queue = [...files];
-  const workers = Array.from({ length: 4 }, async () => {
-    while (queue.length) {
-      const f = queue.shift();
-      const rel = f.webkitRelativePath || f.name;
-      const dir = /(^|\/)control\//i.test(rel) ? "control" : "";
-      try {
-        await api(`/api/dataset/file?side=${side}&name=${encodeURIComponent(f.name)}&dir=${dir}`,
-          { method: "POST", body: f });
-        ok += 1;
-      } catch (e) { toast(`${f.name}: ${e.message}`, "error"); }
-      done += 1;
-      $("#status-text").textContent = `enviando ${done}/${files.length}…`;
-    }
-  });
-  await Promise.all(workers);
+  let done = 0, ok = 0, dup = 0;
+  // Media first, captions after: the server never overwrites an image (a
+  // second "image.jpg" becomes image_2.jpg), so a caption has to follow the
+  // name its image actually got.
+  const isTxt = (f) => /\.txt$/i.test(f.name);
+  const renamed = {};
+  const send = async (list) => {
+    const queue = [...list];
+    await Promise.all(Array.from({ length: 4 }, async () => {
+      while (queue.length) {
+        const f = queue.shift();
+        const rel = f.webkitRelativePath || f.name;
+        const dir = /(^|\/)control\//i.test(rel) ? "control" : "";
+        let name = f.name;
+        if (isTxt(f) && renamed[`${dir}/${stemOf(name)}`]) name = `${renamed[`${dir}/${stemOf(name)}`]}.txt`;
+        try {
+          const r = await api(`/api/dataset/file?side=${side}&name=${encodeURIComponent(name)}&dir=${dir}`,
+            { method: "POST", body: f });
+          if (r.duplicate) dup += 1;
+          if (r.name && r.name !== name) renamed[`${dir}/${stemOf(name)}`] = stemOf(r.name);
+          ok += 1;
+        } catch (e) { toast(`${f.name}: ${e.message}`, "error"); }
+        done += 1;
+        $("#status-text").textContent = `enviando ${done}/${files.length}…`;
+      }
+    }));
+  };
+  await send(files.filter((f) => !isTxt(f)));
+  await send(files.filter(isTxt));
   state.uploading = false;
   // "N enviados" after half of them failed is the report that lets someone
   // train on an incomplete dataset without ever knowing
   const failed = done - ok;
-  if (failed) toast(`${ok} de ${done} enviados — ${failed} falharam`, "error");
-  else toast(`${ok} arquivo${ok === 1 ? "" : "s"} enviado${ok === 1 ? "" : "s"}`, "success");
+  const extra = [];
+  const nRenamed = Object.keys(renamed).length;
+  if (nRenamed) extra.push(`${nRenamed} renomeado${nRenamed === 1 ? "" : "s"} (nome já existia)`);
+  if (dup) extra.push(`${dup} já estava${dup === 1 ? "" : "m"} no dataset`);
+  const tail = extra.length ? ` · ${extra.join(" · ")}` : "";
+  if (failed) toast(`${ok} de ${done} enviados — ${failed} falharam${tail}`, "error");
+  else toast(`${ok} arquivo${ok === 1 ? "" : "s"} enviado${ok === 1 ? "" : "s"}${tail}`, "success");
   poll();
 }
 
@@ -299,8 +358,10 @@ function renderStepState() {
   const trigger = !!$("#trigger-word").value.trim();
 
   const project = $("#state-project");
+  const triggerNeeded = captionNeedsTrigger();
+  document.querySelector(".trigger-field").classList.toggle("needed", triggerNeeded);
   if (!named) setState(project, "falta o nome", false);
-  else if (styleRush() && !trigger) setState(project, "falta a trigger word", false);
+  else if (triggerNeeded && !trigger) setState(project, "falta a trigger word", false);
   else setState(project, named && trigger ? "nome e trigger" : "nomeado", true);
 
   const ds = $("#state-dataset");
@@ -374,7 +435,9 @@ function renderDatasetStats() {
       if (!confirm(`Apagar ${n} ${n === 1 ? "item" : "itens"} deste dataset? `
         + "Os arquivos saem do pod. Para começar outro treino sem perder este, "
         + "troque o nome do projeto no passo 01.")) return;
-      await post(`/api/dataset/clear?side=${side}`);
+      try {
+        await post(`/api/dataset/clear?side=${side}`);
+      } catch (e) { return toast(e.message, "error"); }
       sheetKey[side] = "";
       poll();
     });
@@ -383,40 +446,82 @@ function renderDatasetStats() {
 }
 
 // ---------------------------------------------------------------- captions
+function profileInfo(key) {
+  for (const list of Object.values(state.presets?.caption_profiles || {})) {
+    const p = list.find((x) => x.key === key);
+    if (p) return p;
+  }
+  return null;
+}
+
+// The profile the job will use for missing captions: the one picked here, or
+// the server's plan for (model, kind). "auto" until a model is chosen.
+function plannedProfile() {
+  const s = state.status || {};
+  if (s.caption_profile) return s.caption_profile;
+  const plan = s.caption_plan || {};
+  return state.model ? plan[state.model] : (Object.values(plan)[0] || null);
+}
+
+function captionNeedsTrigger() {
+  const s = state.status || {};
+  const missing = (s.dataset?.missing_captions || 0)
+    + (state.mode === "slider" ? (s.dataset_neg?.missing_captions || 0) : 0);
+  if (styleRush()) return true;
+  if (!missing || sliderIsNative()) return false;
+  return !!profileInfo(plannedProfile())?.trigger;
+}
+
 function renderCaptionCard() {
   const s = state.status || {};
-  const missing = (s.dataset?.missing_captions || 0) + (s.dataset_neg?.missing_captions || 0);
-  // Style Rush writes the captions itself during training, with the trigger word
-  // from step 01 — asking the owner to do it here offers a worse path.
-  const items = (s.dataset?.items || 0) + (s.dataset_neg?.items || 0);
+  const negToo = state.mode === "slider";
+  const missing = (s.dataset?.missing_captions || 0) + (negToo ? (s.dataset_neg?.missing_captions || 0) : 0);
+  const items = (s.dataset?.items || 0) + (negToo ? (s.dataset_neg?.items || 0) : 0);
   const redo = $("#caption-redo").checked;
-  // The card used to appear only while something was missing. Redoing captions
-  // on a dataset that arrived with .txt files needs it visible when nothing is.
-  const show = !sliderIsNative() && !styleRush()
-               && (missing > 0 || (state.mode === "lora" && items > 0));
+  // Style Rush writes its own captions during training, with the trigger word
+  // from step 01 — offering this card there would offer a worse path.
+  const show = !sliderIsNative() && !styleRush() && items > 0;
   $("#caption-card").hidden = !show;
   if (!show) return;
   $("#caption-redo-wrap").hidden = state.mode !== "lora";
   $("#caption-msg").textContent = missing > 0
-    ? `${missing} itens sem caption`
+    ? `${missing} ${missing === 1 ? "item sem caption" : "itens sem caption"}`
     : `${items} itens, todos com caption`;
+  const isVideo = (s.dataset?.videos || 0) > 0 && !(s.dataset?.images || 0);
+  const kind = isVideo ? "video" : "image";
+  const sel = $("#caption-profile");
+  const chosen = s.caption_profile || "";
+  if (sel.dataset.kind !== kind) {
+    sel.dataset.kind = kind;
+    const profiles = state.presets?.caption_profiles[kind] || [];
+    sel.innerHTML = `<option value="">Automático (recomendado)</option>`
+      + profiles.map((p) => `<option value="${esc(p.key)}">${esc(p.label)}</option>`).join("");
+  }
+  if (document.activeElement !== sel) sel.value = chosen;
+  const planned = profileInfo(plannedProfile());
+  const label = planned ? planned.label : "o perfil automático";
+  const plan = $("#caption-plan");
+  if (!s.openrouter) {
+    plan.textContent = missing > 0
+      ? "sem OPENROUTER_API_KEY no pod: envie um .txt com o mesmo nome de cada imagem"
+      : "";
+    plan.classList.toggle("alert", missing > 0);
+  } else {
+    plan.classList.remove("alert");
+    plan.textContent = missing > 0
+      ? `o treino escreve as que faltam sozinho, com o perfil "${label}" — clique abaixo só se quiser revisar antes`
+      : `perfil: "${label}"`;
+  }
   $("#caption-key-hint").hidden = !!s.openrouter;
   $("#btn-captions").disabled = !s.openrouter || (missing === 0 && !redo);
-  $("#btn-captions").textContent = redo ? "Refazer captions" : "Escrever captions";
-  const isVideo = (s.dataset?.videos || 0) > 0;
-  const profiles = state.presets?.caption_profiles[isVideo ? "video" : "image"] || [];
-  const sel = $("#caption-profile");
-  if (sel.dataset.kind !== (isVideo ? "video" : "image")) {
-    sel.dataset.kind = isVideo ? "video" : "image";
-    sel.innerHTML = profiles.map((p) => `<option value="${p.key}" data-var="${p.var || ""}">${p.label}</option>`).join("");
-  }
+  $("#btn-captions").textContent = redo ? "Refazer captions" : "Escrever agora";
   renderCaptionTriggerNote();
 }
 
 // The trigger word is one thing and it lives in step 01. A second field here
 // meant the captions could be written with a word the training never uses.
 function renderCaptionTriggerNote() {
-  const needsVar = !!$("#caption-profile").selectedOptions[0]?.dataset.var;
+  const needsVar = !!profileInfo($("#caption-profile").value || plannedProfile())?.trigger;
   const trig = $("#trigger-word").value.trim();
   const note = $("#caption-trigger-note");
   if (!needsVar) note.textContent = "este perfil não usa trigger word";
@@ -424,33 +529,30 @@ function renderCaptionTriggerNote() {
   else note.textContent = "este perfil usa a trigger word — preencha-a no passo 01";
   note.classList.toggle("alert", needsVar && !trig);
 }
-$("#caption-profile").addEventListener("change", renderCaptionTriggerNote);
+$("#caption-profile").addEventListener("change", async () => {
+  await saveProject({ caption_profile: $("#caption-profile").value });
+  poll();
+});
 $("#caption-redo").addEventListener("change", renderCaptionCard);
 $("#trigger-word").addEventListener("input", renderCaptionTriggerNote);
 
 $("#btn-captions").addEventListener("click", async () => {
-  const sel = $("#caption-profile");
-  const opt = sel.selectedOptions[0];
+  const profile = $("#caption-profile").value || plannedProfile();
   const trigger = $("#trigger-word").value.trim();
-  if (opt?.dataset.var && !trigger) {
+  if (profileInfo(profile)?.trigger && !trigger) {
     toast("este perfil precisa da trigger word — preencha no passo 01", "error");
     $("#trigger-word").focus();
     return;
   }
+  const redo = $("#caption-redo").checked;
+  if (redo && !confirm("Apagar TODAS as captions deste dataset e escrever de novo? As que você mandou também somem.")) return;
   try {
-    const redo = $("#caption-redo").checked;
-    const sides = [];
-    if (redo) {
-      if (state.status?.dataset?.items) sides.push("pos");
-    } else {
-      if (state.status?.dataset?.missing_captions) sides.push("pos");
-      if (state.status?.dataset_neg?.missing_captions) sides.push("neg");
-    }
+    await saveProject();
     await post("/api/captions", {
-      profile: sel.value,
-      var_name: opt?.dataset.var || null,
+      profile: $("#caption-profile").value || null,
+      model: state.model,
       trigger,
-      side: sides[0] || "pos",
+      sides: state.mode === "slider" ? ["pos", "neg"] : ["pos"],
       redo,
     });
     toast("Geração de captions iniciada.");
@@ -465,7 +567,7 @@ function renderModels() {
     const btn = document.createElement("button");
     btn.className = "model-btn";
     btn.dataset.key = key;
-    btn.innerHTML = `${m.label}<span class="eng">${m.engine}</span>`;
+    btn.innerHTML = `${esc(m.label)}<span class="eng">${esc(m.engine)}</span>`;
     btn.addEventListener("click", () => selectModel(key));
     $(m.group === "imagem" ? "#models-imagem" : "#models-video").appendChild(btn);
   }
@@ -486,10 +588,12 @@ function selectModel(key) {
 }
 
 // ---------------------------------------------------------------- advanced
-const ADV_FIELDS = ["adv-net", "adv-dim", "adv-alpha", "adv-lr", "adv-epochs", "adv-repeats", "adv-save", "adv-ltx-res", "adv-convert-target", "adv-blocks-swap"];
+const ADV_FIELDS = ["adv-dim", "adv-alpha", "adv-lr", "adv-epochs", "adv-repeats", "adv-save", "adv-ltx-res", "adv-convert-target", "adv-blocks-swap"];
+// "input" too: "change" only fires on blur, and the poll refilled the field
+// from the preset every 2.5 s while the owner was still typing in it
 ADV_FIELDS.forEach((id) => {
   const el = document.getElementById(id);
-  el?.addEventListener("change", () => state.advTouched.add(id));
+  for (const ev of ["input", "change"]) el?.addEventListener(ev, () => state.advTouched.add(id));
 });
 
 function fillAdvanced() {
@@ -504,12 +608,6 @@ function fillAdvanced() {
   // other modes and showing it here would describe a run that never happens
   const sched = styleRush() ? state.presets?.style_rush_schedule
                             : state.status?.schedules?.[state.model];
-  const net = $("#adv-net");
-  if (net.dataset.model !== state.model) {
-    net.dataset.model = state.model;
-    net.innerHTML = m.net_types.map((n) =>
-      `<option value="${n}">${{ lora: "LoRA (padrão)", loha: "LoHa", lokr: "LoKr" }[n] || n}</option>`).join("");
-  }
   if (!state.advTouched.has("adv-dim")) $("#adv-dim").value = m.train.network_dim ?? "";
   if (!state.advTouched.has("adv-alpha")) $("#adv-alpha").value = m.train.network_alpha ?? "";
   if (!state.advTouched.has("adv-lr")) $("#adv-lr").value = m.train.learning_rate ?? "";
@@ -534,7 +632,6 @@ function fillAdvanced() {
 
 function collectOverrides() {
   const o = {
-    net_type: $("#adv-net").value || "lora",
     loraplus: $("#adv-loraplus").checked,
     hf_upload: $("#adv-hf").checked,
     hf_private: $("#adv-hf-private").checked,
@@ -563,8 +660,8 @@ function collectOverrides() {
 // ---------------------------------------------------------------- train
 $("#btn-train").addEventListener("click", async () => {
   if (!requireProject() || !state.model) return;
-  if (styleRush() && !$("#trigger-word").value.trim()) {
-    toast("Style Rush precisa de uma trigger word", "error");
+  if (captionNeedsTrigger() && !$("#trigger-word").value.trim()) {
+    toast("preencha a trigger word no passo 01", "error");
     $("#trigger-word").focus();
     return;
   }
@@ -602,7 +699,7 @@ $("#btn-shutdown").addEventListener("click", async () => {
 
 $("#btn-cancel").addEventListener("click", async () => {
   if (!confirm("Cancelar o job atual?")) return;
-  await post("/api/cancel");
+  try { await post("/api/cancel"); } catch (e) { toast(e.message, "error"); }
 });
 
 function refreshTrainButton() {
@@ -612,7 +709,10 @@ function refreshTrainButton() {
   // to the button, so there is never a disabled control with no explanation
   const blockers = [];
   if (!$("#project-name").value.trim()) blockers.push("dê um nome ao projeto");
-  if (styleRush() && !$("#trigger-word").value.trim()) blockers.push("preencha a trigger word");
+  if (captionNeedsTrigger() && !$("#trigger-word").value.trim()) {
+    blockers.push(styleRush() ? "preencha a trigger word"
+      : "preencha a trigger word (as captions que faltam vão usá-la)");
+  }
   if (sliderIsNative()) {
     if (!sliderTargets().length) blockers.push("adicione um par de prompts");
   } else if (!(s.dataset?.items || 0)) {
@@ -623,29 +723,44 @@ function refreshTrainButton() {
   }
   if (!state.model) blockers.push("escolha um modelo");
   if (styleRush() && !s.openrouter) blockers.push("defina OPENROUTER_API_KEY no pod");
+  const missing = (s.dataset?.missing_captions || 0)
+    + (state.mode === "slider" ? (s.dataset_neg?.missing_captions || 0) : 0);
+  if (!styleRush() && !sliderIsNative() && missing && !s.openrouter) {
+    blockers.push(`${missing} itens sem caption — envie os .txt ou defina OPENROUTER_API_KEY`);
+  }
   // the server refuses a train mid-upload; say so before the click, not after
   if (state.uploading) blockers.unshift("espere o upload terminar");
 
   $("#btn-train").disabled = !!busy || blockers.length > 0;
   $("#btn-cancel").hidden = !busy;
-  $("#next-action").textContent = busy ? "treinando — cancele quando os samples ficarem bons"
-    : blockers.length ? `falta: ${blockers[0]}` : "tudo pronto";
+  const lowDisk = s.disk_free_gb >= 0 && s.disk_free_gb < 60;
+  $("#next-action").textContent = busy ? `${s.job.title} — acompanhe abaixo`
+    : blockers.length ? `falta: ${blockers[0]}`
+    : lowDisk ? `pronto · atenção: só ${s.disk_free_gb} GB livres (modelos base ocupam 20–60 GB)`
+    : "tudo pronto";
 }
 
 // ---------------------------------------------------------------- polling
 async function poll() {
+  // a slow answer must not stack polls behind it
+  if (state.polling) return;
+  state.polling = true;
   try {
     state.status = await api("/api/status");
   } catch {
     $("#status-dot").className = "dot failed";
     $("#status-text").textContent = "servidor fora do ar?";
     return;
+  } finally {
+    state.polling = false;
   }
   const s = state.status;
   if (!state.projectSet && s.project && !$("#project-name").value) {
     $("#project-name").value = s.project;
     state.projectSet = true;
   }
+  if (state.savedName === null && s.project) state.savedName = s.project;
+  renderKind(s.kind || "");
   // read the stored trigger exactly once: re-filling it every poll would undo
   // the owner clearing the field (the save is debounced 600ms behind it)
   if (!state.triggerHydrated) {
@@ -672,6 +787,10 @@ async function poll() {
   oc.hidden = false;
   oc.textContent = s.openrouter ? "OpenRouter ✓" : "OpenRouter —";
   oc.className = `readout ${s.openrouter ? "ok" : "bad"}`;
+  const dc = $("#disk-chip");
+  dc.hidden = !(s.disk_free_gb >= 0);
+  dc.textContent = `${s.disk_free_gb} GB livres`;
+  dc.className = `readout ${s.disk_free_gb >= 60 ? "ok" : "bad"}`;
 
   renderJob(s.job);
   if (!state.uploading) {
@@ -692,36 +811,46 @@ function renderJob(job) {
   const card = $("#card-progress");
   if (!job) { card.hidden = true; return; }
   card.hidden = false;
-  $("#progress-title").textContent = job.title + (
+  const other = job.project && state.savedName && job.project !== state.savedName
+    ? ` (projeto ${job.project})` : "";
+  $("#progress-title").textContent = job.title + other + (
     { done: " — concluído ✔", failed: " — FALHOU ✘", cancelled: " — cancelado" }[job.status] || ""
   );
   const chips = $("#phase-chips");
   chips.innerHTML = (job.phases || []).map((p) =>
-    `<span class="phase-chip ${p.status}">${p.name}</span>`).join("");
+    `<span class="phase-chip ${esc(p.status)}">${esc(p.name)}</span>`).join("");
   const pr = job.progress || {};
   const wrap = $("#bar-wrap");
   if (pr.total_steps) {
     wrap.hidden = false;
     const pct = Math.min(100, (pr.step / pr.total_steps) * 100);
     $("#bar-fill").style.width = `${pct}%`;
-    $("#bar-label").textContent = `${pr.step}/${pr.total_steps} steps`;
+    $("#bar-label").textContent = `${pr.step}/${pr.total_steps} ${pr.unit || "steps"}`;
   } else wrap.hidden = true;
   const metrics = [];
   if (pr.epoch) metrics.push(`epoch <b>${pr.epoch}${pr.total_epochs ? "/" + pr.total_epochs : ""}</b>`);
   if (pr.loss != null) metrics.push(`loss <b>${pr.loss.toFixed(4)}</b>`);
   const cs = job.extra?.config_summary;
-  if (cs) metrics.push(`<span class="hint">${JSON.stringify(cs).slice(1, -1).replaceAll('"', "")}</span>`);
-  if (job.error) metrics.push(`<b style="color:var(--signal)">${job.error}</b>`);
+  if (cs) metrics.push(`<span class="hint">${esc(JSON.stringify(cs).slice(1, -1).replaceAll('"', ""))}</span>`);
+  if (job.extra?.caption_cost) metrics.push(`captions <b>$${Number(job.extra.caption_cost).toFixed(4)}</b>`);
+  if (job.error) metrics.push(`<b style="color:var(--signal)">${esc(job.error)}</b>`);
   $("#metrics").innerHTML = metrics.join(" · ");
   const hfRow = $("#hf-link-row");
   if (job.extra?.hf_repo) {
     hfRow.hidden = false;
     const files = job.extra.hf_files?.length ? ` · ${job.extra.hf_files.length} arquivos enviados` : "";
-    hfRow.innerHTML = `🤗 <a href="https://huggingface.co/${job.extra.hf_repo}" target="_blank">${job.extra.hf_repo}</a>${files}`;
+    const repo = esc(job.extra.hf_repo);
+    hfRow.innerHTML = `🤗 <a href="https://huggingface.co/${repo}" target="_blank" rel="noopener">${repo}</a>${files}`;
   } else hfRow.hidden = true;
-  fetchSamples();
-  fetchLog();
+  // a finished job's log and gallery do not change: one last read, then stop
+  const key = `${job.started_at}:${job.status}`;
+  if (job.status === "running" || key !== lastJobKey) {
+    lastJobKey = key;
+    fetchSamples();
+    fetchLog();
+  }
 }
+let lastJobKey = "";
 
 let lastLog = "";
 async function fetchLog() {
@@ -757,7 +886,7 @@ async function fetchSamples() {
       ? `${samples.length} amostras · mostrando as ${shown.length} mais recentes`
       : `${samples.length} amostra${samples.length === 1 ? "" : "s"}`;
     box.innerHTML = shown.map((s) => {
-      const label = s.epoch >= 0 ? `epoch ${s.epoch}` : s.name;
+      const label = esc(s.epoch >= 0 ? `epoch ${s.epoch}` : s.name);
       const q = encodeURIComponent(s.name);
       // the grid pulls a thumbnail; the link opens the full-resolution PNG
       return `<figure>
@@ -777,6 +906,7 @@ async function fetchSamples() {
     state.presets = p;
     state.order = p.order;
     renderModels();
+    renderKindButtons();
   } catch (e) { toast(`presets: ${e.message}`, "error"); }
   await poll();
   pollTimer = setInterval(poll, 2500);

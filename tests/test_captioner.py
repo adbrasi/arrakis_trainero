@@ -1,439 +1,357 @@
 """Captioning: the one phase that spends money per image and can refuse.
 
-A caption is not optional — one item without one blocks the training — so the
-pipeline is cheap-model, then fallback model, then drop what neither will take.
+These run the real `captioner` (captionkreator) as a subprocess against a fake
+OpenRouter on localhost, so what is tested is the actual contract between the
+two repos: the CLI flags, the profile format, captions.json, the exit codes and
+the progress lines — not a stand-in of them.
+
+Point CAPTIONER_BIN at a captionkreator install to run them; by default they
+look for a sibling checkout (../captionkreator/.venv/bin/captioner) and skip
+when there is none.
 """
 
 import json
+import os
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from trainero import captioner
-from trainero.captioner import (QUARANTINE_DIR, TAGGER_LOG, caption_models,
-                                generate_captions, prune_stale_log,
-                                quarantine_uncaptionable)
+from trainero.captioner import (FLAGGED_FILE, QUARANTINE_DIR, caption_datasets,
+                                clear_captions, flagged_names, generate_captions)
+from trainero.jobs import Job, JobFailed
 
-# Os testes deste arquivo exercem a cascata do Style Rush, que é a ordem em que
-# o primário é o Gemini — é essa ordem que alimenta record_flagged.
-PRIMARY, SECOND, THIRD = caption_models("style-rush")
+REPO = Path(__file__).resolve().parent.parent
+CAPTIONER_BIN = Path(os.environ.get(
+    "CAPTIONER_BIN", REPO.parent / "captionkreator" / ".venv" / "bin" / "captioner"))
 
-
-class _FakeJob:
-    """Stands in for Job, and plays the tagger: `writes` names which models
-    manage to caption, so a refusal is simply a model that writes nothing."""
-
-    def __init__(self, writes: dict[str, set[str]] | None = None):
-        self.lines = []
-        self.commands = []
-        self.writes = writes or {}
-
-    def log(self, msg):
-        self.lines.append(msg)
-
-    def run(self, cmd, cwd=None, env=None, parse_progress=False):
-        cmd = [str(c) for c in cmd]
-        self.commands.append(cmd)
-        model = cmd[cmd.index("--grok_model") + 1]
-        target = Path(cmd[2])
-        # the real tagger skips anything already in its processing log unless
-        # --force; without that here, dropping the prune would look harmless
-        skip = self._logged(target) if "--force" not in cmd else set()
-        for name in self.writes.get(model, set()):
-            item = target / name
-            if item.exists() and str(item) not in skip:
-                item.with_suffix(".txt").write_text("uma caption")
-                self._mark(target, item)
-        return 0
-
-    @staticmethod
-    def _logged(target: Path) -> set[str]:
-        try:
-            return set(json.loads((target / TAGGER_LOG).read_text())["processed"])
-        except (OSError, json.JSONDecodeError, KeyError):
-            return set()
-
-    @staticmethod
-    def _mark(target: Path, item: Path):
-        log = target / TAGGER_LOG
-        try:
-            data = json.loads(log.read_text())
-        except (OSError, json.JSONDecodeError):
-            data = {"processed": {}}
-        data["processed"][str(item)] = {"taggers": ["grok"], "timestamp": "now"}
-        log.write_text(json.dumps(data))
-
-    def models_used(self):
-        return [c[c.index("--grok_model") + 1] for c in self.commands]
+PRIMARY, SECOND, THIRD = "p/primary", "f/second", "f/third"
 
 
-def _dataset(root: Path, captioned: int, uncaptioned: int) -> Path:
-    ds = root / "dataset"
-    ds.mkdir(parents=True, exist_ok=True)
-    logged = {}
-    for i in range(captioned):
-        img = ds / f"ok_{i:03d}.jpg"
-        img.write_bytes(b"x")
-        img.with_suffix(".txt").write_text("uma caption")
-        logged[str(img)] = {"taggers": ["grok", "pixai"], "timestamp": "2026-08-16T15:00:00"}
-    for i in range(uncaptioned):
-        (ds / f"falta_{i:03d}.jpg").write_bytes(b"x")
-    (ds / TAGGER_LOG).write_text(json.dumps({"processed": logged}))
-    return ds
+class FakeOpenRouter:
+    """/models, /chat/completions and /key, with per-model refusals.
+
+    `refuse[model]` holds file names that model refuses (a provider refusal,
+    the way OpenRouter reports a content filter). `credit` False makes every
+    completion a 402 and /key report an empty balance.
+    """
+
+    def __init__(self):
+        self.refuse: dict[str, set[str]] = {}
+        self.credit = True
+        self.calls: list[tuple[str, str]] = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, payload):
+                body = json.dumps(payload).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path.endswith("/models"):
+                    models = [{"id": m, "architecture": {"input_modalities": ["text", "image", "video"]},
+                               "supported_parameters": ["response_format", "reasoning"]}
+                              for m in (PRIMARY, SECOND, THIRD)]
+                    return self._send(200, {"data": models})
+                if self.path.endswith("/key"):
+                    return self._send(200, {"data": {"limit_remaining": 10 if outer.credit else 0}})
+                self._send(404, {})
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                model = body["model"]
+                text = json.dumps(body["messages"])
+                name = re.search(r"file=([\w.\-]+)", text).group(1)
+                trigger = (re.search(r"trigger=([\w\-]*)", text) or [None, ""])[1]
+                outer.calls.append((model, name))
+                if not outer.credit:
+                    return self._send(402, {"error": {"message": "Insufficient credits"}})
+                usage = {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.001}
+                if name in outer.refuse.get(model, set()):
+                    return self._send(200, {"model": model, "usage": usage, "choices": [
+                        {"message": {"content": None, "refusal": "content policy"},
+                         "finish_reason": "stop"}]})
+                caption = f"{trigger} a caption of {name} by {model}".strip()
+                return self._send(200, {"model": model, "usage": usage, "choices": [
+                    {"message": {"content": json.dumps({"caption": caption})},
+                     "finish_reason": "stop"}]})
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/api/v1"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
 
 
-def _run(ds: Path, job: _FakeJob, problem: str = "", mode: str = "style-rush"):
-    """`problem` is what the OpenRouter health check reports — empty means the
-    account works, so an item still missing really was refused by both models."""
-    with mock.patch.dict("os.environ", {"OPENROUTER_API_KEY": "k"}), \
-         mock.patch.object(captioner, "ensure_engine"), \
-         mock.patch.object(captioner, "venv_python", return_value=Path("py")), \
-         mock.patch.object(captioner, "engine_dir", return_value=Path("/eng")), \
-         mock.patch.object(captioner, "openrouter_problem", return_value=problem):
-        generate_captions(ds, "image", "generic-style", {"style_name": "t"}, job, mode=mode)
+def _write_profile(root: Path, media: str, key: str, trigger: bool) -> None:
+    d = root / media / key
+    d.mkdir(parents=True)
+    (d / "system.md").write_text('Output {"caption": "..."}.\n')
+    user = "file={{filename}}" + (" trigger={{trigger}}" if trigger else "")
+    (d / "user.md").write_text(user + "\n")
+    lines = [f"name: {key}", f"media: {media}", "concurrency: 4"]
+    if trigger:
+        lines += ["vars:", "  - name: trigger", "    required: true"]
+    lines += [f"model: {PRIMARY}", "fallback:", f"  - {SECOND}", f"  - {THIRD}",
+              "extract_json: caption", "retries: 0", "transport_retries: 0",
+              "validate:", "  - not_empty"]
+    if trigger:
+        lines += ["  - type: contains", '    value: "{{trigger}}"']
+    (d / "profile.yaml").write_text("\n".join(lines) + "\n")
 
 
-class TestNoReprocessing(unittest.TestCase):
-    def test_the_command_does_not_reprocess_what_is_already_captioned(self):
-        """--force made the tagger redo every file in its log. A run that died
-        at image 190 of 282 then charged OpenRouter for all 282 on the retry."""
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=190, uncaptioned=92)
-            job = _FakeJob({PRIMARY: {f"falta_{i:03d}.jpg" for i in range(92)}})
-            _run(ds, job)
-            self.assertNotIn("--force", job.commands[0])
+def _png(path: Path, color=(200, 30, 30)) -> None:
+    from PIL import Image
 
-    def test_the_cheap_model_alone_is_enough_when_nothing_is_refused(self):
-        """The fallback is a second paid pass over the dataset — it must not run
-        when the first model captioned everything."""
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=10, uncaptioned=5)
-            job = _FakeJob({PRIMARY: {f"falta_{i:03d}.jpg" for i in range(5)}})
-            _run(ds, job)
-            self.assertEqual(job.models_used(), [PRIMARY])
+    Image.new("RGB", (32, 32), color).save(path)
 
 
-class TestFallback(unittest.TestCase):
-    def test_what_gemini_refuses_goes_to_grok(self):
-        """Gemini answers PROHIBITED_CONTENT on material Grok captions fine."""
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=5, uncaptioned=3)
-            job = _FakeJob({
-                PRIMARY: {"falta_000.jpg", "falta_001.jpg"},
-                SECOND: {"falta_002.jpg"},
-            })
-            _run(ds, job)
+@unittest.skipUnless(CAPTIONER_BIN.exists(), f"captionkreator não instalado em {CAPTIONER_BIN}")
+class CaptionerEndToEnd(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.api = FakeOpenRouter()
+        self.profiles = self.tmp / "profiles"
+        # the real keys: the presets' trigger metadata applies to them
+        _write_profile(self.profiles, "image", "generic-style", trigger=True)
+        _write_profile(self.profiles, "image", "default", trigger=False)
+        _write_profile(self.profiles, "video", "nsfw_caption_video", trigger=False)
+        self.project = self.tmp / "proj"
+        self.ds = self.project / "dataset"
+        self.ds.mkdir(parents=True)
+        self.job = Job("captions", "t", self.tmp / "log.txt")
+        patches = [
+            mock.patch.object(captioner, "PROFILES_DIR", self.profiles),
+            mock.patch.object(captioner, "ensure_engine", lambda *_a: None),
+            mock.patch.object(captioner, "venv_bin", lambda *_a: CAPTIONER_BIN),
+            mock.patch.object(captioner, "engine_dir", lambda *_a: self.tmp),
+            mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-test",
+                                         "OPENROUTER_BASE_URL": self.api.url,
+                                         "HOME": str(self.tmp)}),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(self.api.close)
+        self.addCleanup(shutil.rmtree, self.tmp, True)
 
-            self.assertEqual(job.models_used(),
-                             [PRIMARY, SECOND])
-            self.assertTrue((ds / "falta_002.txt").exists(),
-                            "o fallback tinha de ter escrito a caption")
-            self.assertTrue((ds / "falta_002.jpg").exists(), "nada devia ser removido")
+    def images(self, *names):
+        for i, n in enumerate(names):
+            _png(self.ds / n, (i * 40 % 255, 80, 120))
 
-    def test_the_refused_item_is_not_skipped_by_the_tagger_log(self):
-        """A refusal can leave the item in the tagger log with no caption; the
-        fallback pass would then skip the one file it exists to rescue."""
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=2, uncaptioned=1)
-            log = json.loads((ds / TAGGER_LOG).read_text())
-            log["processed"][str(ds / "falta_000.jpg")] = {"taggers": ["grok"]}
-            (ds / TAGGER_LOG).write_text(json.dumps(log))
+    def caption(self, name):
+        return (self.ds / name).with_suffix(".txt").read_text().strip()
 
-            job = _FakeJob({SECOND: {"falta_000.jpg"}})
-            _run(ds, job)
+    # -- the normal path ---------------------------------------------------
+    def test_every_image_gets_a_caption_with_the_trigger(self):
+        self.images("a.png", "b.png", "c.png")
+        generate_captions(self.ds, "generic-style", self.job, trigger="zzstyle")
+        for n in ("a.png", "b.png", "c.png"):
+            self.assertTrue(self.caption(n).startswith("zzstyle "), self.caption(n))
+        self.assertEqual({m for m, _ in self.api.calls}, {PRIMARY})
+        self.assertFalse(flagged_names(self.ds))
 
-            self.assertTrue((ds / "falta_000.txt").exists())
-            self.assertIn(str(ds / "falta_000.jpg"),
-                          json.loads((ds / TAGGER_LOG).read_text())["processed"])
+    def test_progress_reaches_the_job_log(self):
+        self.images("a.png", "b.png")
+        generate_captions(self.ds, "default", self.job)
+        self.assertRegex(self.job.log_tail(), r"progress: 2/2")
+        self.assertGreater(self.job.extra.get("caption_cost", 0), 0)
 
+    def test_control_images_are_not_captioned(self):
+        self.images("a.png")
+        (self.ds / "control").mkdir()
+        _png(self.ds / "control" / "a.png")
+        generate_captions(self.ds, "default", self.job)
+        self.assertFalse((self.ds / "control" / "a.txt").exists())
 
-class TestDiscard(unittest.TestCase):
-    def test_what_neither_model_captions_leaves_the_dataset(self):
-        """One uncaptioned item fails the whole training, and this one has been
-        refused twice on content grounds — retrying is not going to help."""
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=4, uncaptioned=2)
-            job = _FakeJob({SECOND: {"falta_000.jpg"}})
-            _run(ds, job)
+    # -- the owner's own captions --------------------------------------------
+    def test_captions_the_owner_sent_are_never_rewritten_or_paid_again(self):
+        self.images("mine.png", "new.png")
+        (self.ds / "mine.txt").write_text("my hand written caption\n")
+        generate_captions(self.ds, "default", self.job)
+        self.assertEqual(self.caption("mine.png"), "my hand written caption")
+        self.assertEqual([n for _, n in self.api.calls], ["new.png"])
 
-            self.assertTrue((ds / "falta_000.jpg").exists(), "o fallback salvou esta")
-            self.assertFalse((ds / "falta_001.jpg").exists(), "esta tinha de sair")
-            self.assertEqual(len(list(ds.glob("ok_*.jpg"))), 4,
-                             "não pode encostar nas que já tinham caption")
-            self.assertTrue(any("falta_001.jpg" in ln for ln in job.lines),
-                            "o nome removido tem de ir para o log")
+    def test_nothing_missing_spends_nothing(self):
+        self.images("a.png")
+        (self.ds / "a.txt").write_text("ok\n")
+        generate_captions(self.ds, "default", self.job)
+        self.assertEqual(self.api.calls, [])
 
-    def test_the_discarded_item_leaves_the_processing_log_too(self):
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=1, uncaptioned=1)
-            item = ds / "falta_000.jpg"
-            job = _FakeJob()
-            quarantine_uncaptionable(ds, [item], job)
+    def test_a_second_run_after_an_interruption_only_does_the_rest(self):
+        self.images("a.png", "b.png")
+        generate_captions(self.ds, "default", self.job)
+        self.api.calls.clear()
+        (self.ds / "b.txt").unlink()  # "deleted by hand to redo it"
+        _png(self.ds / "c.png", (1, 2, 3))
+        generate_captions(self.ds, "default", self.job)
+        # b comes back from captionkreator's state for free; only c is new work
+        self.assertEqual([n for _, n in self.api.calls], ["c.png"])
+        self.assertTrue((self.ds / "b.txt").exists())
 
-            self.assertFalse(item.exists())
-            left = json.loads((ds / TAGGER_LOG).read_text())["processed"]
-            self.assertNotIn(str(item), left)
-            self.assertEqual(len(left), 1)
+    def test_redo_rewrites_everything_including_the_owners(self):
+        self.images("a.png")
+        (self.ds / "a.txt").write_text("old\n")
+        generate_captions(self.ds, "default", self.job, redo=True)
+        self.assertIn("a caption of a.png", self.caption("a.png"))
 
-    def test_the_dataset_is_captioned_end_to_end_after_the_three_passes(self):
-        with tempfile.TemporaryDirectory() as td:
-            from trainero.dataset import inspect
-            ds = _dataset(Path(td), captioned=3, uncaptioned=4)
-            job = _FakeJob({
-                PRIMARY: {"falta_000.jpg", "falta_001.jpg"},
-                SECOND: {"falta_002.jpg"},
-            })
-            _run(ds, job)
-            self.assertEqual(inspect(ds)["missing_captions"], 0,
-                             "o treino é bloqueado enquanto sobrar um sem caption")
+    # -- refusals ------------------------------------------------------------
+    def test_what_the_primary_refuses_a_fallback_captions_and_it_is_flagged(self):
+        self.images("ok.png", "spicy.png")
+        self.api.refuse[PRIMARY] = {"spicy.png"}
+        generate_captions(self.ds, "default", self.job)
+        self.assertIn(SECOND, self.caption("spicy.png"))
+        self.assertEqual(flagged_names(self.ds), {"spicy.png"})
 
+    def test_the_third_model_runs_when_the_second_also_refuses(self):
+        self.images("x.png")
+        self.api.refuse[PRIMARY] = self.api.refuse[SECOND] = {"x.png"}
+        generate_captions(self.ds, "default", self.job)
+        self.assertIn(THIRD, self.caption("x.png"))
 
-class TestInfraFailureIsNotARefusal(unittest.TestCase):
-    """Out of credit leaves every item uncaptioned, which on disk is identical
-    to every model refusing them. One is recoverable and the other is not."""
+    def test_what_no_model_captions_is_moved_out_not_deleted(self):
+        self.images("ok.png", "never.png")
+        for m in (PRIMARY, SECOND, THIRD):
+            self.api.refuse[m] = {"never.png"}
+        generate_captions(self.ds, "default", self.job)
+        self.assertFalse((self.ds / "never.png").exists())
+        self.assertTrue((self.project / QUARANTINE_DIR / "never.png").exists())
+        self.assertTrue((self.ds / "ok.txt").exists())
 
-    def test_no_credit_does_not_delete_the_owners_images(self):
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=190, uncaptioned=92)
-            job = _FakeJob()  # nenhum modelo escreve nada: OpenRouter fora do ar
+    def test_the_flag_list_survives_a_later_run(self):
+        self.images("a.png", "b.png")
+        self.api.refuse[PRIMARY] = {"a.png"}
+        generate_captions(self.ds, "default", self.job)
+        self.api.refuse[PRIMARY] = {"c.png"}
+        _png(self.ds / "c.png", (9, 9, 9))
+        generate_captions(self.ds, "default", self.job)
+        self.assertEqual(flagged_names(self.ds), {"a.png", "c.png"})
 
-            with self.assertRaises(Exception) as ctx:
-                _run(ds, job, problem="OpenRouter sem crédito")
+    # -- infrastructure failures -----------------------------------------------
+    def test_no_credit_keeps_every_image_and_says_why(self):
+        self.images("a.png", "b.png")
+        self.api.credit = False
+        with self.assertRaises(JobFailed) as ctx:
+            generate_captions(self.ds, "default", self.job)
+        self.assertIn("sem crédito", str(ctx.exception))
+        self.assertTrue((self.ds / "a.png").exists() and (self.ds / "b.png").exists())
+        self.assertFalse((self.project / QUARANTINE_DIR).exists())
 
-            self.assertIn("crédito", str(ctx.exception))
-            self.assertEqual(len(list(ds.glob("falta_*.jpg"))), 92,
-                             "apagou o dataset por causa de um problema de billing")
-            self.assertEqual(len(list(ds.glob("ok_*.jpg"))), 190)
+    def test_no_key_fails_before_spending(self):
+        self.images("a.png")
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": ""}):
+            with self.assertRaises(JobFailed):
+                generate_captions(self.ds, "default", self.job)
+        self.assertEqual(self.api.calls, [])
 
-    def test_a_healthy_account_still_discards_what_was_refused(self):
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=2, uncaptioned=1)
-            _run(ds, _FakeJob(), problem="")
-            self.assertFalse((ds / "falta_000.jpg").exists())
+    def test_a_trigger_profile_without_a_trigger_fails_before_spending(self):
+        self.images("a.png")
+        with self.assertRaises(JobFailed) as ctx:
+            generate_captions(self.ds, "generic-style", self.job, trigger="")
+        self.assertIn("trigger", str(ctx.exception))
+        self.assertEqual(self.api.calls, [])
 
-    def test_the_discarded_image_is_moved_and_not_destroyed(self):
-        """The account check cannot catch every infra failure — a retired model
-        id answers nothing while the key and the balance are perfect. Moving
-        keeps that mistake recoverable; unlink on the owner's only copy does not."""
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=1, uncaptioned=1)
-            _run(ds, _FakeJob(), problem="")
-            self.assertFalse((ds / "falta_000.jpg").exists())
-            self.assertTrue((ds.parent / QUARANTINE_DIR / "falta_000.jpg").exists(),
-                            "a imagem tem de continuar existindo fora do dataset")
+    # -- mixed datasets ---------------------------------------------------------
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg ausente")
+    def test_images_and_videos_each_get_their_own_profile(self):
+        self.images("still.png")
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
+                        "testsrc=size=64x64:rate=8", "-t", "1", "-pix_fmt", "yuv420p",
+                        str(self.ds / "clip.mp4")], check=True)
+        caption_datasets(self.job, [self.ds], model_key=None, kind="concept")
+        self.assertTrue((self.ds / "still.txt").exists())
+        self.assertTrue((self.ds / "clip.txt").exists())
 
-    def test_the_quarantine_is_outside_the_dataset_the_trainer_scans(self):
-        from trainero.dataset import inspect
-
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=2, uncaptioned=1)
-            _run(ds, _FakeJob(), problem="")
-            self.assertEqual(inspect(ds)["missing_captions"], 0)
-            self.assertEqual(inspect(ds)["items"], 2, "a descartada ainda conta no dataset")
-
-    def test_an_infra_failure_does_not_flag_images_for_the_conversion(self):
-        """Flagging on an outage would exclude the whole dataset from the paid
-        conversion phase permanently, blaming moderation for a billing problem."""
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=190, uncaptioned=92)
-            with self.assertRaises(Exception):
-                _run(ds, _FakeJob(), problem="OpenRouter sem crédito")
-            self.assertEqual(captioner.flagged_names(ds), set())
-
-
-class TestFlagged(unittest.TestCase):
-    def test_what_the_strict_model_refused_is_recorded_for_the_conversion(self):
-        """gpt-image-2 objects to the same images Gemini does, and there a
-        refusal costs a paid slot."""
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=2, uncaptioned=2)
-            job = _FakeJob({SECOND: {"falta_000.jpg", "falta_001.jpg"}})
-            _run(ds, job)
-
-            self.assertEqual(captioner.flagged_names(ds),
-                             {"falta_000.jpg", "falta_001.jpg"})
-
-    def test_nothing_is_flagged_when_the_first_model_takes_everything(self):
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=2, uncaptioned=2)
-            job = _FakeJob({PRIMARY: {"falta_000.jpg", "falta_001.jpg"}})
-            _run(ds, job)
-            self.assertEqual(captioner.flagged_names(ds), set())
-
-    def test_the_flag_survives_a_second_caption_run(self):
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=1, uncaptioned=1)
-            _run(ds, _FakeJob({SECOND: {"falta_000.jpg"}}))
-            _run(ds, _FakeJob())  # nada a fazer, tudo já tem caption
-            self.assertEqual(captioner.flagged_names(ds), {"falta_000.jpg"})
+    def test_both_slider_sides_in_one_call(self):
+        neg = self.project / "dataset_neg"
+        neg.mkdir()
+        self.images("p.png")
+        _png(neg / "n.png")
+        caption_datasets(self.job, [self.ds, neg], model_key="flux-klein", kind="concept")
+        self.assertTrue((self.ds / "p.txt").exists() and (neg / "n.txt").exists())
 
 
-class TestPruneStaleLog(unittest.TestCase):
-    def test_a_caption_deleted_by_hand_goes_back_into_the_queue(self):
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=4, uncaptioned=0)
-            (ds / "ok_001.txt").unlink()
-            job = _FakeJob()
-
-            removed = prune_stale_log(ds, job)
-
-            self.assertEqual(removed, 1)
-            left = json.loads((ds / TAGGER_LOG).read_text())["processed"]
-            self.assertEqual(len(left), 3)
-            self.assertNotIn(str(ds / "ok_001.jpg"), left)
-
-    def test_a_missing_log_is_not_an_error(self):
-        with tempfile.TemporaryDirectory() as td:
-            ds = Path(td) / "dataset"
+class ClearCaptions(unittest.TestCase):
+    def test_clear_takes_captions_state_and_flags_but_not_the_quarantine(self):
+        with tempfile.TemporaryDirectory() as t:
+            ds = Path(t) / "dataset"
             ds.mkdir()
-            self.assertEqual(prune_stale_log(ds), 0)
+            (ds / "a.png").write_bytes(b"x")
+            (ds / "a.txt").write_text("c")
+            for name in (".captioner.sqlite", "captions.json", FLAGGED_FILE, ".tagger_log.json"):
+                (ds / name).write_text("{}")
+            q = Path(t) / QUARANTINE_DIR
+            q.mkdir()
+            (q / "gone.png").write_bytes(b"x")
+            self.assertEqual(clear_captions(ds), 1)
+            self.assertEqual(sorted(p.name for p in ds.iterdir()), ["a.png"])
+            self.assertTrue((q / "gone.png").exists())
 
-    def test_a_corrupt_log_is_not_an_error(self):
-        with tempfile.TemporaryDirectory() as td:
-            ds = Path(td) / "dataset"
-            ds.mkdir()
-            (ds / TAGGER_LOG).write_text("{nao é json")
-            self.assertEqual(prune_stale_log(ds), 0)
+    def test_command_fills_gaps_only_and_never_recurses_into_control(self):
+        cmd = captioner.captioner_cmd(Path("/d"), "default", "")
+        self.assertIn("--skip-captioned", cmd)
+        self.assertIn("--no-recursive", cmd)
+        self.assertNotIn("--force", cmd)
+        self.assertNotIn("--var", cmd)
+        self.assertEqual(cmd[cmd.index("--prompts-dir") + 1], str(captioner.PROFILES_DIR))
 
-    def test_no_openrouter_key_fails_before_spending_anything(self):
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=1, uncaptioned=1)
-            with mock.patch.dict("os.environ", {}, clear=True):
-                with self.assertRaises(Exception):
-                    generate_captions(ds, "image", "default", {}, _FakeJob())
+
+class ShippedProfiles(unittest.TestCase):
+    """The profiles this repo ships are loadable by captionkreator and agree
+    with the trigger metadata the UI and the preflight use."""
+
+    def test_trigger_metadata_matches_each_profile_yaml(self):
+        from trainero.presets import CAPTION_PROFILES, STYLE_RUSH_CAPTION_PROFILE
+
+        entries = [(m, p) for m, ps in CAPTION_PROFILES.items() for p in ps]
+        entries.append(("image", STYLE_RUSH_CAPTION_PROFILE))
+        for media, p in entries:
+            yaml_text = (captioner.PROFILES_DIR / media / p["key"] / "profile.yaml").read_text()
+            self.assertEqual("name: trigger" in yaml_text, p["trigger"], p["key"])
+            self.assertIn(f"media: {media}", yaml_text, p["key"])
+
+    def test_every_placeholder_is_one_captionkreator_knows(self):
+        known = {"trigger", "booru_tags", "existing_caption", "filename"}
+        for md in captioner.PROFILES_DIR.rglob("*.md"):
+            names = set(re.findall(r"\{\{\s*(\w+)", md.read_text()))
+            self.assertLessEqual(names, known, md)
+            # a single-brace leftover from the old engine would reach the model raw
+            self.assertFalse(re.findall(r"(?<!\{)\{(tags|trigger_\w+|style_name|character_name)\}",
+                                        md.read_text()), md)
+
+    @unittest.skipUnless(CAPTIONER_BIN.exists(), "captionkreator ausente")
+    def test_captionkreator_loads_every_profile(self):
+        py = CAPTIONER_BIN.parent / "python"
+        code = ("import sys; from pathlib import Path;"
+                "from captioner.config import list_profiles, load_profile, find_profile;"
+                "from captioner.prompts import preflight_prompts;"
+                "root=[Path(sys.argv[1])];"
+                "[preflight_prompts(load_profile(find_profile(r['name'], root)), {'trigger': 't'})"
+                " for r in list_profiles(root)];"
+                "print(len(list_profiles(root)))")
+        out = subprocess.run([str(py), "-c", code, str(captioner.PROFILES_DIR)],
+                             capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertGreaterEqual(int(out.stdout.strip()), 12)
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class TestCascadeOrder(unittest.TestCase):
-    """A ordem depende do que o modo faz com a recusa do primário: só o Style
-    Rush lê o .caption_refused.json, e lá ele vale dinheiro."""
-
-    def test_lora_starts_with_muse_spark(self):
-        self.assertEqual(caption_models("lora")[0], "meta/muse-spark-1.2-contributor")
-
-    def test_style_rush_starts_with_gemini(self):
-        self.assertEqual(caption_models("style-rush")[0], "google/gemini-3.7-flash")
-
-    def test_both_modes_end_with_grok(self):
-        for mode in ("lora", "style-rush"):
-            self.assertEqual(caption_models(mode)[-1], "x-ai/grok-4.20", mode)
-
-    def test_both_modes_hold_the_same_three_models(self):
-        self.assertEqual(set(caption_models("lora")), set(caption_models("style-rush")))
-
-    def test_an_unknown_mode_falls_back_to_the_lora_order(self):
-        self.assertEqual(caption_models("qualquer-coisa"), caption_models("lora"))
-
-    def test_the_env_var_overrides_every_mode(self):
-        with mock.patch.dict("os.environ", {"CAPTION_MODELS": "a/one, b/two"}, clear=False):
-            self.assertEqual(caption_models("lora"), ["a/one", "b/two"])
-            self.assertEqual(caption_models("style-rush"), ["a/one", "b/two"])
-
-    def test_the_third_model_runs_when_the_second_also_refuses(self):
-        """Dois passes eram o teto antigo. Um item que o Gemini e o Muse recusam
-        tem de chegar no Grok em vez de sair do dataset."""
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=2, uncaptioned=1)
-            job = _FakeJob({THIRD: {"falta_000.jpg"}})
-            _run(ds, job)
-
-            self.assertEqual(job.models_used(), [PRIMARY, SECOND, THIRD])
-            self.assertTrue((ds / "falta_000.txt").exists(), "o terceiro tinha de salvar")
-            self.assertTrue((ds / "falta_000.jpg").exists(), "nada devia sair do dataset")
-
-    def test_the_cascade_stops_as_soon_as_nothing_is_missing(self):
-        """Cada passe extra é uma varredura paga sobre o dataset inteiro."""
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=2, uncaptioned=2)
-            job = _FakeJob({SECOND: {"falta_000.jpg", "falta_001.jpg"}})
-            _run(ds, job)
-            self.assertEqual(job.models_used(), [PRIMARY, SECOND],
-                             "o terceiro modelo não tinha trabalho")
-
-    def test_the_flag_records_the_primary_that_actually_ran(self):
-        """O arquivo diz de quem é a recusa. Gravar um id fixo enquanto a ordem
-        muda com o modo transformaria o registro em mentira."""
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=1, uncaptioned=1)
-            second_of_lora = caption_models("lora")[1]
-            _run(ds, _FakeJob({second_of_lora: {"falta_000.jpg"}}), mode="lora")
-            written = json.loads((ds / captioner.FLAGGED_FILE).read_text())
-            self.assertEqual(written["model"], caption_models("lora")[0])
-
-
-class TestConcurrency(unittest.TestCase):
-    def test_the_command_asks_for_many_parallel_calls(self):
-        """Mil imagens em fila serial é o que faz a fase de caption ser a mais
-        lenta do treino."""
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=0, uncaptioned=1)
-            job = _FakeJob({PRIMARY: {"falta_000.jpg"}})
-            _run(ds, job)
-            cmd = job.commands[0]
-            self.assertIn("--grok_concurrency", cmd)
-            self.assertEqual(int(cmd[cmd.index("--grok_concurrency") + 1]),
-                             captioner.CAPTION_CONCURRENCY)
-            self.assertGreaterEqual(captioner.CAPTION_CONCURRENCY, 32)
-
-
-class TestClearCaptions(unittest.TestCase):
-    def test_every_caption_is_deleted_and_counted(self):
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=6, uncaptioned=2)
-            removed = captioner.clear_captions(ds, _FakeJob())
-            self.assertEqual(removed, 6)
-            self.assertEqual(list(ds.glob("*.txt")), [])
-            self.assertEqual(len(list(ds.glob("*.jpg"))), 8, "nenhuma imagem pode sumir")
-
-    def test_the_tagger_log_goes_too(self):
-        """O tagger pula o que está no log. Sem apagá-lo, refazer não refaz nada."""
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=3, uncaptioned=0)
-            captioner.clear_captions(ds, _FakeJob())
-            self.assertFalse((ds / TAGGER_LOG).exists())
-
-    def test_the_flag_file_goes_too(self):
-        """A lista de flagradas é uma conclusão dos modelos antigos sobre estas
-        imagens. Refazer as captions é justamente refazer essa conclusão."""
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=1, uncaptioned=0)
-            captioner.record_flagged(ds, [ds / "ok_000.jpg"], "algum/modelo")
-            captioner.clear_captions(ds, _FakeJob())
-            self.assertEqual(captioner.flagged_names(ds), set())
-
-    def test_the_quarantine_is_not_touched(self):
-        """descartadas/ já saiu do dataset e é a única cópia do que foi movido."""
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=2, uncaptioned=0)
-            quarantine = ds.parent / QUARANTINE_DIR
-            quarantine.mkdir(parents=True, exist_ok=True)
-            (quarantine / "fora.jpg").write_bytes(b"x")
-            (quarantine / "fora.txt").write_text("uma caption")
-
-            captioner.clear_captions(ds, _FakeJob())
-
-            self.assertTrue((quarantine / "fora.jpg").exists())
-            self.assertTrue((quarantine / "fora.txt").exists())
-
-    def test_an_already_clean_dataset_is_a_no_op(self):
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=0, uncaptioned=3)
-            (ds / TAGGER_LOG).unlink()
-            self.assertEqual(captioner.clear_captions(ds, _FakeJob()), 0)
-
-    def test_the_caption_is_written_again_after_a_clear(self):
-        """O teste que prova o ponto todo: com o log apagado, o passe seguinte
-        reescreve o .txt de um item que já tinha caption."""
-        with tempfile.TemporaryDirectory() as td:
-            ds = _dataset(Path(td), captioned=2, uncaptioned=0)
-            captioner.clear_captions(ds, _FakeJob())
-            _run(ds, _FakeJob({PRIMARY: {"ok_000.jpg", "ok_001.jpg"}}))
-            self.assertTrue((ds / "ok_000.txt").exists())
-            self.assertTrue((ds / "ok_001.txt").exists())

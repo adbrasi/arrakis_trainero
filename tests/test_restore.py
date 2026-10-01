@@ -523,7 +523,7 @@ class TestTrainingWiring(unittest.TestCase):
                              control_dir=root / "dataset_restore" / "control",
                              control_resolution=[1024, 1024]),
             ]
-            text = write_dataset_toml("qwen-image-edit", root / "dataset.toml", subsets,
+            text = write_dataset_toml("flux-klein", root / "dataset.toml", subsets,
                                       [1024, 1024], 1).read_text()
 
             self.assertEqual(text.count("[[datasets]]"), 3)

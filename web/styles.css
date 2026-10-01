@@ -253,7 +253,11 @@ input[readonly] { color: var(--ink-3); cursor: not-allowed; }
 /* no Style Rush o treino escreve as captions — pedir isso ao dono seria
    oferecer um caminho pior do que não fazer nada */
 [data-mode="style-rush"] #caption-card { display: none !important; }
-[data-mode="lora"] .trigger-field, [data-mode="slider"] .trigger-field { opacity: 0.65; }
+/* Style Rush is always a style; a native LTX slider has no dataset to caption */
+[data-mode="style-rush"] .kind-field,
+[data-mode="slider"][data-native="1"] .kind-field { display: none; }
+.seg.wrap { flex-wrap: wrap; }
+[data-mode="lora"] .trigger-field:not(.needed), [data-mode="slider"] .trigger-field:not(.needed) { opacity: 0.65; }
 
 /* ── modelos ──────────────────────────────────────────────────────────── */
 .model-group + .model-group { margin-top: 14px; }

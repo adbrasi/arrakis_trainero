@@ -24,9 +24,10 @@ from .hf_upload import create_repo, hf_username, upload_text
 from .jobs import Job, JobFailed
 from .models_download import ensure_models, resolve
 from .presets import MODELS, suggest_schedule, vram_tier
-from .training import (_cli_args, _script, build_train_config, image_subset,
-                       launch_training, project_dir, run_caches, slugify,
-                       video_subset, write_dataset_toml)
+from .captioner import caption_datasets
+from .training import (_cli_args, _script, archive_previous_run, build_train_config, image_subset,
+                       launch_training, preflight_captions, project_dir, run_caches,
+                       slugify, video_subset, write_dataset_toml)
 
 MAKE_SLIDER = REPO_DIR / "trainero" / "tools" / "make_slider.py"
 
@@ -57,7 +58,6 @@ def _ltx_native_slider(job: Job, params: dict) -> None:
     pdir.mkdir(parents=True, exist_ok=True)
     slug = slugify(project)
     output_dir = pdir / "output"
-    output_dir.mkdir(exist_ok=True)
 
     job.set_phases(["Engine", "Modelos base", "Configuração", "Treino do slider", "Finalização"])
     gpu = gpu_info()
@@ -104,6 +104,7 @@ def _ltx_native_slider(job: Job, params: dict) -> None:
     job.end_phase("Configuração")
 
     job.start_phase("Treino do slider")
+    archive_previous_run(pdir, job)
     edir = engine_dir("musubi-ltx")
     accel = str(venv_bin("musubi-ltx", "accelerate"))
     cmd = [accel, "launch", "--num_cpu_threads_per_process", "1", "--mixed_precision", "bf16",
@@ -117,15 +118,13 @@ def _ltx_native_slider(job: Job, params: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Dataset-pair slider (image models + wan)
+# Dataset-pair slider (image models)
 # ---------------------------------------------------------------------------
 
 def _dataset_pair_slider(job: Job, params: dict) -> None:
     project = params["project"]
     model_key = params["model"]
     overrides = dict(params.get("overrides", {}))
-    if overrides.get("net_type", "lora") != "lora":
-        raise JobFailed("concept slider por dataset só funciona com LoRA padrão")
     model = MODELS[model_key]
     engine = model["engine"]
     pdir = project_dir(project)
@@ -136,11 +135,10 @@ def _dataset_pair_slider(job: Job, params: dict) -> None:
     neg = ds.inspect(neg_dir)
     if pos["items"] == 0 or neg["items"] == 0:
         raise JobFailed("importe os dois datasets do slider (conceito ALTO e conceito BAIXO)")
-    for name, st in (("ALTO", pos), ("BAIXO", neg)):
-        if st["missing_captions"] > 0:
-            raise JobFailed(f"dataset {name}: {st['missing_captions']} itens sem caption")
+    needs_captions = bool(pos["missing_captions"] or neg["missing_captions"])
+    preflight_captions(params, pos, neg)
 
-    phases = ["Engine", "Modelos base", "Configuração"]
+    phases = (["Captions"] if needs_captions else []) + ["Engine", "Modelos base", "Configuração"]
     if engine != "sd-scripts":
         phases += ["Cache de latents", "Cache do text encoder"]
     phases += ["Treino conceito ALTO", "Treino conceito BAIXO", "Montar slider", "Finalização"]
@@ -149,6 +147,17 @@ def _dataset_pair_slider(job: Job, params: dict) -> None:
     gpu = gpu_info()
     vram_gb = gpu.get("vram_mb", 24576) / 1024
     job.extra["gpu"] = gpu
+
+    if needs_captions:
+        job.start_phase("Captions")
+        caption_datasets(job, [pos_dir, neg_dir], model_key=model_key, kind=params.get("kind"),
+                         trigger=params.get("trigger", ""), profile=params.get("caption_profile"))
+        pos, neg = ds.inspect(pos_dir), ds.inspect(neg_dir)
+        for name, st in (("ALTO", pos), ("BAIXO", neg)):
+            if st["items"] == 0 or st["missing_captions"]:
+                raise JobFailed(f"dataset {name}: {st['missing_captions']} itens sem caption "
+                                f"e {st['items']} itens no total")
+        job.end_phase("Captions")
 
     job.start_phase("Engine")
     ensure_engine(engine, job)
@@ -167,6 +176,7 @@ def _dataset_pair_slider(job: Job, params: dict) -> None:
     batch_size = tier.get("batch_size", 1)
     resolution = overrides.get("resolution") or model.get("resolution", [1024, 1024])
 
+    archive_previous_run(pdir, job, ("output", "output_pos", "output_neg"))
     runs = []
     for side, sdir, stats in (("pos", pos_dir, pos), ("neg", neg_dir, neg)):
         out = pdir / f"output_{side}"
