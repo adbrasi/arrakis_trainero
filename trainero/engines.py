@@ -190,14 +190,18 @@ def supports_sampling(engine: str) -> bool:
     root = engine_dir(engine)
     if not root.exists():
         return False
-    for py in root.rglob("*.py"):
-        # the engine's own .venv holds tens of thousands of files and none of
-        # them is the trainer — scanning it would cost seconds for nothing
-        if ".venv" in py.parts or "site-packages" in py.parts:
-            continue
-        try:
-            if "--sample_prompts" in py.read_text(encoding="utf-8", errors="ignore"):
-                return True
-        except OSError:
-            continue
+    # os.walk with pruning: rglob descended the whole .venv (tens of
+    # thousands of files) before the filter threw it away
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in (".venv", "site-packages", ".git", "__pycache__")]
+        for fname in filenames:
+            if not fname.endswith(".py"):
+                continue
+            try:
+                if "--sample_prompts" in (Path(dirpath) / fname).read_text(
+                        encoding="utf-8", errors="ignore"):
+                    return True
+            except OSError:
+                continue
     return False

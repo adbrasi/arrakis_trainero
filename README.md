@@ -10,18 +10,25 @@ export OPENROUTER_API_KEY="sk-..."  # captions via LLM (só se precisar)
 curl -L https://raw.githubusercontent.com/adbrasi/arrakis_trainero/main/bootstrap.sh | bash
 ```
 
-Abra a porta **8090** no painel do pod. Pronto.
+Abra a porta **8090** no painel do pod. Pronto. O servidor roda destacado do terminal
+(fechar a aba não derruba um treino); log em `data/server.log`. Rodar o comando de novo
+atualiza e reinicia — um treino em andamento é cancelado de forma limpa antes.
 
 Local (WSL): `bash start.sh`.
 
 ## O fluxo
 
-1. **Nome do projeto** — vira o nome do LoRA e do repo HF.
-2. **Dataset** — arraste imagens/vídeos + `.txt` (ou um zip), ou cole: link Mega,
-   `user/repo` do HuggingFace, URL de zip, caminho de pasta. Se faltar caption,
-   aparece o card de geração via LLM (presets do data_araknideo).
-3. **Modelo** → **TREINAR**. O resto é automático: engine, download dos modelos
-   base, cache, treino contado em **epochs**, upload de cada checkpoint pro HF.
+1. **Nome do projeto** — vira o nome do LoRA e do repo HF. Escolha **o que você está
+   treinando** (estilo, personagem, conceito, roupa) e, se pedir, a **trigger word**.
+2. **Dataset** — arraste imagens/vídeos (com ou sem `.txt`) ou um zip, ou cole: link
+   Mega, `user/repo` do HuggingFace, URL de zip, caminho de pasta.
+3. **Modelo** → **TREINAR**. O resto é automático: captions que faltam, engine,
+   download dos modelos base, cache, treino contado em **epochs**, upload de cada
+   checkpoint pro HF.
+
+Não precisa saber o que é caption: se faltar, o próprio treino escreve antes de
+baixar qualquer modelo. O botão "Escrever agora" existe só para revisar as captions
+antes de treinar.
 
 ## Modelos e presets (um por modelo, sempre LoRA padrão)
 
@@ -31,16 +38,17 @@ Local (WSL): `bash start.sh`.
 | Anima | sd-scripts (`anima_train_network.py`) | dim 32/16 · lr 2e-5 · sigmoid · ~660 exposições/img |
 | Flux Klein (base-9B) | musubi-tuner | dim 128/128 · lr 1e-4 · flux2_shift |
 | Qwen Image | musubi-tuner | dim 64/64 · lr 5e-5 · shift 2.2 |
-| Qwen Image Edit (2511) | musubi-tuner | idem + pasta `control/` no dataset |
 | Ideogram 4 | musubi-tuner | dim 32/32 · lr 1e-4 · DiT já é FP8 |
 | LTX 2.3 | musubi fork AkaneTendo25 (`ltx-2-dev`) | dim 256/256 · lr 1e-4 · shifted_logit_normal |
-| Wan 2.2 (t2v-A14B) | musubi-tuner | dim 32/32 · lr 2e-4 · high+low noise |
 
-fp8/blocks_to_swap são decididos sozinhos pela VRAM detectada.
+fp8/blocks_to_swap são decididos sozinhos pela VRAM detectada; um blocks_to_swap
+acima do máximo do modelo é recusado antes de baixar qualquer coisa.
 
-No painel ⚙ dá pra trocar LoRA → **LoKr/LoHa**, ligar **LoRA+** (ratio 16), rank,
-epochs. **DoRA não existe** nos backends escolhidos (musubi e sd-scripts) — LoKr
-cobre o caso; se um dia o musubi ganhar DoRA, é uma linha no `presets.py`.
+Só LoRA padrão (LoHa/LoKr saíram de propósito). No painel ⚙ dá pra ligar **LoRA+**
+(ratio 16) e mexer em rank, lr, epochs.
+
+Cada treino começa com `output/` vazio: o anterior vai para `runs/<data>/`, então
+o repo HF e a galeria só mostram o treino atual.
 
 ## Epochs, nunca max steps
 
@@ -62,10 +70,10 @@ Toggle "Concept Slider" no topo:
 
 ## Style Rush
 
-Toggle "Style Rush" no topo, para **Flux Klein** ou **Qwen Image Edit**. Você manda só o
+Toggle "Style Rush" no topo, para **Flux Klein**. Você manda só o
 dataset de estilo e preenche a trigger word; o trainer faz o resto:
 
-1. captions do dataset via OpenRouter (profile `generic-style`, trigger na primeira palavra);
+1. captions do dataset via OpenRouter (perfil `style-rush`, trigger na primeira palavra);
 2. **50 pares de conversão** gerados com `openai/gpt-image-2` (quality low, no máximo
    ~$0.71 — medido; datasets não-quadrados saem mais baratos): a saída vira a control
    image **recortada para a proporção exata da sua imagem**, a sua imagem original vira o
@@ -97,9 +105,9 @@ de imagem e começa pela trigger word; dá para trocar no painel ⚙.
 ```
 /workspace/
 ├── arrakis_trainero/          este repo + venv leve do servidor
-├── engines/                   musubi-tuner · musubi-ltx · sd-scripts · data_araknideo (1 venv cada)
+├── engines/                   musubi-tuner · musubi-ltx · sd-scripts · captionkreator (1 venv cada)
 ├── models/<modelo>/           pesos base (baixados no primeiro treino)
-└── trainero_projects/<slug>/  dataset/ · cache/ · output/ · logs/ · *.toml
+└── trainero_projects/<slug>/  dataset/ · cache/ · output/ · runs/ · logs/ · *.toml
 ```
 
 ## Chaves
@@ -109,22 +117,38 @@ de imagem e começa pela trigger word; dá para trocar no painel ⚙.
 | `HF_TOKEN` | repo + upload de checkpoints (privado por default), download de modelos gated (FLUX.2) |
 | `OPENROUTER_API_KEY` | captions via LLM |
 
+## Captions
+
+Feitas pelo [captionkreator](https://github.com/adbrasi/captionkreator) (`captioner run`),
+instalado como engine próprio (sem torch). Os perfis são deste repo, em
+`caption_profiles/<image|video>/<perfil>/` (`profile.yaml` + `system.md` + `user.md`):
+tags WD14 locais como apoio + LLM no OpenRouter.
+
+| O que você treina | Anima | Outros modelos de imagem |
+|---|---|---|
+| Estilo | `anima-style` | `generic-style` |
+| Personagem | `anima-character` | `generic-character` |
+| Conceito / outro | `anima-concept` | `default` |
+| Roupa | `anima-outfit` | `default` |
+
+Vídeo: `grok_looping_animation_template` no LTX 2.3. Dá para fixar outro perfil no card
+de captions.
+
+- **Só preenche o que falta.** `.txt` que você mandou nunca é sobrescrito nem cobrado.
+- **Cascata:** `meta/muse-spark-1.3-contributor` → `google/gemini-3.8-flash` →
+  `x-ai/grok-4.7` (vídeo: `z-ai/glm-5.3-flash`). No Style Rush o Gemini vem primeiro:
+  o que ele recusa é o que o gpt-image-2 também recusaria.
+- **Recusado por todos** sai do dataset para `descartadas/` (movido, não apagado) —
+  mas só depois de confirmar que a conta do OpenRouter está viva. Sem crédito, o job
+  para e nada sai do dataset.
+- Retomada de graça: o state do captionkreator (`.captioner.sqlite`) fica no dataset.
+
 ### Ajustes opcionais
 
 | Env | Default | Para quê |
 |---|---|---|
-| `CAPTION_MODELS` | por modo | sobrescreve a cascata inteira, separada por vírgula |
 | `CAPTION_CONCURRENCY` | 64 | chamadas paralelas na captionagem |
-| `CAPTION_REASONING_EFFORT` | `minimal` | raciocínio do modelo de caption. Lido pelo tagger, não por este repo |
 | `CONVERT_WORKERS` | 8 | chamadas paralelas ao gpt-image-2 no Style Rush |
 
-A cascata de caption é uma lista ordenada e a ordem muda com o modo. No LoRA
-normal ela começa pelo modelo mais barato; no Style Rush começa pelo Gemini,
-porque é a recusa dele que marca quais imagens o gpt-image-2 também vai recusar
-— e lá uma recusa custa um slot pago.
-
-`CAPTION_REASONING_EFFORT` fica em `minimal`, o menor tier que o OpenRouter
-documenta. Os tiers são fração do `max_tokens` e o tagger não manda
-`max_tokens` de propósito (um teto trunca a caption no meio), então se o gasto
-continuar alto o próximo passo é `none`, que desliga o orçamento de raciocínio
-em vez de encolhê-lo.
+Para trocar modelos ou prompts de caption, edite o `profile.yaml` do perfil — é a única
+fonte da verdade.

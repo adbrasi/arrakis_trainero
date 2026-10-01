@@ -215,13 +215,20 @@ function applyMode() {
   root.dataset.native = native ? "1" : "0";
   const m = MODES[state.mode];
   $("#dataset-title").textContent = (native && m.nativeTitle) || m.title;
-  $("#trigger-help").textContent = m.triggerHelp;
+  $("#trigger-help").textContent = triggerHelpText();
   if (native && !$("#pair-list").children.length) addPair();
   if (state.status) renderDatasetStats();
   fillAdvanced();
   renderModelAvailability();
   renderStepState();
   refreshTrainButton();
+}
+
+function triggerHelpText() {
+  if (!styleRush() && captionNeedsTrigger()) {
+    return "obrigatória — as captions que faltam vão começar com ela";
+  }
+  return MODES[state.mode].triggerHelp;
 }
 
 function renderModelAvailability() {
@@ -773,7 +780,7 @@ async function poll() {
   $("#trigger-word").readOnly = locked;
   $("#trigger-help").textContent = locked
     ? `herdada de ${s.origin} — as captions já têm essa palavra escrita dentro`
-    : MODES[state.mode].triggerHelp;
+    : triggerHelpText();
   // chips
   const gpu = s.gpu || {};
   const gc = $("#gpu-chip");

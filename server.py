@@ -575,6 +575,8 @@ class Handler(SimpleHTTPRequestHandler):
                                            "stats": ds.inspect(dataset_dir(side))})
                     dest = target_root / unique_upload_name(target_root, name)
                 os.replace(tmp, dest)
+                if dest.suffix.lower() in IMAGE_EXTS:
+                    ds.bake_orientation(dest)
             except OSError as exc:
                 return self._error(f"não consegui gravar {name}: {exc}", 507)
             finally:

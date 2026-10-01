@@ -284,6 +284,37 @@ def _descend_wrapper(root: Path) -> Path:
     return cur
 
 
+def bake_orientation(path: Path) -> bool:
+    """Write a photo's EXIF rotation into its pixels. True when it changed.
+
+    Phones store portrait shots as landscape pixels plus an orientation tag.
+    Browsers honour the tag; neither musubi nor sd-scripts do, so the owner saw
+    an upright dataset and the model trained on a sideways one — and Style
+    Rush cropped paid conversion pairs to the wrong aspect ratio.
+    """
+    import os
+
+    from PIL import Image, ImageOps
+
+    try:
+        with Image.open(path) as im:
+            if im.getexif().get(0x0112, 1) in (None, 1):
+                return False
+            fmt = im.format or "PNG"
+            fixed = ImageOps.exif_transpose(im)
+            fixed.load()
+    except Exception:  # not an image PIL can read: leave it to the trainer
+        return False
+    tmp = path.with_name(f".{path.name}.rotating")
+    try:
+        params = {"quality": 95} if fmt.upper() in ("JPEG", "WEBP") else {}
+        fixed.save(tmp, format=fmt, **params)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return True
+
+
 def normalize_into(staging: Path, dataset_dir: Path, job: Job) -> None:
     src = _descend_wrapper(staging)
     dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -304,6 +335,8 @@ def normalize_into(staging: Path, dataset_dir: Path, job: Job) -> None:
             if dest.exists():
                 continue
             shutil.move(str(f), str(dest))
+            if ext in IMAGE_EXTS:
+                bake_orientation(dest)
             moved += 1
             txt = f.with_suffix(".txt")
             if txt.exists() and not in_control:

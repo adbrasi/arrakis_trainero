@@ -46,6 +46,35 @@ class TestMacZips(unittest.TestCase):
             self.assertEqual(ds.uncaptioned(d), [])
 
 
+class TestPhoneRotation(unittest.TestCase):
+    def test_exif_rotation_is_written_into_the_pixels_on_import(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "staging" / "src"
+            src.mkdir(parents=True)
+            im = Image.new("RGB", (400, 300), (200, 10, 10))
+            exif = im.getexif()
+            exif[0x0112] = 6  # "rotate 90 CW to display": a portrait phone shot
+            im.save(src / "phone.jpg", exif=exif)
+            dest = root / "dataset"
+            ds.normalize_into(root / "staging", dest, SyncJob())
+            with Image.open(dest / "phone.jpg") as out:
+                self.assertEqual(out.size, (300, 400))
+                self.assertIn(out.getexif().get(0x0112, 1), (None, 1))
+
+    def test_a_plain_image_is_left_byte_for_byte(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "a.png"
+            Image.new("RGB", (10, 20)).save(p)
+            before = p.read_bytes()
+            self.assertFalse(ds.bake_orientation(p))
+            self.assertEqual(p.read_bytes(), before)
+
+
 class TestLocalImport(unittest.TestCase):
     def test_importing_the_projects_own_folder_is_refused(self):
         """_staging lives inside the project: copying the project into it

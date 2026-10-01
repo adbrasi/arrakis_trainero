@@ -9,6 +9,47 @@ dono" são as que evitam retrabalho.
 
 ---
 
+## 0. Sessão 2026-10-01 — o que mudou (leia antes do resto)
+
+Branch `claude/cool-tesla-vwnh8u` nos dois repos. **O captionkreator precisa ser
+mergeado no `main` dele antes** — o engine é clonado do `main` e usa
+`--skip-captioned`, `OPENROUTER_BASE_URL` e a correção do WD14 que só existem nessa branch.
+
+- **Captions:** data_araknideo saiu; entrou o captionkreator. Perfis em
+  `caption_profiles/` (portados dos prompts antigos, `{{trigger}}` em todos).
+  O treino escreve sozinho as captions que faltam (fase "Captions" antes do download);
+  o perfil vem de "o que você está treinando" + modelo (`default_caption_profile`).
+- **Modelos removidos a pedido do dono:** Wan 2.2, Qwen Image Edit, LoHa/LoKr.
+- **Qwen Image 2.1 (t2i + edit): NÃO adicionado.** musubi (main e branches, 2026-09-27)
+  não suporta. Só o ai-toolkit treina os dois (um checkpoint, edita quando há control);
+  diffusion-pipe só T2I. Precisa de decisão do dono: engine novo (ai-toolkit).
+- **Bug grave no captionkreator corrigido:** o WD14 aplicava sigmoid duas vezes →
+  ~10 mil tags em todo prompt. Achado rodando o tagger de verdade.
+- **Flags conferidas contra o upstream** (musubi main, ltx-2-dev, sd-scripts):
+  Anima agora usa `--l 4.0` no sample (o `--g` era ignorado → CFG 7.5);
+  teto de `blocks_to_swap` por modelo; Gemma 8 bit no treino LTX < 140 GB.
+- **Cenários corrigidos com teste:** trigger levada para o projeto errado na troca de
+  nome; retreino misturando checkpoints/samples (agora `runs/<data>/`); upload com nome
+  repetido trocando imagem e mantendo caption velha; engine meio instalada contada como
+  pronta; `__MACOSX`; importar a própria pasta; staging órfão; galeria do projeto errado
+  durante treino; XSS; campos apagados durante digitação; neto preso no pipe no cancel;
+  SIGTERM orfanando treino (agora cancela e espera; bootstrap usa pidfile e `setsid`);
+  rotação EXIF de foto de celular (musubi/sd-scripts ignoram — treinava de lado).
+- **Retomar treino cancelado: não feito de propósito.** O musubi carrega o state mas
+  recomeça a contagem de épocas em 0 (`trainer_base.py`, "TODO skip until initial
+  step"); um "continuar" em cima disso treinaria o schedule inteiro de novo.
+
+### Ainda em aberto (da auditoria)
+
+1. Sem autenticação HTTP; porta 8090 pública no pod.
+2. Import HF / cópia local / apt não são canceláveis (rodam na thread do job).
+3. Varredura final do HF pode segurar o cancel até 30 min.
+4. Arquivos repetidos entre modelos (VAE do Qwen, TE) baixados uma vez por modelo.
+5. WD14 roda em CPU (~3 s/img em 4 núcleos); `onnxruntime-gpu` aceleraria, não testado.
+6. Preflight de espaço em disco é só aviso na UI (< 60 GB).
+
+---
+
 ## 1. O que é
 
 Treinador de LoRA com UI web de página única, feito para pods vast.ai/RunPod.
@@ -39,7 +80,7 @@ download ou progresso** — já resolveram problemas que este repo ainda tem.
 ```
 /workspace/
   arrakis_trainero/          # este repo; .venv leve só do servidor
-  engines/<engine>/          # musubi-tuner, musubi-ltx, sd-scripts, data_araknideo
+  engines/<engine>/          # musubi-tuner, musubi-ltx, sd-scripts, captionkreator
     .venv/                   # cada engine tem o seu
   models/<model_key>/        # pesos base
   trainero_projects/<slug>/
@@ -58,7 +99,7 @@ download ou progresso** — já resolveram problemas que este repo ainda tem.
 | `trainero/models_download.py` | escolha de transporte (Xet vs aria2c) |
 | `trainero/hf_fetch.py` | processo filho que faz uma transferência |
 | `trainero/dataset.py` | import (Mega/HF/URL/local), normalização, inspect |
-| `trainero/captioner.py` | captions via data_araknideo + OpenRouter |
+| `trainero/captioner.py` | captions via captionkreator (`captioner run`) + perfis em `caption_profiles/` |
 | `trainero/style_rush.py` | dataset sintético de conversão |
 | `trainero/imagegen.py` | cliente OpenRouter Images (gpt-image-2) |
 | `trainero/training.py` | dataset.toml, config, fases, execução |
@@ -211,8 +252,9 @@ misturar as duas coisas; se for fazer, é campo novo, não sequestro do existent
 7. **Overrides são relativos a um preset.** Trocar de modelo ou de modo
    invalida todos (`resetOverrides` no `app.js`). Sem isso, rank do Krea
    chegava no Anima e repeats chegavam no Style Rush, que não tem repeats.
-8. **O flag do captioner se chama `--grok_model` por herança**, mas aceita
-   qualquer model id do OpenRouter. Não confunda nome de flag com modelo.
+8. **Caption de imagem com `.txt` existente nunca é refeita** (`--skip-captioned`).
+   Para refazer, `clear_captions` apaga também o state do captionkreator — sem isso
+   ele restaura o `.txt` do state sem chamar o modelo.
 
 ---
 
