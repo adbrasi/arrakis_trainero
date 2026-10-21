@@ -74,7 +74,8 @@ stop_previous_server() {
     if [ -n "$pid" ] && grep -q "server.py" "/proc/$pid/cmdline" 2>/dev/null; then
       log "parando a instância anterior (pid $pid)…"
       kill -TERM "$pid" 2>/dev/null || true
-      for _ in $(seq 1 45); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+      # an exited process can linger as a zombie with an empty cmdline
+      for _ in $(seq 1 45); do grep -q "server.py" "/proc/$pid/cmdline" 2>/dev/null || break; sleep 1; done
     fi
   fi
   # a server from before the pidfile existed: it was started as
@@ -111,7 +112,9 @@ main() {
   mkdir -p "$APP_DIR/data"
   # detached from this terminal: closing the pod's web terminal must not take
   # the server — and a running training — down with it
-  setsid nohup "$APP_DIR/.venv/bin/python" server.py >> "$APP_DIR/data/server.log" 2>&1 < /dev/null &
+  # double fork: the server is adopted by init, so the `tail` below never
+  # becomes its parent (it would leave it a zombie when it stops)
+  setsid bash -c "nohup '$APP_DIR/.venv/bin/python' server.py >> '$APP_DIR/data/server.log' 2>&1 < /dev/null &"
   log "servidor em segundo plano (log: $APP_DIR/data/server.log). Ctrl+C só para de mostrar o log."
   sleep 2
   exec tail -n 20 -f "$APP_DIR/data/server.log"

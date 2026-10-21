@@ -15,7 +15,8 @@ stop_previous_server() {
     if [ -n "$pid" ] && grep -q "server.py" "/proc/$pid/cmdline" 2>/dev/null; then
       log "parando a instância anterior (pid $pid)…"
       kill -TERM "$pid" 2>/dev/null || true
-      for _ in $(seq 1 45); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+      # an exited process can linger as a zombie with an empty cmdline
+      for _ in $(seq 1 45); do grep -q "server.py" "/proc/$pid/cmdline" 2>/dev/null || break; sleep 1; done
     fi
   fi
   # a server from before the pidfile existed: it was started as
