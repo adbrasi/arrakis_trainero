@@ -181,3 +181,27 @@ class TestTheGalleryFollowsTheJob(LiveServer):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEditPairsInStatus(LiveServer):
+    def test_status_says_how_the_triplets_pair(self):
+        d = server.dataset_dir("pos")
+        for i in range(2):
+            (d / f"r{i}.png").write_bytes(_png_bytes())
+            (d / "control").mkdir(exist_ok=True)
+            (d / "control" / f"r{i}_0.png").write_bytes(_png_bytes())
+            (d / "control" / f"r{i}_1.png").write_bytes(_png_bytes())
+        (d / "solo.png").write_bytes(_png_bytes((9, 9, 9)))
+        ep = json.loads(self._get("/api/status"))["edit_pairs"]
+        self.assertEqual((ep["paired"], ep["unpaired"], ep["refs"]), (2, 1, [2]))
+        self.assertEqual(ep["unpaired_sample"], ["solo.png"])
+
+    def test_a_control_upload_replaces_instead_of_renaming(self):
+        """A control is found by its name; renaming it would unpair it."""
+        self._call("/api/dataset/file?side=pos&name=a.png", raw=_png_bytes())
+        self._call("/api/dataset/file?side=pos&name=a_0.png&dir=control", raw=_png_bytes((1, 1, 1)))
+        code, body = self._call("/api/dataset/file?side=pos&name=a_0.png&dir=control",
+                                raw=_png_bytes((2, 2, 2)))
+        self.assertEqual((code, body["name"]), (200, "a_0.png"))
+        self.assertEqual((server.dataset_dir("pos") / "control" / "a_0.png").read_bytes(),
+                         _png_bytes((2, 2, 2)))

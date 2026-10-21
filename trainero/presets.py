@@ -40,6 +40,19 @@ ENGINES = {
         "install": "requirements",  # pip install -r requirements.txt (installs '.')
         "script_prefix": "",
     },
+    "diffsynth": {
+        # Qwen Image 2.1: musubi does not train it (main and every branch, Sep
+        # 2026); DiffSynth-Studio does, T2I and edit from one checkpoint.
+        "repo": "https://github.com/modelscope/DiffSynth-Studio.git",
+        "branch": "main",
+        # pinned: tools/diffsynth_train.py rebuilds the official train.py main,
+        # verified against this commit (2026-10-21). Move it only after
+        # re-checking that script and the runner/logger it hooks.
+        "commit": "f39d731a3e318d25b725eb3389cfddb184619842",
+        "dir": "DiffSynth-Studio",
+        "install": "package",
+        "script_prefix": "",
+    },
     "captioner": {
         "repo": "https://github.com/adbrasi/captionkreator.git",
         "branch": "main",
@@ -339,6 +352,60 @@ MODELS = {
             {"min_gb": 0, "train": {"blocks_to_swap": 33}},
         ],
     },
+    "qwen-image-21": {
+        "label": "Qwen Image 2.1",
+        "base_model": "Qwen/Qwen-Image-2.1",
+        "group": "imagem",
+        "media": "image",
+        "engine": "diffsynth",
+        "arch": "qwen_image_21",
+        # one checkpoint does text-to-image AND editing: a dataset with a
+        # control/ folder trains edit (control = input, image = result, .txt =
+        # the instruction); without it, plain T2I
+        "downloads": [
+            ("Qwen/Qwen-Image-2.1", "transformer/", "Qwen/Qwen-Image-2.1/transformer/"),
+            ("Qwen/Qwen-Image-2.1", "text_encoder/", "Qwen/Qwen-Image-2.1/text_encoder/"),
+            ("Qwen/Qwen-Image-2.1", "vae/", "Qwen/Qwen-Image-2.1/vae/"),
+            ("Qwen/Qwen-Image-2.1", "processor/", "Qwen/Qwen-Image-2.1/processor/"),
+        ],
+        # DiffSynth finds the files itself from DIFFSYNTH_MODEL_BASE_PATH +
+        # these patterns (the same strings name the models in --fp8_models)
+        "model_args": {
+            "dit": "Qwen/Qwen-Image-2.1:transformer/diffusion_pytorch_model*.safetensors",
+            "text_encoder": "Qwen/Qwen-Image-2.1:text_encoder/model*.safetensors",
+            "vae": "Qwen/Qwen-Image-2.1:vae/diffusion_pytorch_model*.safetensors",
+        },
+        "processor": "Qwen/Qwen-Image-2.1/processor",
+        "train_script": "examples/qwen_image_21/model_training/train.py",
+        "network_module": "peft",  # DiffSynth injects PEFT LoRA; alpha is always = rank
+        # The official recipe (examples/qwen_image_21/.../lora/Qwen-Image-2.1.sh):
+        # rank 32, lr 1e-4, AdamW, constant LR, auto-detected Linear targets in
+        # every transformer block, dynamic resolution up to 1 MP, batch 1.
+        "train": {"network_dim": 32, "network_alpha": 32, "learning_rate": 1e-4,
+                  "optimizer_type": "adamw", "lr_scheduler": "constant"},
+        "resolution": [1024, 1024],
+        "max_pixels": 1024 * 1024,
+        "supports_control": True,
+        # T2I and edit items cannot share a run (the prompt encoder takes the
+        # edit template whenever edit_image is present), so the Style Rush mix
+        # of plain and paired subsets is impossible here
+        "style_rush": False,
+        "target_steps": 2000,
+        "sample_steps": 40,  # DiffSynth's default for this model; CFG stays off (1.0)
+        # DiT ~14 GB + text encoder ~17.5 GB + VAE 1.3 GB in bf16. FP8 storage
+        # (computation stays bf16) is DiffSynth's only training-time VRAM knob
+        # that keeps speed; offload is the last resort and disables sampling.
+        "vram_tiers": [
+            {"min_gb": 70, "train": {}},
+            {"min_gb": 40, "train": {"fp8_models": ["text_encoder"]}},
+            {"min_gb": 30, "train": {"fp8_models": ["text_encoder", "dit"]}},
+            {"min_gb": 22, "train": {"fp8_models": ["text_encoder", "dit"],
+                                     "use_gradient_checkpointing_offload": True}},
+            {"min_gb": 0, "train": {"fp8_models": ["text_encoder", "dit"],
+                                    "use_gradient_checkpointing_offload": True,
+                                    "enable_model_cpu_offload": True}},
+        ],
+    },
     # ------------------------------------------------------------------- VÍDEO
     "ltx-23": {
         "label": "LTX 2.3",
@@ -379,7 +446,7 @@ MODELS = {
     },
 }
 
-MODEL_ORDER = ["krea2", "anima", "flux-klein", "qwen-image", "ideogram", "ltx-23"]
+MODEL_ORDER = ["krea2", "anima", "flux-klein", "qwen-image", "qwen-image-21", "ideogram", "ltx-23"]
 
 # Only standard LoRA is offered (LoHa/LoKr were dropped on purpose: one network
 # type keeps every preset proven). LoRA+ rides on it as an optional ratio.
@@ -440,8 +507,10 @@ def sample_resolution(resolution: list[int]) -> list[int]:
 
 
 def style_rush_models() -> list[str]:
-    """Models that accept a control image, so they can learn style conversion."""
-    return [k for k in MODEL_ORDER if MODELS[k].get("supports_control")]
+    """Models that accept a control image AND can train paired and plain
+    subsets in one run, which is what the Style Rush mix is."""
+    return [k for k in MODEL_ORDER
+            if MODELS[k].get("supports_control") and MODELS[k].get("style_rush", True)]
 
 
 def clamp(v, lo, hi):
@@ -453,6 +522,8 @@ def suggest_schedule(model_key: str, n_items: int) -> dict:
     unit, then epochs so the TOTAL work lands in the model's sweet spot,
     whatever the dataset size. save_every targets ~10 checkpoints."""
     model = MODELS[model_key]
+    if model["engine"] == "diffsynth":
+        return diffsynth_schedule(model_key, n_items)
     n = max(1, n_items)
     if "exposures_per_image" in model:  # Anima: 600-720 exposures per image
         num_repeats = clamp(round(250 / n), 1, 20)
@@ -463,6 +534,18 @@ def suggest_schedule(model_key: str, n_items: int) -> dict:
         epochs = clamp(round(target / (n * num_repeats)), 4, 40)
     save_every = max(1, round(epochs / 10))
     return {"num_repeats": num_repeats, "epochs": epochs, "save_every_n_epochs": save_every}
+
+
+def diffsynth_schedule(model_key: str, n_items: int) -> dict:
+    """DiffSynth saves a checkpoint every epoch, no matter what, so the epoch
+    count IS the checkpoint count: keep it at 4-10 and put the rest of the
+    work into repeats."""
+    model = MODELS[model_key]
+    n = max(1, n_items)
+    target = model.get("target_steps", 2000)
+    epochs = clamp(round(target / n), 4, 10)
+    num_repeats = clamp(round(target / (n * epochs)), 1, 100)
+    return {"num_repeats": num_repeats, "epochs": epochs, "save_every_n_epochs": 1}
 
 
 def vram_tier(model_key: str, vram_gb: float) -> dict:

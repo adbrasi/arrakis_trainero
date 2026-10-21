@@ -396,3 +396,7 @@ input[readonly] { color: var(--ink-3); cursor: not-allowed; }
 
 .btn.tiny { font-size: 11.5px; padding: 4px 10px; font-family: var(--mono); }
 #adv-waiting { padding: 0 14px 14px; }
+
+.dropzone.small { padding: 14px 16px; }
+.dropzone.small .dz-title { font-size: 0.95rem; }
+.control-zone { margin: 10px 0; }

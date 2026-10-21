@@ -171,6 +171,24 @@ def dataset_dir(side: str = "pos") -> Path:
                    "restore": "dataset_restore"}.get(side, "dataset")
 
 
+def edit_pairs_summary(directory: Path) -> dict:
+    """How an edit dataset pairs up: what the UI shows before the run refuses."""
+    from trainero import diffsynth as dsyn
+
+    try:
+        controls = dsyn.control_images(directory)
+        if not controls:
+            return {}
+        items = dsyn.targets(directory)
+        paired = [t for t in items if t.stem in controls]
+        refs = sorted({len(controls[t.stem]) for t in paired})
+        return {"paired": len(paired), "unpaired": len(items) - len(paired),
+                "unpaired_sample": [t.name for t in items if t.stem not in controls][:5],
+                "refs": refs}
+    except OSError:
+        return {}
+
+
 def disk_free_gb() -> float:
     try:
         return round(shutil.disk_usage(PROJECTS_DIR.parent).free / 1024**3, 1)
@@ -374,6 +392,7 @@ class Handler(SimpleHTTPRequestHandler):
             "kind": meta.get("kind", ""),
             "caption_profile": meta.get("caption_profile", ""),
             "disk_free_gb": disk_free_gb(),
+            "edit_pairs": edit_pairs_summary(dataset_dir("pos")) if project else {},
         }
         if project:
             media = "video" if stats.get("videos") and not stats.get("images") else "image"
@@ -567,7 +586,9 @@ class Handler(SimpleHTTPRequestHandler):
                     return self._error(f"upload de {name} truncado "
                                        f"(faltaram {remaining} bytes) — envie de novo")
                 is_media = Path(name).suffix.lower() in (IMAGE_EXTS | VIDEO_EXTS)
-                if is_media and dest.exists():
+                # a control image is found by its name (it pairs with the result
+                # of the same name), so sending it again replaces it
+                if is_media and dest.exists() and sub != "control":
                     if same_bytes(tmp, dest):
                         # the same file sent twice: nothing new, and the
                         # caption beside it still describes it

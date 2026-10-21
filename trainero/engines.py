@@ -18,6 +18,38 @@ from .presets import ENGINES
 
 TORCH_SPEC = ["torch", "torchvision"]
 
+#: PyTorch wheel indexes, newest first, with the minimum driver CUDA version
+#: each needs. PyPI's default torch follows the newest CUDA (2.14 is built for
+#: CUDA 13.0, driver >= 580); a pod on an older driver installs it fine and
+#: then sees no GPU. Every entry here also has Blackwell (RTX 5090, sm_120).
+TORCH_INDEXES = [
+    ((13, 0), "https://download.pytorch.org/whl/cu130"),
+    ((12, 9), "https://download.pytorch.org/whl/cu129"),
+    ((12, 8), "https://download.pytorch.org/whl/cu128"),
+]
+
+
+def driver_cuda_version() -> tuple[int, int] | None:
+    """The highest CUDA the installed driver runs, from the nvidia-smi header."""
+    import re
+
+    try:
+        out = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", out)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def torch_index_for(cuda: tuple[int, int] | None) -> str | None:
+    """The newest wheel index the driver can run; None = PyPI default."""
+    if cuda is None:
+        return None
+    for minimum, url in TORCH_INDEXES:
+        if cuda >= minimum:
+            return url
+    return "https://download.pytorch.org/whl/cu126"  # pre-Blackwell drivers
+
 
 def engine_dir(name: str) -> Path:
     return ENGINES_DIR / ENGINES[name]["dir"]
@@ -83,14 +115,26 @@ def ensure_engine(name: str, job: Job) -> None:
     ENGINES_DIR.mkdir(parents=True, exist_ok=True)
 
     pulled = False
+    cloned = False
     if not (dest / ".git").exists():
         # a leftover directory from an interrupted clone would make git refuse
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
-        job.log(f"Clonando {spec['repo']} ({spec['branch']})...")
+        job.log(f"Clonando {spec['repo']} ({spec.get('commit') or spec['branch']})...")
         job.run(["git", "clone", "--depth", "1", "--single-branch",
                  "--branch", spec["branch"], spec["repo"], str(dest)])
-    elif spec.get("pull"):
+        cloned = True
+    if spec.get("commit"):
+        # a pinned engine: the code that was verified against, not whatever the
+        # branch moved to this week. Fetching the exact commit works with any
+        # clone depth and is a no-op when it is already checked out. Moving the
+        # pin changes the spec stamp, so the venv is reinstalled too.
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=dest, capture_output=True,
+                              text=True).stdout.strip()
+        if head != spec["commit"]:
+            job.run(["git", "fetch", "--depth", "1", "origin", spec["commit"]], cwd=dest)
+            job.run(["git", "checkout", "--force", spec["commit"]], cwd=dest)
+    elif spec.get("pull") and not cloned:
         # A stale engine is bad; a phase that refuses to run is worse. Never let
         # a network hiccup or a local commit in the clone stop the job.
         try:
@@ -98,7 +142,7 @@ def ensure_engine(name: str, job: Job) -> None:
             pulled = True
         except Exception as exc:
             job.log(f"⚠ git pull falhou em {name} ({exc}) — seguindo com o clone atual.")
-    else:
+    elif not cloned:
         job.log(f"Engine {name} já clonado.")
 
     if is_installed(name):
@@ -110,8 +154,10 @@ def ensure_engine(name: str, job: Job) -> None:
 
     pip = _pip(name, job)
     if spec.get("torch", True):
-        job.log(f"Instalando torch no venv de {name} (pode demorar)...")
-        job.run(pip + TORCH_SPEC)
+        index = torch_index_for(driver_cuda_version())
+        job.log(f"Instalando torch no venv de {name} (pode demorar)"
+                + (f" de {index}" if index else "") + "...")
+        job.run(pip + TORCH_SPEC + (["--index-url", index] if index else []))
 
     if spec["install"] == "package":
         job.run(pip + _install_target(spec), cwd=dest)

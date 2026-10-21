@@ -11,6 +11,7 @@
 set -euo pipefail
 
 REPO_URL="${TRAINERO_REPO:-https://github.com/adbrasi/arrakis_trainero.git}"
+BRANCH="${TRAINERO_BRANCH:-}"   # vazio = branch padrão do repo
 WORKSPACE="${WORKSPACE_DIR:-/workspace}"
 APP_DIR="$WORKSPACE/arrakis_trainero"
 PORT="${WEB_PORT:-8090}"
@@ -36,13 +37,18 @@ clone_repo() {
   mkdir -p "$WORKSPACE"
   if [ -d "$APP_DIR/.git" ]; then
     log "repo já existe — atualizando…"
-    git -C "$APP_DIR" pull --ff-only || true
+    if [ -n "$BRANCH" ]; then
+      git -C "$APP_DIR" fetch origin "$BRANCH" || true
+      git -C "$APP_DIR" checkout -B "$BRANCH" "origin/$BRANCH" || true
+    else
+      git -C "$APP_DIR" pull --ff-only || true
+    fi
   elif [ -f "$(pwd)/server.py" ] && [ -d "$(pwd)/trainero" ]; then
     APP_DIR="$(pwd)"
     log "rodando do checkout local: $APP_DIR"
   else
-    log "clonando $REPO_URL…"
-    git clone --depth 1 "$REPO_URL" "$APP_DIR"
+    log "clonando $REPO_URL${BRANCH:+ ($BRANCH)}…"
+    git clone --depth 1 ${BRANCH:+--branch "$BRANCH"} "$REPO_URL" "$APP_DIR"
   fi
 }
 

@@ -19,6 +19,7 @@ import shutil
 from pathlib import Path
 
 from . import dataset as ds
+from . import diffsynth as dsyn
 from . import style_rush as sr
 from .captioner import caption_datasets, generate_captions
 from .config import PROJECTS_DIR, gpu_info
@@ -446,6 +447,10 @@ def launch_training(model_key: str, cfg: dict, pdir: Path, job: Job, toml_name: 
     edir = engine_dir(engine)
     accel = str(venv_bin(engine, "accelerate"))
 
+    if engine == "diffsynth":
+        cmd = dsyn.command(model_key, cfg, accel, edir)
+        job.run(cmd, cwd=edir, env=dsyn.env_for(model_key), parse_progress=True)
+        return
     if engine == "musubi-ltx":
         script = _script(engine, "ltx2_train_network.py")
         ltx = model["ltx"]
@@ -742,6 +747,40 @@ def run_style_rush_training(job: Job, params: dict) -> None:
     job.end_phase("Finalização")
 
 
+def _diffsynth_config(job: Job, model_key: str, overrides: dict, schedule: dict,
+                      vram_gb: float, pdir: Path, dataset_dir: Path, output_dir: Path,
+                      slug: str, edit: bool, trigger: str, resolution: list[int]) -> dict:
+    """Metadata + CLI args for the DiffSynth wrapper, samples included."""
+    model = MODELS[model_key]
+    metadata = dsyn.write_metadata(dataset_dir, pdir / dsyn.METADATA, edit)
+    sample = None
+    if overrides.get("sampling", True):
+        if edit:
+            # sampling an edit LoRA means asking it to do the first pair's edit
+            pair = dsyn.edit_sample(dataset_dir, model.get("max_pixels", 1024 * 1024))
+            if pair:
+                refs, prompt, (w, h) = pair
+                sample = {"prompt": prompt, "edit_image": ",".join(str(r) for r in refs),
+                          "width": w, "height": h}
+                job.log(f"Sample de edição: {refs[0].name} + \"{prompt[:60]}\"")
+        else:
+            prompt_text = overrides.get("sample_prompt")
+            if not prompt_text and not trigger:
+                prompt_text = ds.sample_caption(dataset_dir)
+            text = (prompt_text or SAMPLE_PROMPT).strip()
+            if trigger:
+                text = f"{trigger}, {text}"
+            w, h = sample_resolution(resolution)
+            sample = {"prompt": text, "width": w, "height": h}
+        if sample:
+            sample.update({"seed": SAMPLE_SEED, "steps": model.get("sample_steps", 40),
+                           "dir": str(output_dir / "sample")})
+    cfg = dsyn.build_config(model_key, overrides, schedule, vram_gb, dataset_dir, metadata,
+                            output_dir, slug, edit, sample, job)
+    job.extra["config_summary"] = dsyn.summary(cfg, schedule, edit)
+    return cfg
+
+
 # ---------------------------------------------------------------------------
 # Full pipeline
 # ---------------------------------------------------------------------------
@@ -807,11 +846,14 @@ def run_training(job: Job, params: dict) -> None:
         raise JobFailed("importe o dataset antes de treinar")
     if model.get("needs_control") and stats["control_images"] == 0:
         raise JobFailed(f"{model['label']} precisa de imagens de controle em dataset/control/")
+    # edit vs text-to-image is decided by the dataset, and a half-paired one is
+    # refused here — before captions, engine or 30 GB of weights
+    edit = dsyn.preflight(dataset_dir, stats) if engine == "diffsynth" else False
     needs_captions = stats["missing_captions"] > 0
     preflight_captions(params, stats)
 
     phases = (["Captions"] if needs_captions else []) + ["Engine", "Modelos base", "Configuração"]
-    if engine != "sd-scripts":
+    if engine not in ("sd-scripts", "diffsynth"):
         phases += ["Cache de latents", "Cache do text encoder"]
     phases += ["Treino", "Finalização"]
     job.set_phases(phases)
@@ -861,7 +903,9 @@ def run_training(job: Job, params: dict) -> None:
         except (ValueError, KeyError):
             raise JobFailed(f"resolução LTX inválida: {ltx_cfg.get('resolution')!r} (use LxAxF, ex. 768x512x81)")
     sample_path = None
-    if overrides.get("sampling", True) and supports_sampling(engine):
+    if engine == "diffsynth":
+        pass  # rendered inside the training process (tools/diffsynth_train.py)
+    elif overrides.get("sampling", True) and supports_sampling(engine):
         frames = None
         if model["media"] == "video":
             frames = int(ltx_cfg["resolution"].split("x")[2])
@@ -884,32 +928,39 @@ def run_training(job: Job, params: dict) -> None:
     elif overrides.get("sampling", True):
         job.log(f"⚠ engine {engine} não tem --sample_prompts — sampling desligado.")
 
-    subsets = []
-    if stats.get("images"):
-        subsets.append(image_subset(
-            dataset_dir, pdir / "cache" / "images", schedule["num_repeats"],
-            control_dir=(dataset_dir / "control") if model.get("needs_control") else None,
-            control_resolution=model.get("control_resolution")))
-    if stats.get("videos"):
-        subsets.append(video_subset(dataset_dir, pdir / "cache" / "videos",
-                                    schedule["num_repeats"]))
-    dataset_toml = write_dataset_toml(model_key, pdir / "dataset.toml", subsets,
-                                      resolution, batch_size, ltx_cfg)
-    cfg = build_train_config(model_key, overrides, schedule, stats, vram_gb,
-                             dataset_toml, output_dir, slug, batch_size,
-                             sample_prompts=sample_path)
-    job.extra["schedule"] = schedule
-    job.extra["config_summary"] = {
-        "network_module": cfg.get("network_module"),
-        "network_dim": cfg.get("network_dim"), "network_alpha": cfg.get("network_alpha"),
-        "learning_rate": cfg.get("learning_rate"),
-        "epochs": schedule["epochs"], "batch_size": batch_size,
-        "fp8": bool(cfg.get("fp8_base")), "blocks_to_swap": cfg.get("blocks_to_swap", 0),
-    }
-    job.log(f"Config: {json.dumps(job.extra['config_summary'], ensure_ascii=False)}")
-    job.end_phase("Configuração")
+    if engine == "diffsynth":
+        cfg = _diffsynth_config(job, model_key, overrides, schedule, vram_gb, pdir,
+                                dataset_dir, output_dir, slug, edit, trigger, resolution)
+        job.extra["schedule"] = schedule
+        job.log(f"Config: {json.dumps(job.extra['config_summary'], ensure_ascii=False)}")
+        job.end_phase("Configuração")
+    else:
+        subsets = []
+        if stats.get("images"):
+            subsets.append(image_subset(
+                dataset_dir, pdir / "cache" / "images", schedule["num_repeats"],
+                control_dir=(dataset_dir / "control") if model.get("needs_control") else None,
+                control_resolution=model.get("control_resolution")))
+        if stats.get("videos"):
+            subsets.append(video_subset(dataset_dir, pdir / "cache" / "videos",
+                                        schedule["num_repeats"]))
+        dataset_toml = write_dataset_toml(model_key, pdir / "dataset.toml", subsets,
+                                          resolution, batch_size, ltx_cfg)
+        cfg = build_train_config(model_key, overrides, schedule, stats, vram_gb,
+                                 dataset_toml, output_dir, slug, batch_size,
+                                 sample_prompts=sample_path)
+        job.extra["schedule"] = schedule
+        job.extra["config_summary"] = {
+            "network_module": cfg.get("network_module"),
+            "network_dim": cfg.get("network_dim"), "network_alpha": cfg.get("network_alpha"),
+            "learning_rate": cfg.get("learning_rate"),
+            "epochs": schedule["epochs"], "batch_size": batch_size,
+            "fp8": bool(cfg.get("fp8_base")), "blocks_to_swap": cfg.get("blocks_to_swap", 0),
+        }
+        job.log(f"Config: {json.dumps(job.extra['config_summary'], ensure_ascii=False)}")
+        job.end_phase("Configuração")
 
-    run_caches(model_key, dataset_toml, vram_gb, job)
+        run_caches(model_key, dataset_toml, vram_gb, job)
 
     # HuggingFace repo + watcher (default ON)
     # before the upload watcher exists: it must only ever see this run's files

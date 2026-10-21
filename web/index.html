@@ -115,6 +115,13 @@
             <p class="dz-sub">ou clique para escolher · aceita .zip · <code>.txt</code> com o mesmo nome vira caption (sem .txt, o treino escreve)</p>
             <input type="file" multiple hidden>
           </div>
+          <div class="control-zone" id="control-zone" hidden>
+            <div class="dropzone small" tabindex="0" role="button" id="control-drop">
+              <p class="dz-title">Imagens de controle (treino de edição)</p>
+              <p class="dz-sub">mesmo nome do resultado: <code>foto1.png</code> ← <code>foto1_0.png</code> + <code>foto1_1.png</code> · ou um .zip com pastas <code>control_0/</code> e <code>control_1/</code></p>
+              <input type="file" multiple hidden>
+            </div>
+          </div>
           <div class="contact-sheet" id="thumbs-pos" hidden></div>
           <div class="row link-row">
             <input class="link-input" type="text" placeholder="ou cole: link do Mega · repo HuggingFace · URL de .zip · caminho local">

@@ -10,6 +10,9 @@ export OPENROUTER_API_KEY="sk-..."  # captions via LLM (só se precisar)
 curl -L https://raw.githubusercontent.com/adbrasi/arrakis_trainero/main/bootstrap.sh | bash
 ```
 
+Outra branch: `TRAINERO_BRANCH=<branch>` antes do `bash`, e o `bootstrap.sh` da mesma branch
+na URL.
+
 Abra a porta **8090** no painel do pod. Pronto. O servidor roda destacado do terminal
 (fechar a aba não derruba um treino); log em `data/server.log`. Rodar o comando de novo
 atualiza e reinicia — um treino em andamento é cancelado de forma limpa antes.
@@ -38,6 +41,7 @@ antes de treinar.
 | Anima | sd-scripts (`anima_train_network.py`) | dim 32/16 · lr 2e-5 · sigmoid · ~660 exposições/img |
 | Flux Klein (base-9B) | musubi-tuner | dim 128/128 · lr 1e-4 · flux2_shift |
 | Qwen Image | musubi-tuner | dim 64/64 · lr 5e-5 · shift 2.2 |
+| Qwen Image 2.1 (T2I **e** edição) | DiffSynth-Studio (commit fixo) | dim 32 · lr 1e-4 · AdamW constante · até 1 MP |
 | Ideogram 4 | musubi-tuner | dim 32/32 · lr 1e-4 · DiT já é FP8 |
 | LTX 2.3 | musubi fork AkaneTendo25 (`ltx-2-dev`) | dim 256/256 · lr 1e-4 · shifted_logit_normal |
 
@@ -49,6 +53,41 @@ Só LoRA padrão (LoHa/LoKr saíram de propósito). No painel ⚙ dá pra ligar 
 
 Cada treino começa com `output/` vazio: o anterior vai para `runs/<data>/`, então
 o repo HF e a galeria só mostram o treino atual.
+
+## Qwen Image 2.1 — texto→imagem ou edição (pares e trios)
+
+Treinado pelo [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) (o musubi não
+suporta o 2.1). Um checkpoint só faz as duas coisas; **o dataset decide**:
+
+- **sem pasta `control/`** → texto→imagem, captions como em qualquer modelo.
+- **com `control/`** → edição. Para cada imagem-resultado `foto1.png`:
+  - par: `control/foto1.png`
+  - trio (2 referências): `control/foto1_0.png` + `control/foto1_1.png`
+  - `foto1.txt` = a **instrução** de edição (escrita por você — o LLM de caption não é usado
+    em edição, ele descreveria a imagem em vez da instrução).
+
+Jeitos de mandar um dataset de trios:
+
+```
+meu_dataset.zip
+├── target/      foto1.png  foto1.txt  foto2.png  foto2.txt …
+├── control_0/   foto1.png  foto2.png  …     (1ª referência, mesmo nome do resultado)
+└── control_1/   foto1.png  foto2.png  …     (2ª referência)
+```
+
+ou arraste os resultados + `.txt` no dataset e as referências na área "Imagens de controle"
+(nomes `foto1_0.png`, `foto1_1.png`). A tela mostra quantos itens ficaram pareados; misturar
+itens com e sem controle é recusado antes de qualquer download (o DiffSynth não treina os dois
+no mesmo run).
+
+Por VRAM: ≥ 70 GB bf16 · 40–70 GB text encoder em FP8 · 30–40 GB (RTX 5090) DiT e text
+encoder em FP8, e em edição as ativações vão para a RAM · < 30 GB offload (mais lento, sem
+samples). Um sample por época é gerado dentro do próprio treino; em edição ele aplica a
+instrução do primeiro item às referências dele. O LoRA sai no formato que o ComfyUI carrega
+direto.
+
+Pesos: `Qwen/Qwen-Image-2.1` do Hugging Face (~33 GB), baixados pelo trainer; o DiffSynth
+nunca baixa do ModelScope.
 
 ## Epochs, nunca max steps
 

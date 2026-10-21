@@ -17,7 +17,7 @@ class TestPresets(unittest.TestCase):
     def test_all_models_complete(self):
         for key in MODEL_ORDER:
             m = MODELS[key]
-            self.assertIn(m["engine"], ("musubi", "musubi-ltx", "sd-scripts"), key)
+            self.assertIn(m["engine"], ("musubi", "musubi-ltx", "sd-scripts", "diffsynth"), key)
             self.assertTrue(m["downloads"], key)
             self.assertTrue(m["model_args"], key)
             self.assertIn("network_dim", m["train"], key)

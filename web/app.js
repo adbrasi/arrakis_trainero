@@ -220,6 +220,7 @@ function applyMode() {
   if (state.status) renderDatasetStats();
   fillAdvanced();
   renderModelAvailability();
+  renderControlZone();
   renderStepState();
   refreshTrainButton();
 }
@@ -229,6 +230,11 @@ function triggerHelpText() {
     return "obrigatória — as captions que faltam vão começar com ela";
   }
   return MODES[state.mode].triggerHelp;
+}
+
+function renderControlZone() {
+  const m = state.model && state.presets?.models[state.model];
+  $("#control-zone").hidden = !(m && m.supports_control && state.mode === "lora");
 }
 
 function renderModelAvailability() {
@@ -304,7 +310,23 @@ function requireProject() {
 
 const stemOf = (name) => name.replace(/\.[^.]+$/, "");
 
-async function uploadFiles(files, side) {
+// Edit training: control images go to dataset/control/ under their own names,
+// which is how they pair with the result of the same name.
+(() => {
+  const dz = $("#control-drop");
+  const input = dz.querySelector("input");
+  dz.addEventListener("click", () => input.click());
+  dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.classList.add("drag"); });
+  dz.addEventListener("dragleave", () => dz.classList.remove("drag"));
+  dz.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dz.classList.remove("drag");
+    uploadFiles([...e.dataTransfer.files], "pos", "control");
+  });
+  input.addEventListener("change", () => uploadFiles([...input.files], "pos", "control"));
+})();
+
+async function uploadFiles(files, side, forceDir = "") {
   if (!files.length || !requireProject()) return;
   if (state.status?.job?.status === "running") {
     return toast("há um job rodando — espere terminar ou cancele antes de enviar arquivos", "error");
@@ -324,7 +346,7 @@ async function uploadFiles(files, side) {
       while (queue.length) {
         const f = queue.shift();
         const rel = f.webkitRelativePath || f.name;
-        const dir = /(^|\/)control\//i.test(rel) ? "control" : "";
+        const dir = forceDir || (/(^|\/)control\//i.test(rel) ? "control" : "");
         let name = f.name;
         if (isTxt(f) && renamed[`${dir}/${stemOf(name)}`]) name = `${renamed[`${dir}/${stemOf(name)}`]}.txt`;
         try {
@@ -427,7 +449,13 @@ function renderDatasetStats() {
     const parts = [];
     if (stats.images) parts.push(`<span><b>${stats.images}</b> imagens</span>`);
     if (stats.videos) parts.push(`<span><b>${stats.videos}</b> vídeos</span>`);
-    if (stats.control_images) parts.push(`<span><b>${stats.control_images}</b> control</span>`);
+    if (stats.control_images) parts.push(`<span><b>${stats.control_images}</b> controles</span>`);
+    const ep = side === "pos" ? s.edit_pairs : null;
+    if (ep && ep.paired !== undefined) {
+      const refs = (ep.refs || []).join(" ou ");
+      parts.push(`<span>edição: <b>${ep.paired}</b> itens com ${esc(refs)} controle(s)</span>`);
+      if (ep.unpaired) parts.push(`<span class="warn">${ep.unpaired} sem controle (ex.: ${esc((ep.unpaired_sample || []).join(", "))})</span>`);
+    }
     // Style Rush writes the captions during training, so counting them here is
     // noise at best and a false alarm at worst
     if (styleRush()) parts.push(`<span>captions escritas no treino</span>`);
@@ -472,11 +500,16 @@ function plannedProfile() {
 
 function captionNeedsTrigger() {
   const s = state.status || {};
+  if (editDataset()) return false;
   const missing = (s.dataset?.missing_captions || 0)
     + (state.mode === "slider" ? (s.dataset_neg?.missing_captions || 0) : 0);
   if (styleRush()) return true;
   if (!missing || sliderIsNative()) return false;
   return !!profileInfo(plannedProfile())?.trigger;
+}
+
+function editDataset() {
+  return (state.status?.edit_pairs?.paired || 0) > 0;
 }
 
 function renderCaptionCard() {
@@ -508,6 +541,18 @@ function renderCaptionCard() {
   const planned = profileInfo(plannedProfile());
   const label = planned ? planned.label : "o perfil automático";
   const plan = $("#caption-plan");
+  if (editDataset()) {
+    // an edit LoRA learns the instruction; describing the image would teach
+    // the wrong thing, so the LLM path is closed here
+    plan.textContent = missing > 0
+      ? "dataset de edição: cada resultado precisa de um .txt com a INSTRUÇÃO (ex.: \"junte as duas pessoas na mesma foto\") — envie os .txt"
+      : "dataset de edição: o .txt de cada item é a instrução";
+    plan.classList.toggle("alert", missing > 0);
+    $("#btn-captions").disabled = true;
+    $("#caption-key-hint").hidden = true;
+    renderCaptionTriggerNote();
+    return;
+  }
   if (!s.openrouter) {
     plan.textContent = missing > 0
       ? "sem OPENROUTER_API_KEY no pod: envie um .txt com o mesmo nome de cada imagem"
@@ -732,7 +777,11 @@ function refreshTrainButton() {
   if (styleRush() && !s.openrouter) blockers.push("defina OPENROUTER_API_KEY no pod");
   const missing = (s.dataset?.missing_captions || 0)
     + (state.mode === "slider" ? (s.dataset_neg?.missing_captions || 0) : 0);
-  if (!styleRush() && !sliderIsNative() && missing && !s.openrouter) {
+  if (editDataset() && missing) {
+    blockers.push(`${missing} itens sem .txt de instrução (dataset de edição)`);
+  } else if (editDataset() && s.edit_pairs.unpaired) {
+    blockers.push(`${s.edit_pairs.unpaired} imagens sem controle — num treino de edição todas precisam`);
+  } else if (!styleRush() && !sliderIsNative() && missing && !s.openrouter) {
     blockers.push(`${missing} itens sem caption — envie os .txt ou defina OPENROUTER_API_KEY`);
   }
   // the server refuses a train mid-upload; say so before the click, not after

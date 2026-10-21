@@ -315,6 +315,28 @@ def bake_orientation(path: Path) -> bool:
     return True
 
 
+_CONTROL_N_RE = re.compile(r"^control[_\- ]?(\d+)$", re.IGNORECASE)
+
+
+def control_slot(rel: Path) -> tuple[bool, int | None]:
+    """Where a file sits in an edit dataset: (is a control image, its index).
+
+    `control/a.png` is the (only or first) reference of `a.png`. A numbered
+    folder — `control_0/`, `control1/`, `control-2/` — is one reference slot of
+    a multi-reference dataset (two inputs + one result, say) and lands as
+    `control/a_<n>.png`, the name the trainers pair by.
+    """
+    index = None
+    is_control = False
+    for part in (p.name for p in rel.parents if p.name):
+        m = _CONTROL_N_RE.match(part)
+        if m:
+            return True, int(m.group(1))
+        if part.lower() == "control":
+            is_control = True
+    return is_control, index
+
+
 def normalize_into(staging: Path, dataset_dir: Path, job: Job) -> None:
     src = _descend_wrapper(staging)
     dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -325,11 +347,16 @@ def normalize_into(staging: Path, dataset_dir: Path, job: Job) -> None:
         if not f.is_file() or is_junk(f.relative_to(src)):
             continue
         ext = f.suffix.lower()
-        in_control = "control" in [p.name.lower() for p in f.relative_to(src).parents if p.name]
+        in_control, slot = control_slot(f.relative_to(src))
         if ext in media_exts:
             target_root = control_dir if in_control else dataset_dir
             target_root.mkdir(parents=True, exist_ok=True)
-            dest = target_root / f.name
+            dest = target_root / (f"{f.stem}_{slot}{f.suffix}" if slot is not None else f.name)
+            if dest.exists() and in_control:
+                # a control is found by its name: renaming it would silently
+                # unpair it, so a clash is reported instead
+                job.log(f"⚠ controle repetido ignorado: {f.relative_to(src)}")
+                continue
             if dest.exists():
                 dest = target_root / f"{f.parent.name}_{f.name}"
             if dest.exists():
