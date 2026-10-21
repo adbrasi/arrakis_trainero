@@ -57,14 +57,16 @@ ENGINES = {
         "repo": "https://github.com/adbrasi/captionkreator.git",
         "branch": "main",
         "dir": "captionkreator",
-        # `pip install -e .[wd14]`: the CLI plus the local booru tagger. No torch
-        # and no accelerate — it is an HTTP client plus an ONNX model on CPU.
+        # pinned like diffsynth: verified with --skip-captioned, the plain
+        # progress lines, fallback marks in captions.json and the WD14 fix
+        # (single sigmoid). The prompts live in this repo (caption_profiles/),
+        # so nothing is gained by pulling the engine on every run.
+        "commit": "8f5ab6c01ec5b0ca185197cacab799e140cc118d",
+        # `pip install -e .[wd14]`: the CLI plus the local booru tagger
+        # (onnxruntime-gpu on Linux). No torch and no accelerate.
         "install": "package",
         "extras": "wd14",
         "torch": False,
-        # The engine's code changes between runs while its dependencies do not;
-        # a long-lived pod would otherwise caption with a stale engine.
-        "pull": True,
     },
 }
 
@@ -379,9 +381,12 @@ MODELS = {
         "train_script": "examples/qwen_image_21/model_training/train.py",
         "network_module": "peft",  # DiffSynth injects PEFT LoRA; alpha is always = rank
         # The official recipe (examples/qwen_image_21/.../lora/Qwen-Image-2.1.sh):
-        # rank 32, lr 1e-4, AdamW, constant LR, auto-detected Linear targets in
-        # every transformer block, dynamic resolution up to 1 MP, batch 1.
-        "train": {"network_dim": 32, "network_alpha": 32, "learning_rate": 1e-4,
+        # rank 32, AdamW, constant LR, auto-detected Linear targets in every
+        # transformer block, dynamic resolution up to 1 MP, batch 1 — but lr
+        # 5e-5 instead of its 1e-4: independent reports (r/StableDiffusion,
+        # Sep-Oct 2026) of anatomy collapse at 1e-4 and clean runs at 3e-5..5e-5
+        # with more steps. Hence target_steps 2500, not 2000.
+        "train": {"network_dim": 32, "network_alpha": 32, "learning_rate": 5e-5,
                   "optimizer_type": "adamw", "lr_scheduler": "constant"},
         "resolution": [1024, 1024],
         "max_pixels": 1024 * 1024,
@@ -390,8 +395,13 @@ MODELS = {
         # edit template whenever edit_image is present), so the Style Rush mix
         # of plain and paired subsets is impossible here
         "style_rush": False,
-        "target_steps": 2000,
-        "sample_steps": 40,  # DiffSynth's default for this model; CFG stays off (1.0)
+        "target_steps": 2500,
+        "sample_steps": 40,
+        # 2.1 ships CFG-distilled (runs at CFG 1). A LoRA trained on it breaks
+        # that distillation, and at CFG 1 the result melts (hands, limbs) while
+        # CFG ~4 renders it clean — so samples are judged at 4. Use the same in
+        # ComfyUI with the LoRA.
+        "sample_cfg": 4.0,
         # DiT ~14 GB + text encoder ~17.5 GB + VAE 1.3 GB in bf16. FP8 storage
         # (computation stays bf16) is DiffSynth's only training-time VRAM knob
         # that keeps speed; offload is the last resort and disables sampling.

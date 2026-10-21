@@ -85,7 +85,8 @@ def make_sampler(args):
             if dit is not None:
                 dit.eval()
             with torch.no_grad():
-                image = pipe(args.sample_prompt, edit_image=edit,
+                image = pipe(args.sample_prompt, negative_prompt=" ",
+                             cfg_scale=args.sample_cfg, edit_image=edit,
                              height=args.sample_height, width=args.sample_width,
                              seed=args.sample_seed, num_inference_steps=args.sample_steps,
                              progress_bar_cmd=lambda x: x)
@@ -121,6 +122,7 @@ def main(argv: list[str]) -> None:
     parser.add_argument("--sample_height", type=int, default=1024)
     parser.add_argument("--sample_seed", type=int, default=42)
     parser.add_argument("--sample_steps", type=int, default=40)
+    parser.add_argument("--sample_cfg", type=float, default=1.0)
     parser.add_argument("--sample_edit_image", default=None)
     parser.add_argument("--sample_dir", default=None)
     args = parser.parse_args(rest)

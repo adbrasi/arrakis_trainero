@@ -148,7 +148,7 @@ class TestConfig(unittest.TestCase):
 
     def test_official_recipe_defaults(self):
         cfg = self._cfg(80)
-        self.assertEqual((cfg["lora_rank"], cfg["learning_rate"]), (32, 1e-4))
+        self.assertEqual((cfg["lora_rank"], cfg["learning_rate"]), (32, 5e-5))
         self.assertEqual(cfg["lora_target_modules"], "")
         self.assertEqual(cfg["max_pixels"], 1024 * 1024)
 
@@ -157,7 +157,7 @@ class TestConfig(unittest.TestCase):
             s = suggest_schedule(KEY, n)
             self.assertTrue(4 <= s["epochs"] <= 10, (n, s))
             total = n * s["num_repeats"] * s["epochs"]
-            self.assertTrue(1500 <= total <= 4000, (n, s, total))
+            self.assertTrue(2000 <= total <= 5000, (n, s, total))
 
     def test_not_offered_for_style_rush(self):
         self.assertNotIn(KEY, style_rush_models())
@@ -216,7 +216,7 @@ class TestWrapperEndToEnd(unittest.TestCase):
                 smp = {"prompt": prompt, "edit_image": ",".join(map(str, refs)), "width": w, "height": h}
             else:
                 smp = {"prompt": prompt, "width": 1344, "height": 768}
-            smp.update({"seed": 42, "steps": 40, "dir": str(out / "sample")})
+            smp.update({"seed": 42, "steps": 40, "cfg": 4.0, "dir": str(out / "sample")})
         cfg = dsyn.build_config(KEY, {}, schedule, 32, d, meta, out, "proj", edit, smp)
         cfg["dataset_num_workers"] = 0
         record = td / "record.jsonl"
@@ -244,6 +244,7 @@ class TestWrapperEndToEnd(unittest.TestCase):
         samples = [e for e in events if e["event"] == "sample"]
         self.assertEqual(len(samples), 3)                   # before step 1 + each epoch
         self.assertTrue(all(s["refs"] == 2 for s in samples))
+        self.assertTrue(all(s["cfg"] == 4.0 for s in samples))  # judged with CFG on
         # the shared scheduler goes back to training timesteps after each sample
         sets = [e for e in events if e["event"] == "set_timesteps"]
         self.assertEqual([(e["n"], e["training"]) for e in sets[-2:]], [(40, False), (1000, True)])
@@ -343,4 +344,5 @@ class TestRunTrainingRoute(unittest.TestCase):
             cmd = ran["cmd"]
             self.assertTrue(cmd[cmd.index("--sample_prompt") + 1].startswith("zz, "))
             self.assertNotIn("--extra_inputs", cmd)
+            self.assertEqual(cmd[cmd.index("--sample_cfg") + 1], "4.0")
             self.assertEqual(job.extra["config_summary"]["task"], "t2i")

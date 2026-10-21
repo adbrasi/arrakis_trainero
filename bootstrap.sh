@@ -77,7 +77,11 @@ stop_previous_server() {
       for _ in $(seq 1 45); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
     fi
   fi
-  # a server from before the pidfile existed: free the port the old way
+  # a server from before the pidfile existed: it was started as
+  # "<app>/.venv/bin/python server.py", which names this app and no other
+  if pkill -TERM -f "^$1/.venv/bin/python server.py" >/dev/null 2>&1; then
+    for _ in $(seq 1 45); do pgrep -f "^$1/.venv/bin/python server.py" >/dev/null || break; sleep 1; done
+  fi
   command -v fuser >/dev/null 2>&1 && fuser -k "$PORT/tcp" >/dev/null 2>&1 || true
 }
 

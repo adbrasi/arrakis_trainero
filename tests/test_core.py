@@ -377,57 +377,22 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestEnginePull(unittest.TestCase):
-    """O clone do captioner é o único cujo conteúdo (os prompts) muda entre
-    runs enquanto as dependências não. Pull no musubi arriscaria um venv bom."""
+class TestEnginePins(unittest.TestCase):
+    """captioner and diffsynth are pinned to a verified commit: a clone that
+    sits elsewhere is moved to it, one already there is left alone."""
 
-    def test_only_the_captioner_declares_pull(self):
-        from trainero.presets import ENGINES
-
-        pulling = {k for k, v in ENGINES.items() if v.get("pull")}
-        self.assertEqual(pulling, {"captioner"})
-
-    def test_an_existing_clone_is_fast_forwarded(self):
+    def _ensure(self, head: str):
         import tempfile
         from pathlib import Path as P
         from unittest import mock
 
         from trainero import engines
+        from trainero.presets import ENGINES
 
+        ran = []
         with tempfile.TemporaryDirectory() as td:
             dest = P(td) / "captionkreator"
             (dest / ".git").mkdir(parents=True)
-            (dest / ".venv" / "bin").mkdir(parents=True)
-            (dest / ".venv" / "bin" / "python").touch()
-            ran = []
-
-            class FakeJob:
-                def log(self, *_): pass
-
-                def run(self, cmd, cwd=None, **_kw):
-                    ran.append(([str(c) for c in cmd], str(cwd) if cwd else None))
-
-            with mock.patch.object(engines, "engine_dir", return_value=dest), \
-                 mock.patch.object(engines, "is_installed", return_value=True):
-                engines.ensure_engine("captioner", FakeJob())
-
-            self.assertEqual(ran[0], (["git", "pull", "--ff-only"], str(dest)))
-            # new code may need a new dependency: the editable install is redone
-            self.assertEqual(len(ran), 2)
-            self.assertEqual(ran[1][0][-2:], ["-e", ".[wd14]"])
-            self.assertNotIn("torch", ran[1][0])
-
-    def test_a_training_engine_is_left_alone(self):
-        import tempfile
-        from pathlib import Path as P
-        from unittest import mock
-
-        from trainero import engines
-
-        with tempfile.TemporaryDirectory() as td:
-            dest = P(td) / "musubi-tuner"
-            (dest / ".git").mkdir(parents=True)
-            ran = []
 
             class FakeJob:
                 def log(self, *_): pass
@@ -435,39 +400,30 @@ class TestEnginePull(unittest.TestCase):
                 def run(self, cmd, cwd=None, **_kw):
                     ran.append([str(c) for c in cmd])
 
+            fake_head = mock.Mock(stdout=head + "\n")
             with mock.patch.object(engines, "engine_dir", return_value=dest), \
-                 mock.patch.object(engines, "is_installed", return_value=True):
-                engines.ensure_engine("musubi", FakeJob())
+                 mock.patch.object(engines, "is_installed", return_value=True), \
+                 mock.patch.object(engines.subprocess, "run", return_value=fake_head):
+                engines.ensure_engine("captioner", FakeJob())
+        return ran, ENGINES["captioner"]["commit"]
 
-            self.assertEqual(ran, [], "pull no musubi pode quebrar um venv que funciona")
+    def test_no_engine_pulls_a_moving_branch(self):
+        from trainero.presets import ENGINES
 
-    def test_a_failed_pull_does_not_stop_the_job(self):
-        """Sem rede, ou com commit local no clone, o pull falha. O prompt velho
-        é ruim; não captionar nada é pior."""
-        import tempfile
-        from pathlib import Path as P
-        from unittest import mock
+        self.assertFalse({k for k, v in ENGINES.items() if v.get("pull")})
+        for key in ("captioner", "diffsynth"):
+            self.assertRegex(ENGINES[key]["commit"], r"^[0-9a-f]{40}$")
 
-        from trainero import engines
+    def test_a_clone_elsewhere_moves_to_the_pin(self):
+        ran, pin = self._ensure("0" * 40)
+        self.assertEqual(ran[0], ["git", "fetch", "--depth", "1", "origin", pin])
+        self.assertEqual(ran[1], ["git", "checkout", "--force", pin])
 
-        with tempfile.TemporaryDirectory() as td:
-            dest = P(td) / "data_araknideo"
-            (dest / ".git").mkdir(parents=True)
-            lines = []
+    def test_a_clone_on_the_pin_runs_nothing(self):
+        from trainero.presets import ENGINES
 
-            class FakeJob:
-                def log(self, msg): lines.append(msg)
-
-                def run(self, cmd, cwd=None, **_kw):
-                    raise RuntimeError("fatal: not possible to fast-forward")
-
-            with mock.patch.object(engines, "engine_dir", return_value=dest), \
-                 mock.patch.object(engines, "is_installed", return_value=True):
-                engines.ensure_engine("captioner", FakeJob())  # não pode levantar
-
-            self.assertTrue(any("pull" in ln.lower() for ln in lines),
-                            "o dono tem de ver que o clone ficou velho")
-
+        ran, _ = self._ensure(ENGINES["captioner"]["commit"])
+        self.assertEqual(ran, [])
 
 class TestSampleCaption(unittest.TestCase):
     """O sample só serve porque é o mesmo prompt a cada época. Uma escolha que

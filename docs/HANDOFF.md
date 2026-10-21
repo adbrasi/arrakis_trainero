@@ -11,18 +11,23 @@ dono" são as que evitam retrabalho.
 
 ## 0. Sessão 2026-10-01 — o que mudou (leia antes do resto)
 
-Branch `claude/cool-tesla-vwnh8u` nos dois repos. **O captionkreator precisa ser
-mergeado no `main` dele antes** — o engine é clonado do `main` e usa
-`--skip-captioned`, `OPENROUTER_BASE_URL` e a correção do WD14 que só existem nessa branch.
+Branch `claude/cool-tesla-vwnh8u` nos dois repos. O captionkreator é fixado por commit
+(`8f5ab6c`, na branch — inclui o merge do `main` de 2026-10-08 e a correção do WD14).
 
 - **Captions:** data_araknideo saiu; entrou o captionkreator. Perfis em
   `caption_profiles/` (portados dos prompts antigos, `{{trigger}}` em todos).
   O treino escreve sozinho as captions que faltam (fase "Captions" antes do download);
   o perfil vem de "o que você está treinando" + modelo (`default_caption_profile`).
 - **Modelos removidos a pedido do dono:** Wan 2.2, Qwen Image Edit, LoHa/LoKr.
-- **Qwen Image 2.1 (t2i + edit): NÃO adicionado.** musubi (main e branches, 2026-09-27)
-  não suporta. Só o ai-toolkit treina os dois (um checkpoint, edita quando há control);
-  diffusion-pipe só T2I. Precisa de decisão do dono: engine novo (ai-toolkit).
+- **Qwen Image 2.1 (2026-10-21): adicionado via DiffSynth-Studio**, pedido do dono. musubi
+  segue sem suporte; diffusion-pipe só T2I. Engine `diffsynth` fixado em `f39d731`;
+  `trainero/tools/diffsynth_train.py` roda o módulo/loop oficiais + sample por época.
+  Edição: `control/<nome>_0.png`, `_1.png`… (trios), `.txt` = instrução do dono.
+  Testado em CPU com runner/dataset/parser reais e modelo stub; **nunca rodou em GPU**.
+  Primeiro run real: RTX 5090, edição com trios — conferir no log a linha `Config:`
+  (fp8 2, task edit), o sample da época 0 e a VRAM no `nvidia-smi`.
+- **Engines fixados por commit** (`captioner`, `diffsynth`); torch instalado pelo CUDA do
+  driver (PyPI 2.14 = CUDA 13, driver ≥ 580).
 - **Bug grave no captionkreator corrigido:** o WD14 aplicava sigmoid duas vezes →
   ~10 mil tags em todo prompt. Achado rodando o tagger de verdade.
 - **Flags conferidas contra o upstream** (musubi main, ltx-2-dev, sd-scripts):

@@ -37,10 +37,11 @@ class FakePipe:
         self.dit = dit
         self.scheduler = FakeScheduler()
 
-    def __call__(self, prompt, edit_image=None, height=1024, width=1024, seed=None,
-                 num_inference_steps=40, progress_bar_cmd=None, **kwargs):
+    def __call__(self, prompt, negative_prompt=" ", cfg_scale=1.0, edit_image=None,
+                 height=1024, width=1024, seed=None, num_inference_steps=40,
+                 progress_bar_cmd=None, **kwargs):
         _record(event="sample", prompt=prompt, refs=len(edit_image or []),
-                size=[width, height], steps=num_inference_steps)
+                size=[width, height], steps=num_inference_steps, cfg=cfg_scale)
         self.scheduler.set_timesteps(num_inference_steps)  # what the real pipe does
         if "FAIL" in prompt:
             raise RuntimeError("CUDA out of memory (simulado)")

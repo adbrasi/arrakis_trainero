@@ -774,6 +774,7 @@ def _diffsynth_config(job: Job, model_key: str, overrides: dict, schedule: dict,
             sample = {"prompt": text, "width": w, "height": h}
         if sample:
             sample.update({"seed": SAMPLE_SEED, "steps": model.get("sample_steps", 40),
+                           "cfg": model.get("sample_cfg", 1.0),
                            "dir": str(output_dir / "sample")})
     cfg = dsyn.build_config(model_key, overrides, schedule, vram_gb, dataset_dir, metadata,
                             output_dir, slug, edit, sample, job)
