@@ -156,6 +156,105 @@ def generate(prompt: str, image_path: Path, timeout: float = 300.0) -> tuple[byt
     """Restyle one image. Returns the PNG bytes and what the call cost in USD."""
     data_url, width, height = to_data_url(image_path)
     payload = build_payload(prompt, data_url, aspect_ratio_for(width, height))
+    return post_images(payload, timeout)
+
+
+# ---------------------------------------------------------------------------
+# Any model on the Images endpoint (expand mode)
+# ---------------------------------------------------------------------------
+# The endpoint serves many models (gpt-image-2, Nano Banana, Seedream...) and
+# each declares its own `supported_parameters` at /images/models. Sending a
+# parameter a model does not declare is how a request gets rejected, so the
+# payload is built from that declaration instead of from per-model branches.
+
+MODELS_URL = "https://openrouter.ai/api/v1/images/models"
+_params_cache: dict[str, dict | None] = {}
+
+
+def model_parameters(model: str, timeout: float = 30.0) -> dict | None:
+    """supported_parameters of `model`, or None when the listing is unreachable
+    or does not mention it. Free call, cached per process."""
+    if model in _params_cache:
+        return _params_cache[model]
+    found = None
+    try:
+        req = urllib.request.Request(MODELS_URL, headers={"Authorization": f"Bearer {api_key()}"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            listing = json.loads(response.read().decode())
+        for entry in listing.get("data") or []:
+            if entry.get("id") == model:
+                found = entry.get("supported_parameters") or {}
+                break
+    except Exception:
+        found = None
+    _params_cache[model] = found
+    return found
+
+
+def _ratio_value(label: str) -> float | None:
+    try:
+        w, h = (float(x) for x in label.split(":"))
+        return w / h if h else None
+    except ValueError:
+        return None
+
+
+def nearest_supported_ratio(wanted: str, allowed: list[str] | None) -> str:
+    """`wanted` if the model lists it, else the closest ratio it does list."""
+    if not allowed or wanted in allowed:
+        return wanted
+    target = _ratio_value(wanted)
+    options = [(a, _ratio_value(a)) for a in allowed if _ratio_value(a)]
+    if target is None or not options:
+        return wanted
+    return min(options, key=lambda o: abs(math.log(o[1]) - math.log(target)))[0]
+
+
+def build_reference_payload(model: str, prompt: str, data_urls: list[str], aspect_ratio: str,
+                            params: dict | None, quality: str | None = None) -> dict:
+    """Payload for a generation guided by several reference images.
+
+    params is the model's supported_parameters (None when unknown: then only
+    the fields every image model on the endpoint takes are sent, plus the
+    OpenAI ones for an openai/ model, which are verified to work).
+    """
+    ratios = None
+    if params and isinstance(params.get("aspect_ratio"), dict):
+        ratios = params["aspect_ratio"].get("values")
+    max_refs = None
+    if params and isinstance(params.get("input_references"), dict):
+        max_refs = params["input_references"].get("max")
+    refs = data_urls[:max_refs] if max_refs else data_urls
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "n": 1,
+        "aspect_ratio": nearest_supported_ratio(aspect_ratio, ratios),
+        "input_references": [{"type": "image_url", "image_url": {"url": u}} for u in refs],
+    }
+    openai = model.startswith("openai/")
+    if quality and ((params and "quality" in params) or (params is None and openai)):
+        payload["quality"] = quality
+    if params and "resolution" in params:
+        values = (params["resolution"] or {}).get("values") or []
+        if "1K" in values:
+            payload["resolution"] = "1K"   # Krea trains at 1024; more only costs
+    if openai:
+        payload["moderation"] = "low"
+    return payload
+
+
+def generate_from_references(prompt: str, image_paths: list[Path], aspect_ratio: str,
+                             model: str, quality: str | None = None,
+                             params: dict | None = None,
+                             timeout: float = 300.0) -> tuple[bytes, float]:
+    """One new image guided by reference images. Returns (image bytes, USD)."""
+    urls = [to_data_url(Path(p))[0] for p in image_paths]
+    payload = build_reference_payload(model, prompt, urls, aspect_ratio, params, quality)
+    return post_images(payload, timeout)
+
+
+def post_images(payload: dict, timeout: float = 300.0) -> tuple[bytes, float]:
     request = urllib.request.Request(
         API_URL,
         data=json.dumps(payload).encode(),
