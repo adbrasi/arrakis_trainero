@@ -583,10 +583,13 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json({"ok": True, "job": job.kind, "folders": len(plan)}, 202)
 
         prompt_vars = {}
-        var = body.get("var_name")
-        if var and body.get("trigger"):
-            prompt_vars[var] = body["trigger"]
         entry = next((e for e in CAPTION_PROFILES.get(media, []) if e["key"] == profile), {})
+        # a UI manda var_name; quem chama a API direto só manda o trigger, e o
+        # perfil já declara qual variável o recebe
+        var = body.get("var_name") or entry.get("var")
+        trigger = body.get("trigger") or meta.get("trigger")
+        if var and trigger:
+            prompt_vars[var] = trigger
         if "character_class" in entry.get("extra_vars", []):
             char_class = (body.get("character_class") or meta.get("character_class") or "").strip()
             if char_class:
