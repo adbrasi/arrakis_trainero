@@ -308,14 +308,14 @@ class Handler(SimpleHTTPRequestHandler):
         if project and stats.get("items"):
             payload["schedules"] = {key: suggest_schedule(key, stats["items"]) for key in MODEL_ORDER}
         if project:
-            payload.update(self._kind_status(meta, stats))
+            payload.update(self._kind_status(meta, stats, payload["gpu"]))
             # Krea 2 trains on its recipe, not on suggest_schedule: the panel
             # has to show the numbers that will actually run
             if "krea2_schedule" in payload:
                 payload.setdefault("schedules", {})["krea2"] = payload.pop("krea2_schedule")
         self._json(payload)
 
-    def _kind_status(self, meta: dict, stats: dict) -> dict:
+    def _kind_status(self, meta: dict, stats: dict, gpu: dict) -> dict:
         """What the Krea 2 recipe would do with this dataset right now."""
         style_folders = meta.get("style_folders") or []
         concepts = ds.concepts(dataset_dir("pos"), style_folders)
@@ -330,7 +330,7 @@ class Handler(SimpleHTTPRequestHandler):
             "expand_generated": len(ex.generated_images(dataset_dir("pos"))),
         }
         if stats.get("items") or concepts:
-            vram_gb = (gpu_info().get("vram_mb") or 24576) / 1024
+            vram_gb = (gpu.get("vram_mb") or 24576) / 1024
             try:
                 recipe = dataset_recipe("krea2", dataset_dir("pos"), vram_gb, choice, style_folders)
             except ValueError as exc:
