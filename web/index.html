@@ -82,6 +82,22 @@
         <input id="trigger-word" type="text" placeholder="makima_style" autocomplete="off">
         <span class="help" id="trigger-help">a palavra que invoca o estilo nos seus prompts</span>
       </label>
+
+      <!-- Krea 2: what the LoRA is decides the recipe and the caption profile -->
+      <div class="field" id="kind-field" hidden>
+        <span class="label">Tipo de LoRA <span class="tag">Krea 2</span></span>
+        <div class="seg" id="kind-toggle">
+          <button type="button" data-kind="character">Personagem</button>
+          <button type="button" data-kind="style">Estilo</button>
+          <button type="button" data-kind="mixed">Misto</button>
+        </div>
+        <span class="help" id="kind-help"></span>
+      </div>
+      <label class="field" id="class-field" hidden>
+        <span class="label">Classe do personagem</span>
+        <input id="character-class" type="text" placeholder="woman · man · anime girl · robot" autocomplete="off">
+        <span class="help">curta, em inglês — entra nas captions e nas imagens geradas</span>
+      </label>
     </div>
   </section>
 
@@ -139,6 +155,28 @@
         <button class="btn quiet" id="add-pair">Adicionar par</button>
       </div>
 
+      <!-- Krea 2 misto: uma subpasta por conceito -->
+      <div id="mixed-card" hidden>
+        <p class="mode-note">
+          No <b>Misto</b>, mande um <code>.zip</code> (ou link) com <b>uma subpasta por conceito</b>:
+          <code>makima/</code>, <code>rem__anime girl/</code> (trigger<code>__</code>classe) e
+          <code>style_ghibli/</code> para o estilo. O nome da pasta vira a trigger.
+        </p>
+        <div id="concept-list"></div>
+      </div>
+
+      <!-- Krea 2 personagem: poucas imagens viram um dataset -->
+      <div id="expand-card" hidden>
+        <p class="caption-head" id="expand-head">Poucas imagens? Gere mais do personagem</p>
+        <div class="row">
+          <label class="inline">Meta: <input type="number" id="expand-n" min="1" max="200" value="20"> imagens geradas</label>
+          <button class="btn" id="btn-expand">Gerar</button>
+        </div>
+        <p class="help" id="expand-note"></p>
+        <p class="help alert" id="expand-key-hint" hidden>defina OPENROUTER_API_KEY no pod para usar isto</p>
+      </div>
+      <button class="btn quiet tiny" id="expand-open" hidden>Gerar mais imagens do personagem</button>
+
       <!-- captions: só quando o dono precisa agir -->
       <div id="caption-card">
         <p class="caption-head" id="caption-msg"></p>
@@ -176,6 +214,7 @@
         <div class="model-grid" id="models-video"></div>
       </div>
       <p class="preset-line" id="preset-line" hidden></p>
+      <p class="recipe-line" id="recipe-line" hidden></p>
     </div>
   </section>
 

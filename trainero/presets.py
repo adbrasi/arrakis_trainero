@@ -571,6 +571,7 @@ MIXED_LARGE_SET = 600
 # fraction of every mixed epoch spent on the style subset
 MIXED_STYLE_SHARE = 0.45
 MIXED_CHAR_INFLATE_MAX = 3
+MIXED_MAX_EPOCHS = 40
 # a character-sized dataset above this is assumed to be a style when the owner
 # never picked a kind
 AUTO_STYLE_MIN_ITEMS = 40
@@ -727,6 +728,13 @@ def krea2_recipe(kind: str, n_items: int, concepts: list[dict] | None = None,
         target = mixed_target_steps(n)
         samples = sum(c["items"] * c["num_repeats"] for c in subsets)
         spe = math.ceil(samples / max(1, batch_size))
+        if spe * MIXED_MAX_EPOCHS < target:
+            # a small mixed set would run hundreds of tiny epochs: scale every
+            # folder by the same integer, which keeps the balance exact
+            k = max(1, round(target / (spe * CHECKPOINTS * 2)))
+            subsets = [{**c, "num_repeats": c["num_repeats"] * k} for c in subsets]
+            samples *= k
+            spe = math.ceil(samples / max(1, batch_size))
         epochs, save_every = _cut_epochs(spe, target)
         style_samples = sum(c["items"] * c["num_repeats"] for c in subsets if c.get("style"))
         recipe.update({

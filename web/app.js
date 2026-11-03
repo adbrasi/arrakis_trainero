@@ -17,7 +17,22 @@ const state = {
   uploading: false,
   samples: [],
   triggerHydrated: false,
+  // Krea 2: the kind the owner picked ("" = let the dataset decide)
+  kindChoice: "",
+  kindHydrated: false,
+  expandOpen: false,
 };
+
+const KIND_LABEL = { character: "personagem", style: "estilo", mixed: "misto" };
+const KIND_HELP = {
+  character: "identidade consistente com 1 a 30 imagens — pessoa real ou personagem",
+  style: "o traço de um anime, artista ou jogo",
+  mixed: "vários personagens + um estilo no mesmo LoRA, uma subpasta cada",
+};
+const KIND_PROFILE = { character: "krea2-character", style: "generic-style" };
+
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 // ---------------------------------------------------------------- helpers
 function toast(msg, type = "info") {
@@ -44,7 +59,7 @@ const post = (path, body) => api(path, {
 
 // ---------------------------------------------------------------- project
 let projectTimer = null;
-for (const id of ["#project-name", "#trigger-word"]) {
+for (const id of ["#project-name", "#trigger-word", "#character-class"]) {
   $(id).addEventListener("input", () => {
     clearTimeout(projectTimer);
     projectTimer = setTimeout(saveProject, 600);
@@ -57,6 +72,7 @@ async function saveProject() {
   // before the first /api/status lands the field is empty because we have not
   // read the stored value yet — sending it would erase the saved trigger
   if (state.triggerHydrated) body.trigger = $("#trigger-word").value.trim();
+  if (state.kindHydrated) body.character_class = $("#character-class").value.trim();
   try {
     await post("/api/project", body);
     state.projectSet = true;
@@ -183,8 +199,130 @@ function applyMode() {
   if (state.status) renderDatasetStats();
   fillAdvanced();
   renderModelAvailability();
+  renderKind();
   renderStepState();
   refreshTrainButton();
+}
+
+// ---------------------------------------------------------------- Krea 2 kind
+// The kind decides the recipe (rank, steps, checkpoints) and the caption
+// profile. It only exists for models with recipes, and is shown before a model
+// is picked too, because the captions are written before step 03.
+function krea2Context() {
+  return state.mode === "lora" && !!state.presets &&
+    (!state.model || !!state.presets.models[state.model]?.recipes);
+}
+function currentKind() { return state.kindChoice || state.status?.kind || "character"; }
+function conceptList() { return krea2Context() ? (state.status?.concepts || []) : []; }
+function posItems() {
+  return (state.status?.dataset?.items || 0) + conceptList().reduce((a, c) => a + c.items, 0);
+}
+
+function renderKind() {
+  const show = krea2Context();
+  const kind = currentKind();
+  document.documentElement.dataset.kind = show ? kind : "";
+  $("#kind-field").hidden = !show;
+  $$("#kind-toggle button").forEach((b) =>
+    b.classList.toggle("active", show && b.dataset.kind === kind));
+  $("#kind-help").textContent = state.kindChoice ? KIND_HELP[kind]
+    : `automático (${KIND_LABEL[kind]}) — ${KIND_HELP[kind]}`;
+  $("#class-field").hidden = !(show && kind === "character");
+  $("#mixed-card").hidden = !(show && kind === "mixed");
+  if (show && kind === "mixed") renderConcepts();
+  renderExpandCard();
+  renderRecipeLine();
+}
+
+$("#kind-toggle").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-kind]");
+  if (!btn || !requireProject()) return;
+  if (state.kindChoice !== btn.dataset.kind) resetOverrides();  // overrides are relative to the recipe
+  state.kindChoice = btn.dataset.kind;
+  renderKind();
+  renderCaptionCard();
+  try {
+    await post("/api/project", { name: $("#project-name").value.trim(), lora_kind: state.kindChoice });
+    await poll();
+  } catch (e) { toast(e.message, "error"); }
+});
+
+function renderConcepts() {
+  const list = state.status?.concepts || [];
+  const box = $("#concept-list");
+  const key = JSON.stringify(list);
+  if (box.dataset.key === key) return;
+  box.dataset.key = key;
+  if (!list.length) {
+    box.innerHTML = `<p class="help">nenhuma subpasta no dataset ainda</p>`;
+    return;
+  }
+  box.innerHTML = list.map((c) => {
+    const prefixed = c.name.toLowerCase().startsWith("style_");
+    const cls = c.character_class ? ` · ${esc(c.character_class)}` : "";
+    const warn = c.missing_captions ? `<span class="warn">${c.missing_captions} sem caption</span>` : "";
+    return `<div class="concept"><span class="c-name">${esc(c.name)}</span>
+      <span class="c-meta">${c.style ? "estilo" : "personagem"} · trigger ${esc(c.trigger)}${cls} · ${c.items} imgs</span>${warn}
+      <label class="check" title="${prefixed ? "o prefixo style_ já marca como estilo" : "marcar como estilo"}">
+        <input type="checkbox" data-concept="${esc(c.name)}" ${c.style ? "checked" : ""} ${prefixed ? "disabled" : ""}> estilo</label></div>`;
+  }).join("");
+  box.querySelectorAll("input[data-concept]").forEach((cb) => cb.addEventListener("change", async () => {
+    const names = [...box.querySelectorAll("input[data-concept]:not(:disabled):checked")]
+      .map((x) => x.dataset.concept);
+    try {
+      await post("/api/project", { name: $("#project-name").value.trim(), style_folders: names });
+      await poll();
+    } catch (e) { toast(e.message, "error"); }
+  }));
+}
+
+// Few images of a character: the expand card. Open by itself below 10 images,
+// a click away above that.
+function renderExpandCard() {
+  const s = state.status || {};
+  const items = s.dataset?.items || 0;
+  const eligible = krea2Context() && currentKind() === "character" && items > 0 && !conceptList().length;
+  const open = eligible && (items < 10 || state.expandOpen);
+  $("#expand-card").hidden = !open;
+  $("#expand-open").hidden = !eligible || open;
+  if (!open) return;
+  const refs = s.expand_refs || 0;
+  const gen = s.expand_generated || 0;
+  const busy = s.job?.status === "running";
+  const e = state.presets?.expand || {};
+  $("#expand-key-hint").hidden = !!s.openrouter;
+  $("#btn-expand").disabled = !s.openrouter || busy || refs === 0;
+  const bits = [`${refs} referência${refs === 1 ? "" : "s"}${refs > 5 ? " (usa as 5 primeiras)" : ""}`];
+  if (gen) bits.push(`${gen} já geradas contam na meta`);
+  bits.push(`${e.image_model || "?"} + juiz ${e.judge_model || "?"}`);
+  bits.push("só entra o que mantém a identidade");
+  $("#expand-note").textContent = bits.join(" · ");
+  $("#expand-head").textContent = items < 10
+    ? `Só ${items} imagem${items === 1 ? "" : "s"}? Gere o resto do dataset`
+    : "Gerar mais imagens do personagem";
+}
+$("#expand-open").addEventListener("click", () => { state.expandOpen = true; renderExpandCard(); });
+$("#btn-expand").addEventListener("click", async () => {
+  if (!requireProject()) return;
+  await saveProject();
+  try {
+    await post("/api/expand", {
+      n: parseInt($("#expand-n").value, 10) || state.presets?.expand?.default_target || 20,
+      character_class: $("#character-class").value.trim(),
+    });
+    toast("Gerando imagens — acompanhe no progresso.");
+    $("#card-progress").hidden = false;
+  } catch (e) { toast(e.message, "error"); }
+});
+
+function renderRecipeLine() {
+  const el = $("#recipe-line");
+  const r = state.status?.recipe;
+  const show = krea2Context() && !!state.model && !!r;
+  el.hidden = !show;
+  if (!show) return;
+  el.textContent = r.error ? `Receita: ${r.error}` : r.line;
+  el.classList.toggle("alert", !!r.error);
 }
 
 function renderModelAvailability() {
@@ -294,7 +432,7 @@ async function uploadFiles(files, side) {
 // Reading the margin top to bottom has to be enough to know what to do next.
 function renderStepState() {
   const s = state.status || {};
-  const items = s.dataset?.items || 0;
+  const items = posItems();
   const named = !!$("#project-name").value.trim();
   const trigger = !!$("#trigger-word").value.trim();
 
@@ -350,14 +488,24 @@ async function renderContactSheet(side, items) {
 
 function renderDatasetStats() {
   const s = state.status || {};
-  for (const [side, stats] of [["pos", s.dataset], ["neg", s.dataset_neg]]) {
+  for (const [side, raw] of [["pos", s.dataset], ["neg", s.dataset_neg]]) {
     const panel = $(`.ds-panel[data-side=${side}]`);
     const box = panel.querySelector(".ds-stats");
+    // concept folders (Krea 2 mixed) count as part of the positive dataset
+    const concepts = side === "pos" ? conceptList() : [];
+    const stats = raw && concepts.length ? {
+      ...raw,
+      images: raw.images + concepts.reduce((a, c) => a + c.items, 0),
+      items: raw.items + concepts.reduce((a, c) => a + c.items, 0),
+      captions: raw.captions + concepts.reduce((a, c) => a + c.captions, 0),
+      missing_captions: raw.missing_captions + concepts.reduce((a, c) => a + c.missing_captions, 0),
+    } : raw;
     renderContactSheet(side, stats?.images || 0);
     if (!stats || !stats.items) { box.hidden = true; continue; }
     box.hidden = false;
     const parts = [];
     if (stats.images) parts.push(`<span><b>${stats.images}</b> imagens</span>`);
+    if (concepts.length) parts.push(`<span><b>${concepts.length}</b> subpastas</span>`);
     if (stats.videos) parts.push(`<span><b>${stats.videos}</b> vídeos</span>`);
     if (stats.control_images) parts.push(`<span><b>${stats.control_images}</b> control</span>`);
     // Style Rush writes the captions during training, so counting them here is
@@ -385,10 +533,12 @@ function renderDatasetStats() {
 // ---------------------------------------------------------------- captions
 function renderCaptionCard() {
   const s = state.status || {};
-  const missing = (s.dataset?.missing_captions || 0) + (s.dataset_neg?.missing_captions || 0);
+  const conceptMissing = conceptList().reduce((a, c) => a + c.missing_captions, 0);
+  const missing = (s.dataset?.missing_captions || 0) + (s.dataset_neg?.missing_captions || 0)
+    + conceptMissing;
   // Style Rush writes the captions itself during training, with the trigger word
   // from step 01 — asking the owner to do it here offers a worse path.
-  const items = (s.dataset?.items || 0) + (s.dataset_neg?.items || 0);
+  const items = posItems() + (s.dataset_neg?.items || 0);
   const redo = $("#caption-redo").checked;
   // The card used to appear only while something was missing. Redoing captions
   // on a dataset that arrived with .txt files needs it visible when nothing is.
@@ -408,7 +558,25 @@ function renderCaptionCard() {
   const sel = $("#caption-profile");
   if (sel.dataset.kind !== (isVideo ? "video" : "image")) {
     sel.dataset.kind = isVideo ? "video" : "image";
+    sel.dataset.autoKind = "";
     sel.innerHTML = profiles.map((p) => `<option value="${p.key}" data-var="${p.var || ""}">${p.label}</option>`).join("");
+  }
+  // Krea 2: the profile follows the kind (once per change, so a manual pick
+  // afterwards sticks); the mixed kind picks one per folder on the server
+  const mixed = krea2Context() && currentKind() === "mixed";
+  sel.hidden = mixed;
+  if (krea2Context() && !isVideo && !mixed && sel.dataset.autoKind !== currentKind()) {
+    sel.dataset.autoKind = currentKind();
+    const want = KIND_PROFILE[currentKind()];
+    if ([...sel.options].some((o) => o.value === want)) sel.value = want;
+  }
+  if (mixed) {
+    const note = $("#caption-trigger-note");
+    note.textContent = "cada subpasta usa a própria trigger: personagem → krea2-character, "
+      + "estilo → generic-style";
+    note.classList.remove("alert");
+    $("#btn-captions").disabled = !s.openrouter || (conceptMissing === 0 && !redo);
+    return;
   }
   renderCaptionTriggerNote();
 }
@@ -429,6 +597,14 @@ $("#caption-redo").addEventListener("change", renderCaptionCard);
 $("#trigger-word").addEventListener("input", renderCaptionTriggerNote);
 
 $("#btn-captions").addEventListener("click", async () => {
+  if (krea2Context() && currentKind() === "mixed") {
+    try {
+      const r = await post("/api/captions", { kind: "mixed", side: "pos",
+                                              redo: $("#caption-redo").checked });
+      toast(`Captions de ${r.folders} subpasta${r.folders === 1 ? "" : "s"} iniciadas.`);
+    } catch (e) { toast(e.message, "error"); }
+    return;
+  }
   const sel = $("#caption-profile");
   const opt = sel.selectedOptions[0];
   const trigger = $("#trigger-word").value.trim();
@@ -452,6 +628,7 @@ $("#btn-captions").addEventListener("click", async () => {
       trigger,
       side: sides[0] || "pos",
       redo,
+      character_class: $("#character-class").value.trim(),
     });
     toast("Geração de captions iniciada.");
   } catch (e) { toast(e.message, "error"); }
@@ -478,9 +655,10 @@ function selectModel(key) {
   const m = state.presets.models[key];
   const t = m.train;
   $("#preset-line").hidden = false;
-  $("#preset-line").textContent =
-    `${m.label} · ${m.engine} · dim ${t.network_dim}/${t.network_alpha ?? "auto"} · lr ${t.learning_rate}`
-    + (styleRush() ? " · 5 epochs" : " · epochs automáticos");
+  $("#preset-line").textContent = m.recipes && state.mode === "lora"
+    ? `${m.label} · ${m.engine} · lr ${t.learning_rate} · ${t.timestep_sampling} · receita automática pelo tipo`
+    : `${m.label} · ${m.engine} · dim ${t.network_dim}/${t.network_alpha ?? "auto"} · lr ${t.learning_rate}`
+      + (styleRush() ? " · 5 epochs" : " · epochs automáticos");
   fillAdvanced();
   applyMode();
 }
@@ -510,8 +688,11 @@ function fillAdvanced() {
     net.innerHTML = m.net_types.map((n) =>
       `<option value="${n}">${{ lora: "LoRA (padrão)", loha: "LoHa", lokr: "LoKr" }[n] || n}</option>`).join("");
   }
-  if (!state.advTouched.has("adv-dim")) $("#adv-dim").value = m.train.network_dim ?? "";
-  if (!state.advTouched.has("adv-alpha")) $("#adv-alpha").value = m.train.network_alpha ?? "";
+  // the recipe sets the rank on Krea 2; the panel shows what will really run
+  const recipe = m.recipes && state.mode === "lora" && !state.status?.recipe?.error
+    ? state.status?.recipe : null;
+  if (!state.advTouched.has("adv-dim")) $("#adv-dim").value = recipe?.network_dim ?? m.train.network_dim ?? "";
+  if (!state.advTouched.has("adv-alpha")) $("#adv-alpha").value = recipe?.network_alpha ?? m.train.network_alpha ?? "";
   if (!state.advTouched.has("adv-lr")) $("#adv-lr").value = m.train.learning_rate ?? "";
   if (sched) {
     if (!state.advTouched.has("adv-epochs")) $("#adv-epochs").value = sched.epochs;
@@ -574,6 +755,7 @@ $("#btn-train").addEventListener("click", async () => {
       model: state.model,
       mode: state.mode,
       trigger: $("#trigger-word").value.trim(),
+      lora_kind: krea2Context() ? state.kindChoice : "",
       overrides: collectOverrides(),
       slider_targets: sliderTargets(),
     });
@@ -615,13 +797,14 @@ function refreshTrainButton() {
   if (styleRush() && !$("#trigger-word").value.trim()) blockers.push("preencha a trigger word");
   if (sliderIsNative()) {
     if (!sliderTargets().length) blockers.push("adicione um par de prompts");
-  } else if (!(s.dataset?.items || 0)) {
+  } else if (!posItems()) {
     blockers.push("importe as imagens");
   }
   if (state.mode === "slider" && !sliderIsNative() && !(s.dataset_neg?.items || 0)) {
     blockers.push("importe o dataset do lado (−)");
   }
   if (!state.model) blockers.push("escolha um modelo");
+  else if (krea2Context() && s.recipe?.error && posItems()) blockers.push(s.recipe.error);
   if (styleRush() && !s.openrouter) blockers.push("defina OPENROUTER_API_KEY no pod");
   // the server refuses a train mid-upload; say so before the click, not after
   if (state.uploading) blockers.unshift("espere o upload terminar");
@@ -651,6 +834,11 @@ async function poll() {
   if (!state.triggerHydrated) {
     $("#trigger-word").value = s.trigger || "";
     state.triggerHydrated = true;
+  }
+  if (!state.kindHydrated && s.project) {
+    state.kindChoice = s.lora_kind || "";
+    $("#character-class").value = s.character_class || "";
+    state.kindHydrated = true;
   }
   // a copied dataset arrives with the trigger already inside every .txt on
   // disk: accepting another word here trains one thing and samples another
@@ -683,6 +871,7 @@ async function poll() {
   // both depend on the status payload, so they also recover from the first poll
   // landing after the owner already picked a mode
   renderModelAvailability();
+  renderKind();
   renderStepState();
   fillAdvanced();
   refreshTrainButton();

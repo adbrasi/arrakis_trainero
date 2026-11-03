@@ -137,6 +137,13 @@ class TestMixedRecipe(unittest.TestCase):
         only_chars = mixed_repeats(self._concepts([5, 10], 0))
         self.assertEqual([c["num_repeats"] for c in only_chars], [2, 1])
 
+    def test_small_mixed_set_scales_repeats_not_epochs(self):
+        r = krea2_recipe("mixed", 0, self._concepts([4, 4], 6), batch_size=2)
+        self.assertLessEqual(r["epochs"], 40)
+        reps = {c["name"]: c["num_repeats"] for c in r["subsets"]}
+        self.assertEqual(reps["char0"], reps["char1"])       # balance kept
+        self.assertGreater(r["est_steps"], 4000)
+
     def test_target_steps_band(self):
         self.assertEqual(mixed_target_steps(100), 5000)
         self.assertEqual(mixed_target_steps(450), 5750)
