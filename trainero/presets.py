@@ -14,6 +14,8 @@ Engines:
 
 from __future__ import annotations
 
+import math
+
 # ---------------------------------------------------------------------------
 # Engines
 # ---------------------------------------------------------------------------
@@ -65,6 +67,10 @@ CAPTION_PROFILES = {
         {"key": "anima-concept", "label": "Conceito (Anima)", "var": None},
         {"key": "anima-outfit", "label": "Outfit (Anima)", "var": "trigger_outfit"},
         {"key": "default", "label": "NSFW prosa (Flux/Qwen/Krea)", "var": None},
+        # extra_vars: optional profile variables filled from the project (the
+        # class lives in step 01 next to the trigger), never asked twice.
+        {"key": "krea2-character", "label": "Personagem (Krea 2)", "var": "character_name",
+         "extra_vars": ["character_class"]},
         {"key": "generic-character", "label": "Personagem genérico", "var": "character_name"},
         {"key": "generic-style", "label": "Estilo genérico", "var": "style_name"},
     ],
@@ -120,14 +126,19 @@ MODELS = {
         "sample_args": {"l": 5.5, "n": "blurry, low quality, jpeg artifacts, watermark, text"},
         "resolution": [1024, 1024],
         "target_steps": 2000,
+        # The plain LoRA mode resolves a recipe per kind (character / style /
+        # mixed) instead of the target_steps above — see krea2_recipe().
+        "recipes": True,
+        # mixed_batch_size: only the mixed recipe batches (hundreds of images,
+        # 5-6k steps); character and style follow the research at batch 1.
         "vram_tiers": [
-            {"min_gb": 70, "train": {}},
+            {"min_gb": 70, "train": {}, "mixed_batch_size": 4},
             # fp8 halves the 28 main blocks to ~12 GB (docs/krea2.md), leaving
             # a 32 GB card (RTX 5090) room for activations plus the ~8 GB text
             # encoder that visits at sample time — swapping blocks there only
             # costs step time. Swap starts at 24 GB cards, where fp8 alone sits
             # exactly at the limit during sampling.
-            {"min_gb": 30, "train": {"fp8_base": True, "fp8_scaled": True}},
+            {"min_gb": 30, "train": {"fp8_base": True, "fp8_scaled": True}, "mixed_batch_size": 2},
             {"min_gb": 22, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 8}},
             {"min_gb": 0, "train": {"fp8_base": True, "fp8_scaled": True, "blocks_to_swap": 20}},
         ],
@@ -532,6 +543,219 @@ def public_presets() -> dict:
             "needs_control": m.get("needs_control", False),
             "supports_control": m.get("supports_control", False),
             "supports_slider_native": m.get("supports_slider_native", False),
+            "recipes": m.get("recipes", False),
             "ltx": m.get("ltx"),
         }
     return out
+
+
+# ---------------------------------------------------------------------------
+# Krea 2 recipes (docs/PESQUISA_RECEITAS_KREA2.md)
+# ---------------------------------------------------------------------------
+# One button, no settings: the kind of LoRA plus the dataset size decide rank,
+# total steps and how the epochs are cut. Still epochs, never max steps — the
+# step target is only what repeats x epochs are chosen to land on.
+
+LORA_KINDS = ("character", "style", "mixed")
+KIND_LABELS = {"character": "personagem", "style": "estilo", "mixed": "misto"}
+
+# (images, total steps), batch 1. 3 -> 1000, 8 -> 1440, 15 -> 2100 are the
+# measured optimum on Krea 2 (imagelora); 1 and 30 extend it. Above ~2700 a
+# small character set collapses into frontal headshots, hence the cap.
+CHARACTER_STEP_ANCHORS = [(1, 1000), (3, 1000), (8, 1450), (15, 2100), (30, 2500)]
+CHARACTER_STEP_CAP = 2600
+# up to this many images (counted after expansion) a character trains at rank 16
+CHARACTER_SMALL_SET = 5
+STYLE_LARGE_SET = 300
+MIXED_LARGE_SET = 600
+# fraction of every mixed epoch spent on the style subset
+MIXED_STYLE_SHARE = 0.45
+MIXED_CHAR_INFLATE_MAX = 3
+# a character-sized dataset above this is assumed to be a style when the owner
+# never picked a kind
+AUTO_STYLE_MIN_ITEMS = 40
+CHECKPOINTS = 8
+CHECKPOINT_RANGE = (7, 10)
+STYLE_PREFIX = "style_"
+
+
+def character_target_steps(n_items: int) -> int:
+    n = max(1, int(n_items))
+    pts = CHARACTER_STEP_ANCHORS
+    if n <= pts[0][0]:
+        return pts[0][1]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if n <= x1:
+            return min(CHARACTER_STEP_CAP, round(y0 + (y1 - y0) * (n - x0) / (x1 - x0)))
+    (x0, y0), (x1, y1) = pts[-2], pts[-1]
+    return min(CHARACTER_STEP_CAP, round(y1 + (y1 - y0) / (x1 - x0) * (n - x1)))
+
+
+def style_target_steps(n_items: int) -> int:
+    return clamp(1500 + 12 * max(1, int(n_items)), 2000, 4000)
+
+
+def mixed_target_steps(n_items: int) -> int:
+    return clamp(3500 + 5 * max(1, int(n_items)), 5000, 6000)
+
+
+def suggest_kind(n_items: int, n_concepts: int = 0) -> str:
+    """The kind used until the owner picks one: concept folders mean mixed,
+    a big flat folder is a style, anything else is a character."""
+    if n_concepts:
+        return "mixed"
+    return "style" if n_items > AUTO_STYLE_MIN_ITEMS else "character"
+
+
+def _cut_epochs(steps_per_epoch: int, target: int, cap: int | None = None) -> tuple[int, int]:
+    """(epochs, save_every) whose total lands nearest `target` with 7-10 saves.
+
+    Fewer epochs win a tie: every epoch renders a sample, which costs time and
+    buys nothing once the checkpoints are already spread evenly.
+    """
+    spe = max(1, steps_per_epoch)
+    best = None
+    for save_every in range(1, 41):
+        for ckpts in range(CHECKPOINT_RANGE[0], CHECKPOINT_RANGE[1] + 1):
+            epochs = save_every * ckpts
+            total = epochs * spe
+            if cap and total > cap:
+                continue
+            key = (round(abs(total - target) / target + 0.01 * abs(ckpts - CHECKPOINTS), 4), epochs)
+            if best is None or key < best[0]:
+                best = (key, epochs, save_every)
+    if best is not None and best[0][0] < 0.25:
+        return best[1], best[2]
+    # one epoch is already a big slice of the target (huge dataset): as many
+    # epochs as fit, saving each
+    epochs = max(1, round(target / spe))
+    if cap:
+        epochs = max(1, min(epochs, cap // spe))
+    return epochs, max(1, round(epochs / CHECKPOINTS))
+
+
+def _single_subset_schedule(n: int, target: int, batch_size: int,
+                            cap: int | None = None) -> dict:
+    """repeats + epochs for one folder, searched jointly so the total lands on
+    the target instead of wherever a rounded repeat count leaves it."""
+    best = None
+    for repeats in range(1, 201):
+        spe = math.ceil(n * repeats / batch_size)
+        if spe * CHECKPOINT_RANGE[0] > target * 1.25:
+            break
+        epochs, save_every = _cut_epochs(spe, target, cap)
+        total = spe * epochs
+        if cap and total > cap:
+            continue
+        ckpts = epochs // save_every
+        key = (round(abs(total - target) / target + 0.01 * abs(ckpts - CHECKPOINTS), 4),
+               epochs, repeats)
+        if best is None or key < best[0]:
+            best = (key, repeats, epochs, save_every, total)
+    if best is None:  # even one repeat overshoots: one pass per epoch
+        epochs, save_every = _cut_epochs(math.ceil(n / batch_size), target, cap)
+        return {"num_repeats": 1, "epochs": epochs, "save_every_n_epochs": save_every,
+                "est_steps": math.ceil(n / batch_size) * epochs}
+    _, repeats, epochs, save_every, total = best
+    return {"num_repeats": repeats, "epochs": epochs, "save_every_n_epochs": save_every,
+            "est_steps": total}
+
+
+def mixed_repeats(concepts: list[dict], style_share: float = MIXED_STYLE_SHARE) -> list[dict]:
+    """num_repeats per concept folder.
+
+    Every character gets the same exposure per epoch (as many samples as the
+    largest character folder) and the style folders together take
+    `style_share` of the epoch. When the style pool is so big that one pass of
+    it already exceeds that share, the characters are raised to make room — but
+    at most MIXED_CHAR_INFLATE_MAX times, because past that a 10-image
+    character would be shown hundreds of times per image, far beyond what its
+    own character recipe allows. The style then simply ends up above its share.
+    """
+    chars = [c for c in concepts if not c.get("style") and c["items"] > 0]
+    styles = [c for c in concepts if c.get("style") and c["items"] > 0]
+    style_items = sum(c["items"] for c in styles)
+    out = []
+    char_samples = 0
+    if chars:
+        per_char = max(c["items"] for c in chars)
+        if styles:
+            room = style_items * (1 - style_share) / (style_share * len(chars))
+            per_char = max(per_char, min(room, per_char * MIXED_CHAR_INFLATE_MAX))
+        for c in chars:
+            r = max(1, round(per_char / c["items"]))
+            char_samples += r * c["items"]
+            out.append({**c, "num_repeats": r})
+    if styles:
+        if chars:
+            wanted = char_samples * style_share / (1 - style_share)
+            r = max(1, round(wanted / style_items))
+        else:
+            r = 1
+        out += [{**c, "num_repeats": r} for c in styles]
+    return out
+
+
+def krea2_recipe(kind: str, n_items: int, concepts: list[dict] | None = None,
+                 batch_size: int = 1) -> dict:
+    """Resolved Krea 2 recipe: rank, schedule and the numbers the UI shows.
+
+    `concepts` (mixed only): [{"name", "items", "style": bool}, ...], one per
+    dataset subfolder. `n_items` is the whole dataset, generated images included.
+    """
+    if kind not in LORA_KINDS:
+        raise ValueError(f"tipo de LoRA desconhecido: {kind!r}")
+    n = max(1, int(n_items))
+    recipe: dict = {"kind": kind, "items": n}
+    if kind == "character":
+        dim = 16 if n <= CHARACTER_SMALL_SET else 32
+        target = character_target_steps(n)
+        batch_size = 1
+        recipe.update(_single_subset_schedule(n, target, batch_size, cap=CHARACTER_STEP_CAP))
+    elif kind == "style":
+        dim = 64 if n > STYLE_LARGE_SET else 32
+        target = style_target_steps(n)
+        batch_size = 1
+        recipe.update(_single_subset_schedule(n, target, batch_size))
+    else:
+        if not concepts:
+            raise ValueError("o modo misto precisa de subpastas (uma por personagem/estilo)")
+        subsets = mixed_repeats(concepts)
+        n = sum(c["items"] for c in subsets)
+        recipe["items"] = n
+        dim = 64 if n > MIXED_LARGE_SET else 32
+        target = mixed_target_steps(n)
+        samples = sum(c["items"] * c["num_repeats"] for c in subsets)
+        spe = math.ceil(samples / max(1, batch_size))
+        epochs, save_every = _cut_epochs(spe, target)
+        style_samples = sum(c["items"] * c["num_repeats"] for c in subsets if c.get("style"))
+        recipe.update({
+            "num_repeats": 1, "epochs": epochs, "save_every_n_epochs": save_every,
+            "est_steps": spe * epochs, "subsets": subsets,
+            "style_share": round(style_samples / samples, 3) if samples else 0.0,
+            "characters": sum(1 for c in subsets if not c.get("style")),
+        })
+    recipe.update({
+        "network_dim": dim, "network_alpha": dim, "target_steps": target,
+        "batch_size": max(1, batch_size),
+        "checkpoints": recipe["epochs"] // recipe["save_every_n_epochs"],
+    })
+    recipe["line"] = recipe_line(recipe)
+    return recipe
+
+
+def recipe_line(recipe: dict) -> str:
+    bits = [f"Receita: {KIND_LABELS[recipe['kind']]}", f"{recipe['items']} imgs"]
+    if recipe["kind"] == "mixed":
+        bits.append(f"{recipe['characters']} personagens + estilo "
+                    f"{round(100 * recipe['style_share'])}%")
+    bits.append(f"dim {recipe['network_dim']}")
+    steps = f"~{recipe['est_steps']} steps"
+    if recipe.get("batch_size", 1) > 1:
+        steps += f" (batch {recipe['batch_size']})"
+    bits += [steps, f"{recipe['checkpoints']} checkpoints"]
+    return " · ".join(bits)
+
+
+def recipe_schedule(recipe: dict) -> dict:
+    return {k: recipe[k] for k in ("num_repeats", "epochs", "save_every_n_epochs")}

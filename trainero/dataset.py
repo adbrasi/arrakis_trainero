@@ -242,13 +242,64 @@ def _descend_wrapper(root: Path) -> Path:
     return cur
 
 
-def normalize_into(staging: Path, dataset_dir: Path, job: Job) -> None:
-    src = _descend_wrapper(staging)
+def _has_media(directory: Path) -> bool:
+    return any(f.is_file() and f.suffix.lower() in (IMAGE_EXTS | VIDEO_EXTS)
+               for f in directory.iterdir())
+
+
+def _descend_to_concepts(root: Path) -> Path:
+    """Like _descend_wrapper, but stops at a folder whose single child is itself
+    a concept (has media directly): `wrapper/makima/*.png` keeps `makima`."""
+    cur = root
+    for _ in range(8):
+        entries = [p for p in cur.iterdir() if not p.name.startswith(".")]
+        dirs = [p for p in entries if p.is_dir()]
+        files = [p for p in entries if p.is_file() and archive_ext(p.name) is None
+                 and not p.name.endswith(".extracted")]
+        if len(dirs) == 1 and not files and not _has_media(dirs[0]):
+            cur = dirs[0]
+        else:
+            break
+    return cur
+
+
+def concept_dir_name(name: str) -> str:
+    """A folder name safe to keep: no separators, no leading dot/underscore."""
+    clean = re.sub(r"[/\\\x00]+", "_", name).strip().lstrip("._")
+    return clean or "conceito"
+
+
+def normalize_into(staging: Path, dataset_dir: Path, job: Job,
+                   keep_concepts: bool = False) -> None:
+    """Flatten the source into dataset_dir.
+
+    keep_concepts (the Krea 2 mixed kind): every top-level folder of the source
+    is one concept (a character, or a style when its name starts with
+    `style_`) and survives as dataset/<folder>/, flattened inside. Media at the
+    top level still lands in dataset/ itself.
+    """
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    if not keep_concepts:
+        moved = _flatten(_descend_wrapper(staging), dataset_dir)
+    else:
+        src = _descend_to_concepts(staging)
+        moved = 0
+        for sub in sorted(p for p in src.iterdir() if p.is_dir()):
+            if sub.name.startswith((".", "_")) or sub.name.lower() == "control":
+                continue
+            moved += _flatten(sub, dataset_dir / concept_dir_name(sub.name))
+        moved += _flatten(src, dataset_dir, recursive=False)
+    job.log(f"✔ {moved} arquivos de mídia importados.")
+    if moved == 0:
+        raise JobFailed("nenhuma imagem/vídeo encontrado na fonte")
+
+
+def _flatten(src: Path, dataset_dir: Path, recursive: bool = True) -> int:
     dataset_dir.mkdir(parents=True, exist_ok=True)
     control_dir = dataset_dir / "control"
     moved = 0
     media_exts = IMAGE_EXTS | VIDEO_EXTS
-    for f in sorted(src.rglob("*")):
+    for f in sorted(src.rglob("*") if recursive else src.iterdir()):
         if not f.is_file():
             continue
         ext = f.suffix.lower()
@@ -277,9 +328,7 @@ def normalize_into(staging: Path, dataset_dir: Path, job: Job) -> None:
                     if not dest.exists():
                         shutil.move(str(f), str(dest))
                     break
-    job.log(f"✔ {moved} arquivos de mídia importados.")
-    if moved == 0:
-        raise JobFailed("nenhuma imagem/vídeo encontrado na fonte")
+    return moved
 
 
 # ---------------------------------------------------------------------------
@@ -414,3 +463,56 @@ def inspect(dataset_dir: Path) -> dict:
         "missing_sample": missing[:8],
         "control_images": control,
     }
+
+
+# ---------------------------------------------------------------------------
+# Concept folders (Krea 2 mixed kind)
+# ---------------------------------------------------------------------------
+# dataset/<trigger>/            a character; its folder name is its trigger
+# dataset/<trigger>__<class>/   the same, with the class the captions use
+# dataset/style_<trigger>/      a style subset (or any folder the owner marks)
+
+STYLE_PREFIX = "style_"
+CLASS_SEPARATOR = "__"
+#: folders inside dataset/ that are never concepts
+NOT_CONCEPTS = {"control"}
+
+
+def parse_concept(name: str, style_marked: bool = False) -> dict:
+    style = style_marked or name.lower().startswith(STYLE_PREFIX)
+    base = name[len(STYLE_PREFIX):] if name.lower().startswith(STYLE_PREFIX) else name
+    trigger, _, char_class = base.partition(CLASS_SEPARATOR)
+    return {"name": name, "trigger": trigger.strip() or name, "style": style,
+            "character_class": "" if style else char_class.replace("_", " ").strip()}
+
+
+def concept_dirs(dataset_dir: Path) -> list[Path]:
+    try:
+        return sorted(d for d in Path(dataset_dir).iterdir()
+                      if d.is_dir() and not d.name.startswith((".", "_"))
+                      and d.name.lower() not in NOT_CONCEPTS)
+    except OSError:
+        return []
+
+
+def concepts(dataset_dir: Path, style_folders=()) -> list[dict]:
+    """One entry per concept subfolder that holds media, with its own stats."""
+    marked = set(style_folders or ())
+    out = []
+    for d in concept_dirs(dataset_dir):
+        stats = inspect(d)
+        if not stats["items"]:
+            continue
+        out.append({**parse_concept(d.name, d.name in marked),
+                    "items": stats["items"], "captions": stats["captions"],
+                    "missing_captions": stats["missing_captions"],
+                    "missing_sample": stats["missing_sample"]})
+    return out
+
+
+def all_captions_map(dataset_dir: Path) -> dict[str, str]:
+    """captions_map of dataset/ plus every concept folder as `concept/name`."""
+    out = captions_map(dataset_dir)
+    for d in concept_dirs(dataset_dir):
+        out.update({f"{d.name}/{k}": v for k, v in captions_map(d).items()})
+    return out

@@ -27,10 +27,11 @@ from .engines import (engine_dir, ensure_engine, supports_sampling, venv_bin,
 from .hf_upload import UploadWatcher, create_repo, hf_username, upload_run_files
 from .jobs import Job, JobFailed
 from .models_download import ensure_models, resolve
-from .presets import (CONTROL_RESOLUTION, LORAPLUS_RATIO, MODELS, NETWORK_MODULES,
-                      SAMPLE_GUIDANCE, SAMPLE_PROMPT, SAMPLE_SEED, SAMPLE_STEPS,
-                      STYLE_RUSH_SCHEDULE, net_types_for, sample_resolution,
-                      style_rush_models, suggest_schedule, vram_tier)
+from .presets import (CONTROL_RESOLUTION, LORA_KINDS, LORAPLUS_RATIO, MODELS,
+                      NETWORK_MODULES, SAMPLE_GUIDANCE, SAMPLE_PROMPT, SAMPLE_SEED,
+                      SAMPLE_STEPS, STYLE_RUSH_SCHEDULE, krea2_recipe, net_types_for,
+                      recipe_schedule, sample_resolution, style_rush_models,
+                      suggest_kind, suggest_schedule, vram_tier)
 
 
 def slugify(name: str) -> str:
@@ -209,8 +210,12 @@ def write_sample_prompts(path: Path, prompt_text: str, trigger: str,
 def build_train_config(model_key: str, overrides: dict, schedule: dict, stats: dict,
                        vram_gb: float, dataset_toml: Path, output_dir: Path,
                        output_name: str, batch_size: int,
-                       sample_prompts: Path | None = None) -> dict:
-    """Resolved flat dict of training args (musubi/sd-scripts arg names)."""
+                       sample_prompts: Path | None = None,
+                       recipe: dict | None = None) -> dict:
+    """Resolved flat dict of training args (musubi/sd-scripts arg names).
+
+    Precedence: preset < VRAM tier < recipe (Krea 2) < the owner's overrides.
+    """
     model = MODELS[model_key]
     tier = vram_tier(model_key, vram_gb)
     cfg: dict = {}
@@ -220,6 +225,9 @@ def build_train_config(model_key: str, overrides: dict, schedule: dict, stats: d
     cfg.update(model.get("extra_args", {}))
     cfg.update(model["train"])
     cfg.update(tier.get("train", {}))
+    if recipe:
+        cfg["network_dim"] = recipe["network_dim"]
+        cfg["network_alpha"] = recipe["network_alpha"]
 
     net_type = overrides.get("net_type", "lora")
     if net_type not in net_types_for(model_key):
@@ -265,7 +273,7 @@ def build_train_config(model_key: str, overrides: dict, schedule: dict, stats: d
     })
     if sample_prompts is not None:
         cfg["sample_prompts"] = str(sample_prompts)
-        cfg["sample_every_n_epochs"] = 1
+        cfg["sample_every_n_epochs"] = schedule.get("sample_every_n_epochs", 1)
         cfg["sample_at_first"] = True
     if model["engine"] == "sd-scripts":
         cfg["attn_mode"] = "torch"
@@ -728,6 +736,44 @@ def run_style_rush_training(job: Job, params: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Krea 2 recipes
+# ---------------------------------------------------------------------------
+
+
+def resolve_kind(choice: str | None, n_items: int, n_concepts: int) -> str:
+    """The owner's pick when there is one, else the guess from the dataset."""
+    return choice if choice in LORA_KINDS else suggest_kind(n_items, n_concepts)
+
+
+def mixed_batch_size(model_key: str, vram_gb: float) -> int:
+    return int(vram_tier(model_key, vram_gb).get("mixed_batch_size", 1))
+
+
+def dataset_recipe(model_key: str, dataset_dir: Path, vram_gb: float,
+                   kind_choice: str | None = None, style_folders=()) -> dict | None:
+    """The recipe this dataset would train with, or None for models without
+    recipes. Raises ValueError when the dataset cannot serve the kind."""
+    if not MODELS[model_key].get("recipes"):
+        return None
+    stats = ds.inspect(dataset_dir)
+    concept_list = ds.concepts(dataset_dir, style_folders)
+    kind = resolve_kind(kind_choice, stats["items"], len(concept_list))
+    if kind == "mixed":
+        if not concept_list:
+            raise ValueError("o modo Misto precisa de uma subpasta por personagem/estilo "
+                             "(importe um .zip com dataset/<trigger>/ e dataset/style_<trigger>/)")
+        if stats["items"]:
+            raise ValueError(f"no modo Misto toda imagem fica numa subpasta — "
+                             f"{stats['items']} estão soltas em dataset/")
+        return krea2_recipe("mixed", 0, concept_list, mixed_batch_size(model_key, vram_gb))
+    if not stats["items"]:
+        if concept_list:
+            raise ValueError("o dataset está organizado em subpastas — escolha o tipo Misto")
+        raise ValueError("importe o dataset antes de treinar")
+    return krea2_recipe(kind, stats["items"])
+
+
+# ---------------------------------------------------------------------------
 # Full pipeline
 # ---------------------------------------------------------------------------
 
@@ -758,12 +804,25 @@ def run_training(job: Job, params: dict) -> None:
         return run_style_rush_training(job, params)
 
     stats = ds.inspect(dataset_dir)
-    if stats["items"] == 0:
-        raise JobFailed("importe o dataset antes de treinar")
-    if stats["missing_captions"] > 0:
-        raise JobFailed(
-            f"{stats['missing_captions']} itens sem caption — gere as captions primeiro "
-            f"(ex.: {', '.join(stats['missing_sample'][:3])})")
+    style_folders = params.get("style_folders") or ()
+    concept_list = ds.concepts(dataset_dir, style_folders) if model.get("recipes") else []
+    kind = resolve_kind(params.get("lora_kind"), stats["items"], len(concept_list)) \
+        if model.get("recipes") else None
+    if kind == "mixed":
+        missing = [(c["name"], c["missing_captions"], c["missing_sample"])
+                   for c in concept_list if c["missing_captions"]]
+        if missing:
+            name, count, sample = missing[0]
+            raise JobFailed(f"{sum(m[1] for m in missing)} itens sem caption — gere as "
+                            f"captions primeiro (ex.: {name}/{sample[0]})")
+    else:
+        if stats["items"] == 0:
+            raise JobFailed("o dataset está organizado em subpastas — escolha o tipo Misto"
+                            if concept_list else "importe o dataset antes de treinar")
+        if stats["missing_captions"] > 0:
+            raise JobFailed(
+                f"{stats['missing_captions']} itens sem caption — gere as captions primeiro "
+                f"(ex.: {', '.join(stats['missing_sample'][:3])})")
     if model.get("needs_control") and stats["control_images"] == 0:
         raise JobFailed("Qwen Image Edit precisa de imagens de controle em dataset/control/")
     if model["media"] == "video" and stats["videos"] == 0 and stats["images"] == 0:
@@ -789,12 +848,30 @@ def run_training(job: Job, params: dict) -> None:
     job.end_phase("Modelos base")
 
     job.start_phase("Configuração")
-    schedule = suggest_schedule(model_key, stats["items"])
-    for key in ("epochs", "num_repeats", "save_every_n_epochs"):
-        if overrides.get(key):
-            schedule[key] = int(overrides[key])
+    recipe = None
     tier = vram_tier(model_key, vram_gb)
     batch_size = tier.get("batch_size", 1)
+    if kind:
+        try:
+            recipe = dataset_recipe(model_key, dataset_dir, vram_gb, kind, style_folders)
+        except ValueError as exc:
+            raise JobFailed(str(exc))
+        schedule = recipe_schedule(recipe)
+        batch_size = recipe["batch_size"]
+        job.extra["recipe"] = recipe
+        job.log(recipe["line"])
+    else:
+        schedule = suggest_schedule(model_key, stats["items"])
+    for key in ("epochs", "num_repeats", "save_every_n_epochs"):
+        if overrides.get(key):
+            if key == "num_repeats" and kind == "mixed":
+                job.log("Repeats manual ignorado no modo Misto — cada subpasta tem o seu.")
+                continue
+            schedule[key] = int(overrides[key])
+    if recipe:
+        # a sample per checkpoint, not per epoch: the mixed recipe can run 40
+        # short epochs, and each sample costs the time of a few dozen steps
+        schedule["sample_every_n_epochs"] = schedule["save_every_n_epochs"]
     ltx_cfg = dict(model.get("ltx") or {})
     if overrides.get("ltx_resolution"):
         ltx_cfg["resolution"] = overrides["ltx_resolution"]
@@ -817,7 +894,17 @@ def run_training(job: Job, params: dict) -> None:
         # never passes through the screen that asks for a trigger, so this is the
         # normal case, not the edge one.
         prompt_text = overrides.get("sample_prompt")
-        if not prompt_text and not trigger.strip():
+        sample_trigger = trigger
+        if kind == "mixed":
+            # each concept has its own trigger, already written in its captions:
+            # a caption of the first character is a prompt inside the run
+            chars = [c for c in recipe["subsets"] if not c.get("style")] or recipe["subsets"]
+            sample_trigger = ""
+            if not prompt_text:
+                prompt_text = ds.sample_caption(dataset_dir / chars[0]["name"])
+                job.log(f"Sample do modo Misto com uma caption de {chars[0]['name']}: "
+                        f"{prompt_text[:80]}")
+        elif not prompt_text and not trigger.strip():
             prompt_text = ds.sample_caption(dataset_dir)
             if prompt_text:
                 job.log(f"Sem trigger word — o sample usa uma caption do dataset: "
@@ -825,13 +912,22 @@ def run_training(job: Job, params: dict) -> None:
         sample_path = write_sample_prompts(
             pdir / "sample_prompts.txt",
             prompt_text or SAMPLE_PROMPT,
-            trigger, resolution, frames, extra=model.get("sample_args"))
+            sample_trigger, resolution, frames, extra=model.get("sample_args"))
         job.log(f"Samples a cada época: {sample_path}")
     elif overrides.get("sampling", True):
         job.log(f"⚠ engine {engine} não tem --sample_prompts — sampling desligado.")
 
     subsets = []
-    if stats.get("images"):
+    train_stats = stats
+    if kind == "mixed":
+        for c in recipe["subsets"]:
+            subsets.append(image_subset(dataset_dir / c["name"],
+                                        pdir / "cache" / "concepts" / c["name"],
+                                        c["num_repeats"]))
+        # one "item" per sample seen in an epoch, so the warmup estimate holds
+        train_stats = {"items": sum(c["items"] * c["num_repeats"] for c in recipe["subsets"])}
+        schedule["num_repeats"] = 1
+    elif stats.get("images"):
         subsets.append(image_subset(
             dataset_dir, pdir / "cache" / "images", schedule["num_repeats"],
             control_dir=(dataset_dir / "control") if model.get("needs_control") else None,
@@ -841,9 +937,9 @@ def run_training(job: Job, params: dict) -> None:
                                     schedule["num_repeats"]))
     dataset_toml = write_dataset_toml(model_key, pdir / "dataset.toml", subsets,
                                       resolution, batch_size, ltx_cfg)
-    cfg = build_train_config(model_key, overrides, schedule, stats, vram_gb,
+    cfg = build_train_config(model_key, overrides, schedule, train_stats, vram_gb,
                              dataset_toml, output_dir, slug, batch_size,
-                             sample_prompts=sample_path)
+                             sample_prompts=sample_path, recipe=recipe)
     job.extra["schedule"] = schedule
     job.extra["config_summary"] = {
         "network_module": cfg.get("network_module"),
@@ -852,6 +948,11 @@ def run_training(job: Job, params: dict) -> None:
         "epochs": schedule["epochs"], "batch_size": batch_size,
         "fp8": bool(cfg.get("fp8_base")), "blocks_to_swap": cfg.get("blocks_to_swap", 0),
     }
+    if recipe:
+        job.extra["config_summary"]["kind"] = kind
+        job.extra["config_summary"]["est_steps"] = (
+            math.ceil(train_stats["items"] * schedule["num_repeats"] / batch_size)
+            * schedule["epochs"])
     job.log(f"Config: {json.dumps(job.extra['config_summary'], ensure_ascii=False)}")
     job.end_phase("Configuração")
 
@@ -872,8 +973,9 @@ def run_training(job: Job, params: dict) -> None:
             "project": project, "model": model_key, "model_label": model["label"],
             "base_model": model.get("base_model", ""),
             "mode": mode, "trigger": trigger, "schedule": schedule, "dataset": stats,
+            "lora_kind": kind, "recipe": recipe,
             "config": {k: v for k, v in cfg.items() if isinstance(v, (str, int, float, bool))},
-        }, captions=ds.captions_map(dataset_dir))
+        }, captions=ds.all_captions_map(dataset_dir))
         convert = comfy_converter(model_key, job)
         watcher = UploadWatcher(repo_id, output_dir, job, convert=convert)
         watcher.start()
