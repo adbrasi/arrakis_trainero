@@ -65,7 +65,7 @@ def archive_ext(name: str) -> str | None:
 # Import
 # ---------------------------------------------------------------------------
 
-def import_source(source: str, dataset_dir: Path, job: Job) -> None:
+def import_source(source: str, dataset_dir: Path, job: Job, keep_concepts: bool = False) -> None:
     kind = detect_source(source)
     job.log(f"Fonte detectada: {kind}")
     staging = dataset_dir.parent / "_staging"
@@ -92,7 +92,7 @@ def import_source(source: str, dataset_dir: Path, job: Job) -> None:
         _http(source.strip(), staging, job)
 
     _resolve_archives(staging, job)
-    normalize_into(staging, dataset_dir, job)
+    normalize_into(staging, dataset_dir, job, keep_concepts=keep_concepts)
     shutil.rmtree(staging, ignore_errors=True)
 
 

@@ -301,3 +301,45 @@ def generate_captions(dataset_dir, media: str, profile: str, prompt_vars: dict[s
         quarantine_uncaptionable(dataset_dir, missing, job)
 
     job.log("✔ Captions geradas.")
+
+
+# ---------------------------------------------------------------------------
+# Profiles per LoRA kind (Krea 2)
+# ---------------------------------------------------------------------------
+# character -> describes everything that varies, never the permanent identity
+#              traits (those are what the trigger has to absorb)
+# style     -> describes the content, never the style (same reason)
+
+KIND_PROFILES = {"character": "krea2-character", "style": "generic-style"}
+
+
+def profile_var(profile: str) -> str | None:
+    """The trigger variable a data_araknideo image profile asks for."""
+    from .presets import CAPTION_PROFILES
+
+    for entry in CAPTION_PROFILES["image"]:
+        if entry["key"] == profile:
+            return entry.get("var")
+    return None
+
+
+def concept_caption_plan(dataset_dir, style_folders=(), redo: bool = False) -> list[dict]:
+    """One caption pass per concept folder of a mixed dataset.
+
+    Each folder is captioned with its own trigger (the folder name) and the
+    profile of its kind, so a character's captions never name the style
+    trigger and vice versa. Folders already fully captioned are skipped unless
+    `redo`.
+    """
+    dataset_dir = Path(dataset_dir)
+    plan = []
+    for c in ds.concepts(dataset_dir, style_folders):
+        if not redo and not c["missing_captions"]:
+            continue
+        profile = KIND_PROFILES["style" if c["style"] else "character"]
+        prompt_vars = {profile_var(profile): c["trigger"]}
+        if not c["style"] and c["character_class"]:
+            prompt_vars["character_class"] = c["character_class"]
+        plan.append({"dir": dataset_dir / c["name"], "name": c["name"],
+                     "profile": profile, "vars": prompt_vars})
+    return plan

@@ -24,15 +24,18 @@ from trainero import jobs
 from trainero import style_rush as sr
 from trainero import project as pj
 from trainero.jobs import JobFailed
-from trainero.captioner import clear_captions, generate_captions
+from trainero import expand as ex
+from trainero.captioner import (clear_captions, concept_caption_plan,
+                                generate_captions)
 from trainero.config import (IMAGE_EXTS, VIDEO_EXTS, WEB_PORT, ensure_dirs,
                              gpu_info, hf_token, load_state, save_state,
                              update_state)
 from trainero.engines import is_installed
-from trainero.presets import (CAPTION_PROFILES, MODEL_ORDER, MODELS,
-                              STYLE_RUSH_SCHEDULE, public_presets,
-                              style_rush_models, suggest_schedule)
-from trainero.training import project_dir, run_training, slugify
+from trainero.presets import (CAPTION_PROFILES, KIND_LABELS, LORA_KINDS, MODEL_ORDER,
+                              MODELS, STYLE_RUSH_SCHEDULE, public_presets,
+                              recipe_schedule, style_rush_models, suggest_schedule)
+from trainero.training import (dataset_recipe, project_dir, resolve_kind, run_training,
+                               slugify)
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 
@@ -102,13 +105,28 @@ THUMB_EDGE = 220
 
 
 def dataset_thumbs(directory: Path, limit: int = THUMB_LIMIT) -> tuple[list[str], int]:
-    """The first `limit` image names in a dataset, plus how many there are."""
+    """The first `limit` image names in a dataset, plus how many there are.
+
+    Images inside concept folders (the Krea 2 mixed kind) come as
+    `<concept>/<name>`, after the loose ones."""
     try:
         names = sorted(p.name for p in directory.iterdir()
                        if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
     except OSError:
         return [], 0
+    for sub in ds.concept_dirs(directory):
+        names += sorted(f"{sub.name}/{p.name}" for p in sub.iterdir()
+                        if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
     return names[:limit], len(names)
+
+
+def safe_thumb_name(name: str) -> bool:
+    """A basename, or one concept folder plus a basename. No traversal."""
+    parts = name.split("/") if name else []
+    if not 1 <= len(parts) <= 2 or "\x00" in name:
+        return False
+    return all(part and part == Path(part).name and part not in (".", "..")
+               and not part.startswith(".") for part in parts)
 
 
 def render_thumb(path: Path, edge: int = THUMB_EDGE) -> bytes:
@@ -232,7 +250,7 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def _serve_thumb(self, side: str, name: str):
-        if not name or "\x00" in name or name != Path(name).name or ".." in name:
+        if not safe_thumb_name(name):
             return self._error("nome inválido")
         path = dataset_dir(side) / name
         if path.suffix.lower() not in IMAGE_EXTS:
@@ -289,7 +307,38 @@ class Handler(SimpleHTTPRequestHandler):
         }
         if project and stats.get("items"):
             payload["schedules"] = {key: suggest_schedule(key, stats["items"]) for key in MODEL_ORDER}
+        if project:
+            payload.update(self._kind_status(meta, stats))
+            # Krea 2 trains on its recipe, not on suggest_schedule: the panel
+            # has to show the numbers that will actually run
+            if "krea2_schedule" in payload:
+                payload.setdefault("schedules", {})["krea2"] = payload.pop("krea2_schedule")
         self._json(payload)
+
+    def _kind_status(self, meta: dict, stats: dict) -> dict:
+        """What the Krea 2 recipe would do with this dataset right now."""
+        style_folders = meta.get("style_folders") or []
+        concepts = ds.concepts(dataset_dir("pos"), style_folders)
+        choice = meta.get("lora_kind") or ""
+        out = {
+            "lora_kind": choice,
+            "kind": resolve_kind(choice, stats.get("items", 0), len(concepts)),
+            "character_class": meta.get("character_class", ""),
+            "style_folders": style_folders,
+            "concepts": concepts,
+            "expand_refs": len(ex.reference_images(dataset_dir("pos"))),
+            "expand_generated": len(ex.generated_images(dataset_dir("pos"))),
+        }
+        if stats.get("items") or concepts:
+            vram_gb = (gpu_info().get("vram_mb") or 24576) / 1024
+            try:
+                recipe = dataset_recipe("krea2", dataset_dir("pos"), vram_gb, choice, style_folders)
+            except ValueError as exc:
+                out["recipe"] = {"error": str(exc)}
+            else:
+                out["recipe"] = recipe
+                out["krea2_schedule"] = recipe_schedule(recipe)
+        return out
 
     def _presets(self):
         self._json({
@@ -300,6 +349,9 @@ class Handler(SimpleHTTPRequestHandler):
             # in the panel would promise a run that is not the one that happens
             "style_rush_schedule": STYLE_RUSH_SCHEDULE,
             "default_convert_target": sr.DEFAULT_CONVERT_TARGET,
+            "lora_kinds": {k: KIND_LABELS[k] for k in LORA_KINDS},
+            "expand": {"default_target": ex.DEFAULT_TARGET, "image_model": ex.IMAGE_MODEL,
+                       "judge_model": ex.JUDGE_MODEL},
         })
 
     # -- POST --------------------------------------------------------------
@@ -319,6 +371,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._clear_dataset(query)
             if url.path == "/api/captions":
                 return self._captions()
+            if url.path == "/api/expand":
+                return self._expand()
             if url.path == "/api/train":
                 return self._train()
             if url.path == "/api/cancel":
@@ -345,6 +399,17 @@ class Handler(SimpleHTTPRequestHandler):
         # it until it has read the stored value, so a fast typist cannot wipe it
         if "trigger" in body and not pj.trigger_locked(pdir):
             fields["trigger"] = (body.get("trigger") or "").strip()
+        # same rule as the trigger: only what the client actually sent
+        if "lora_kind" in body:
+            kind = body.get("lora_kind") or ""
+            if kind and kind not in LORA_KINDS:
+                return self._error(f"tipo de LoRA inválido: {kind}")
+            fields["lora_kind"] = kind
+        if "character_class" in body:
+            fields["character_class"] = (body.get("character_class") or "").strip()
+        if "style_folders" in body:
+            fields["style_folders"] = [str(n) for n in (body.get("style_folders") or [])
+                                       if isinstance(n, str)]
         pj.save_meta(pdir, **fields)
         self._json({"ok": True, "slug": slugify(name),
                     "trigger": pj.load_meta(pdir).get("trigger", "")})
@@ -405,8 +470,9 @@ class Handler(SimpleHTTPRequestHandler):
         side = query.get("side", "pos")
         target = dataset_dir(side)
         pdir = project_dir(project)
+        keep = side == "pos" and current_meta().get("lora_kind") == "mixed"
         job = jobs.start("import", f"Importando dataset ({side})", pdir / "logs" / "import.log",
-                         lambda j: ds.import_source(source, target, j))
+                         lambda j: ds.import_source(source, target, j, keep_concepts=keep))
         self._json({"ok": True, "job": job.kind}, 202)
 
     def _upload_file(self, query):
@@ -458,7 +524,9 @@ class Handler(SimpleHTTPRequestHandler):
                 try:
                     sync = jobs.SyncJob()
                     ds.extract_archive(dest, staging / "src", sync)
-                    ds.normalize_into(staging, target_root, sync)
+                    ds.normalize_into(staging, target_root, sync, keep_concepts=(
+                        side == "pos" and sub != "control"
+                        and current_meta().get("lora_kind") == "mixed"))
                 except (JobFailed, OSError) as exc:
                     return self._error(f"extração de {name} falhou: {exc}")
                 finally:
@@ -492,12 +560,37 @@ class Handler(SimpleHTTPRequestHandler):
         side = body.get("side", "pos")
         redo = bool(body.get("redo"))
         media = "video" if ds.inspect(dataset_dir(side)).get("videos") else "image"
+        pdir = project_dir(project)
+        target = dataset_dir(side)
+        meta = current_meta()
+        if body.get("kind") == "mixed" and side == "pos":
+            plan = concept_caption_plan(target, meta.get("style_folders") or [], redo)
+            if not plan:
+                return self._error("nenhuma subpasta precisa de caption")
+
+            def run_mixed(j):
+                for step in plan:
+                    j.check_cancel()
+                    j.log(f"— {step['name']}: perfil {step['profile']}, "
+                          f"{', '.join(f'{k}={v}' for k, v in step['vars'].items())}")
+                    if redo:
+                        clear_captions(step["dir"], j)
+                    generate_captions(step["dir"], "image", step["profile"], step["vars"],
+                                      j, mode="lora")
+
+            job = jobs.start("captions", "Gerando captions por subpasta",
+                             pdir / "logs" / "captions.log", run_mixed)
+            return self._json({"ok": True, "job": job.kind, "folders": len(plan)}, 202)
+
         prompt_vars = {}
         var = body.get("var_name")
         if var and body.get("trigger"):
             prompt_vars[var] = body["trigger"]
-        pdir = project_dir(project)
-        target = dataset_dir(side)
+        entry = next((e for e in CAPTION_PROFILES.get(media, []) if e["key"] == profile), {})
+        if "character_class" in entry.get("extra_vars", []):
+            char_class = (body.get("character_class") or meta.get("character_class") or "").strip()
+            if char_class:
+                prompt_vars["character_class"] = char_class
 
         def run(j):
             # Deleting the .txt is not enough on its own: the tagger skips
@@ -509,6 +602,34 @@ class Handler(SimpleHTTPRequestHandler):
 
         job = jobs.start("captions", "Gerando captions com LLM",
                          pdir / "logs" / "captions.log", run)
+        self._json({"ok": True, "job": job.kind}, 202)
+
+    def _expand(self):
+        """Few images of one character -> gen_*.png images, judged, into dataset/."""
+        project = self._require_project()
+        if not project:
+            return
+        if not os.environ.get("OPENROUTER_API_KEY"):
+            return self._error("defina OPENROUTER_API_KEY no pod para gerar imagens")
+        pending = uploads_in_flight()
+        if pending:
+            return self._error(f"{pending} upload(s) ainda em andamento — espere terminar", 409)
+        body = self._body_json()
+        try:
+            target = int(body.get("n") or ex.DEFAULT_TARGET)
+        except (TypeError, ValueError):
+            return self._error("quantidade inválida")
+        if not 1 <= target <= 200:
+            return self._error("peça entre 1 e 200 imagens")
+        target_dir = dataset_dir("pos")
+        if not ex.reference_images(target_dir):
+            return self._error("mande de 1 a 5 imagens do personagem primeiro")
+        char_class = (body.get("character_class") or current_meta().get("character_class")
+                      or "").strip()
+        pdir = project_dir(project)
+        job = jobs.start("expand", "Gerando imagens do personagem", pdir / "logs" / "expand.log",
+                         lambda j: ex.expand_dataset(target_dir, j, target=target,
+                                                     char_class=char_class))
         self._json({"ok": True, "job": job.kind}, 202)
 
     def _train(self):
@@ -529,6 +650,8 @@ class Handler(SimpleHTTPRequestHandler):
             "trigger": (body.get("trigger") or current_meta().get("trigger") or "").strip(),
             "overrides": body.get("overrides") or {},
             "slider_targets": body.get("slider_targets") or [],
+            "lora_kind": body.get("lora_kind") or current_meta().get("lora_kind") or "",
+            "style_folders": current_meta().get("style_folders") or [],
         }
         pdir = project_dir(project)
         title = f"Treinando {MODELS[model_key]['label']}"
